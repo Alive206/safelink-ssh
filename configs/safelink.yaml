@@ -1,0 +1,31 @@
+# Example sshtunneld configuration.
+#
+# Anything written as ${VAR} or $VAR is replaced with the matching environment
+# variable at load time, so secrets should not be committed to disk.
+#
+# All durations use Go's time.ParseDuration syntax: e.g. 30s, 1m, 1m30s.
+
+log_level: info
+
+# Path to the strict-mode known_hosts file.  Must already contain the SSH
+# server's fingerprint; seed it once with `ssh-keyscan` before first run.
+known_hosts: ~/.ssh/known_hosts
+
+defaults:
+  keepalive_interval: 30s
+  keepalive_max_fails: 3
+  dial_timeout: 10s
+  reconnect_initial: 1s
+  reconnect_max: 60s
+
+# Embedded web control panel.
+web:
+  addr: 127.0.0.1:9090
+  auth:
+    api_token: ""
+    users:
+      - username: admin
+        password_hash: "$2a$12$NKg2AegLKuPaRdIa.kPHMOzx5CdB6BnhdRZtJ7LJH570nfpD89G6q"   # Generate with: safelink.exe passwd admin
+
+# Tunnels can be added via the web UI or by editing this section.
+tunnels: []

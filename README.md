@@ -32,7 +32,7 @@ go build -o safelink.exe .\cmd\safelink
 
 ## Configure
 
-Copy [configs/sshtunneld.yaml](configs/sshtunneld.yaml) and edit it.  Anything
+Copy [configs/safelink.yaml](configs/safelink.yaml) and edit it.  Anything
 written as `${VAR}` is substituted from the process environment at load time,
 so secrets need not live in the file.
 
@@ -55,7 +55,7 @@ tunnels:
 
 ```powershell
 $env:ID_ED25519_PASS = "super-secret"
-.\safelink.exe -config .\configs\sshtunneld.yaml
+.\safelink.exe -config .\configs\safelink.yaml
 ```
 
 On first run, SafeLink will auto-create the config file with a random admin

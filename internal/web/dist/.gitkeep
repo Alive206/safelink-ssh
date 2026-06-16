@@ -1,2 +1,0 @@
-# Placeholder so `//go:embed dist` works on a fresh checkout.
-# Run `cd web && npm install && npm run build` to populate this directory.

@@ -1,9 +1,9 @@
-# sshtunneld
+# SafeLink
 
 A small, cross-platform SSH tunnel daemon written in Go.  A single binary
 maintains any number of `-L` / `-R` / `-D` (SOCKS5) tunnels described in a
-YAML file, with auto-reconnect, keepalive, and strict `known_hosts`
-verification.
+YAML file, with auto-reconnect, keepalive, strict `known_hosts` verification,
+and an embedded Web UI for management.
 
 ## Features
 
@@ -18,6 +18,8 @@ verification.
 - **Auto-reconnect** with capped exponential backoff and ±20% jitter.
 - **Keepalive** equivalent to OpenSSH's `ServerAliveInterval` /
   `ServerAliveCountMax` (`SendRequest("keepalive@openssh.com")`).
+- **Embedded Web UI** with real-time SSE log streaming, tunnel management,
+  and bcrypt-protected login.
 - **Cross-platform**: Windows / Linux / macOS, single binary.
 - Structured JSON logging via `log/slog`.
 
@@ -25,7 +27,7 @@ verification.
 
 ```powershell
 go mod tidy
-go build -o sshtunneld.exe .\cmd\sshtunneld
+go build -o safelink.exe .\cmd\safelink
 ```
 
 ## Configure
@@ -53,11 +55,23 @@ tunnels:
 
 ```powershell
 $env:ID_ED25519_PASS = "super-secret"
-.\sshtunneld.exe -config .\configs\sshtunneld.yaml
+.\safelink.exe -config .\configs\sshtunneld.yaml
 ```
+
+On first run, SafeLink will auto-create the config file with a random admin
+password and open the Web UI in your browser.
 
 Stop with Ctrl+C; on Windows you can also use
 `taskkill /PID <pid>` (sends `SIGTERM`).
+
+### Generate a password hash
+
+```powershell
+.\safelink.exe passwd [USERNAME]
+```
+
+This prompts for a password and prints a YAML snippet with a bcrypt hash
+to paste into the config.
 
 ## Security notes
 
@@ -80,19 +94,28 @@ paths.
 ## Project layout
 
 ```
-cmd/sshtunneld/    main package
-internal/config/   YAML schema, loader, validation
+cmd/safelink/      main package
+internal/config/    YAML schema, loader, validation
 internal/sshclient/ auth, host-key, keepalive, supervisor
-internal/tunnel/   local / remote / dynamic forwarders
-internal/daemon/   signal handling and supervisor wiring
-internal/logging/  slog initialization
-configs/           example configuration
-test/              docker-compose sshd for verification
+internal/tunnel/    local / remote / dynamic forwarders
+internal/daemon/    signal handling and supervisor wiring
+internal/logging/   slog initialization
+internal/web/       embedded HTTP UI & SSE streaming
+internal/manager/   tunnel lifecycle manager
+internal/store/     persistent tunnel store
+configs/            example configuration
+test/               docker-compose sshd for verification
+web/                React frontend (Vite + Tailwind)
 ```
 
 ## Dependencies
 
 - `golang.org/x/crypto/ssh` – SSH protocol and key parsing
 - `golang.org/x/crypto/ssh/knownhosts` – strict host-key verification
+- `golang.org/x/term` – secure password input
 - `gopkg.in/yaml.v3` – YAML parsing
 - `github.com/things-go/go-socks5` – SOCKS5 server (used for `-D`)
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).

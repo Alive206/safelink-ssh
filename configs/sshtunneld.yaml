@@ -1,0 +1,56 @@
+# Example sshtunneld configuration.
+#
+# Anything written as ${VAR} or $VAR is replaced with the matching environment
+# variable at load time, so secrets should not be committed to disk.
+#
+# All durations use Go's time.ParseDuration syntax: e.g. 30s, 1m, 1m30s.
+
+log_level: info
+
+# Path to the strict-mode known_hosts file.  Must already contain the SSH
+# server's fingerprint; seed it once with `ssh-keyscan` before first run.
+known_hosts: ~/.ssh/known_hosts
+
+defaults:
+  keepalive_interval: 30s
+  keepalive_max_fails: 3
+  dial_timeout: 10s
+  reconnect_initial: 1s
+  reconnect_max: 60s
+
+tunnels:
+  # Pure private-key auth.  Equivalent to:
+  #   ssh -L 127.0.0.1:5433:db.internal:5432 alice@jump.example.com
+  - name: db-local
+    mode: local
+    listen: 127.0.0.1:5433
+    forward: db.internal:5432
+    ssh:
+      addr: jump.example.com:22
+      user: alice
+      identity_file: ~/.ssh/id_ed25519
+      passphrase: "${ID_ED25519_PASS}"
+
+  # Pure password auth.  Equivalent to:
+  #   ssh -R 0.0.0.0:8080:127.0.0.1:3000 bob@jump.example.com
+  # Requires `GatewayPorts yes` on the remote sshd to bind 0.0.0.0.
+  - name: expose-web
+    mode: remote
+    listen: 0.0.0.0:8080
+    forward: 127.0.0.1:3000
+    ssh:
+      addr: jump.example.com:22
+      user: bob
+      password: "${BOB_SSH_PASSWORD}"
+
+  # Dynamic SOCKS5 (-D) with both auth methods configured: publickey is tried
+  # first, password is the fallback if the server rejects publickey.
+  - name: socks
+    mode: dynamic
+    listen: 127.0.0.1:1080
+    ssh:
+      addr: jump.example.com:22
+      user: alice
+      identity_file: ~/.ssh/id_rsa
+      passphrase: "secret"
+      password: "${ALICE_SSH_PASSWORD}"

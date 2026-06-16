@@ -1,0 +1,3 @@
+# Replace this file with the OpenSSH-format public key (id_test.pub) you want
+# to authorize for the `tester` user inside the test container.  See
+# test/README.md for the exact one-liner.

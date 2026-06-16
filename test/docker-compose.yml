@@ -1,0 +1,20 @@
+services:
+  sshd:
+    image: lscr.io/linuxserver/openssh-server:latest
+    container_name: sshtunneld-sshd
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - PUBLIC_KEY_FILE=/keys/authorized_keys
+      - USER_NAME=tester
+      - USER_PASSWORD=tester-pw
+      - PASSWORD_ACCESS=true
+      - SUDO_ACCESS=false
+      - LISTEN_PORT=2222
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./authorized_keys:/keys/authorized_keys:ro
+      - ./sshd_config:/config/sshd/sshd_config:ro
+    restart: unless-stopped

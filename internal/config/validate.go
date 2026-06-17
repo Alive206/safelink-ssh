@@ -33,11 +33,15 @@ func (c *Config) applyDefaultsAndExpand() error {
 	}
 
 	if c.KnownHosts == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("resolve home dir: %w", err)
+		if c.InsecureHostKey {
+			// known_hosts not needed when host key verification is disabled.
+		} else {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("resolve home dir: %w", err)
+			}
+			c.KnownHosts = filepath.Join(home, ".ssh", "known_hosts")
 		}
-		c.KnownHosts = filepath.Join(home, ".ssh", "known_hosts")
 	} else {
 		expanded, err := expandHome(c.KnownHosts)
 		if err != nil {

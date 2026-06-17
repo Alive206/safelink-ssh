@@ -72,13 +72,14 @@ func (m *managedTunnel) loadStart() (time.Time, bool) {
 
 // Manager coordinates a fleet of managedTunnel instances.
 type Manager struct {
-	mu         sync.RWMutex
-	tunnels    map[string]*managedTunnel
-	defaults   config.ConnDefaults
-	knownHosts string
-	log        *slog.Logger
-	store      *store.Store
-	rootCtx    context.Context
+	mu              sync.RWMutex
+	tunnels         map[string]*managedTunnel
+	defaults        config.ConnDefaults
+	knownHosts      string
+	insecureHostKey bool
+	log             *slog.Logger
+	store           *store.Store
+	rootCtx         context.Context
 }
 
 // KeysDir exposes the on-disk directory holding uploaded SSH private keys,
@@ -103,11 +104,12 @@ func (m *Manager) IsKeyInUse(absPath string) bool {
 // launch every supervisor.
 func New(cfg *config.Config, log *slog.Logger, st *store.Store) *Manager {
 	m := &Manager{
-		tunnels:    make(map[string]*managedTunnel),
-		defaults:   cfg.Defaults,
-		knownHosts: cfg.KnownHosts,
-		log:        log,
-		store:      st,
+		tunnels:         make(map[string]*managedTunnel),
+		defaults:        cfg.Defaults,
+		knownHosts:      cfg.KnownHosts,
+		insecureHostKey: cfg.InsecureHostKey,
+		log:             log,
+		store:           st,
 	}
 	for _, tc := range cfg.Tunnels {
 		mt := &managedTunnel{cfg: tc, stats: tunnel.NewStats()}
@@ -336,7 +338,7 @@ func (m *Manager) startTunnel(name string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("build tunnel: %w", err)
 	}
-	sup := sshclient.NewSupervisor(mt.cfg, m.defaults, m.knownHosts, t, m.log)
+	sup := sshclient.NewSupervisor(mt.cfg, m.defaults, m.knownHosts, m.insecureHostKey, t, m.log)
 	sup.OnStateChange = func(state sshclient.State, lastErr error) {
 		mt.state.Store(state)
 		if lastErr != nil {

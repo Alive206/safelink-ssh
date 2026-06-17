@@ -18,3 +18,10 @@ func newHostKeyCallback(knownHostsPath string) (ssh.HostKeyCallback, error) {
 	}
 	return cb, nil
 }
+
+// insecureHostKeyCallback returns a callback that accepts any host key.
+// This is intentionally unsafe and should only be used in trusted networks
+// or development environments where known_hosts management is impractical.
+func insecureHostKeyCallback() ssh.HostKeyCallback {
+	return ssh.InsecureIgnoreHostKey()
+}

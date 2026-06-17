@@ -11,6 +11,10 @@ log_level: info
 # server's fingerprint; seed it once with `ssh-keyscan` before first run.
 known_hosts: ~/.ssh/known_hosts
 
+# Set to true to skip host key verification entirely.
+# WARNING: only use in trusted networks — disables MITM protection.
+insecure_host_key: true
+
 defaults:
   keepalive_interval: 30s
   keepalive_max_fails: 3

@@ -41,11 +41,12 @@ const (
 // carries it.  It dials, runs keepalive + tunnel concurrently, and reconnects
 // with capped exponential backoff on any failure.
 type Supervisor struct {
-	tunnelCfg  config.TunnelCfg
-	defaults   config.ConnDefaults
-	knownHosts string
-	tunnel     Tunnel
-	log        *slog.Logger
+	tunnelCfg       config.TunnelCfg
+	defaults        config.ConnDefaults
+	knownHosts      string
+	insecureHostKey bool
+	tunnel          Tunnel
+	log             *slog.Logger
 
 	// OnStateChange, if non-nil, is invoked synchronously whenever the
 	// supervisor transitions states.  `lastErr` is non-nil only when the
@@ -56,13 +57,14 @@ type Supervisor struct {
 // NewSupervisor wires up a Supervisor.  The tunnel argument must already be
 // constructed for the given tunnelCfg (the supervisor does not know about
 // tunnel-mode specifics).
-func NewSupervisor(tc config.TunnelCfg, defaults config.ConnDefaults, knownHosts string, tunnel Tunnel, log *slog.Logger) *Supervisor {
+func NewSupervisor(tc config.TunnelCfg, defaults config.ConnDefaults, knownHosts string, insecureHostKey bool, tunnel Tunnel, log *slog.Logger) *Supervisor {
 	return &Supervisor{
-		tunnelCfg:  tc,
-		defaults:   defaults,
-		knownHosts: knownHosts,
-		tunnel:     tunnel,
-		log:        log.With("tunnel", tc.Name),
+		tunnelCfg:       tc,
+		defaults:        defaults,
+		knownHosts:      knownHosts,
+		insecureHostKey: insecureHostKey,
+		tunnel:          tunnel,
+		log:             log.With("tunnel", tc.Name),
 	}
 }
 
@@ -142,9 +144,15 @@ func (s *Supervisor) dial(ctx context.Context) (*ssh.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	hostKeyCB, err := newHostKeyCallback(s.knownHosts)
-	if err != nil {
-		return nil, fmt.Errorf("host key callback: %w", err)
+
+	var hostKeyCB ssh.HostKeyCallback
+	if s.insecureHostKey {
+		hostKeyCB = insecureHostKeyCallback()
+	} else {
+		hostKeyCB, err = newHostKeyCallback(s.knownHosts)
+		if err != nil {
+			return nil, fmt.Errorf("host key callback: %w", err)
+		}
 	}
 
 	cfg := &ssh.ClientConfig{

@@ -18,11 +18,12 @@ import (
 // rewrite.  The YAML may still embed `tunnels:` for backwards compatibility;
 // the store layer decides which source wins.
 type Config struct {
-	LogLevel   string       `yaml:"log_level" json:"log_level"`
-	KnownHosts string       `yaml:"known_hosts" json:"known_hosts"`
-	Defaults   ConnDefaults `yaml:"defaults" json:"defaults"`
-	Web        WebCfg       `yaml:"web" json:"web"`
-	Tunnels    []TunnelCfg  `yaml:"tunnels" json:"tunnels"`
+	LogLevel        string       `yaml:"log_level" json:"log_level"`
+	KnownHosts      string       `yaml:"known_hosts" json:"known_hosts"`
+	InsecureHostKey bool         `yaml:"insecure_host_key" json:"insecure_host_key"`
+	Defaults        ConnDefaults `yaml:"defaults" json:"defaults"`
+	Web             WebCfg       `yaml:"web" json:"web"`
+	Tunnels         []TunnelCfg  `yaml:"tunnels" json:"tunnels"`
 }
 
 // ConnDefaults holds shared connection-level defaults.

@@ -13,7 +13,7 @@ known_hosts: ~/.ssh/known_hosts
 
 # Set to true to skip host key verification entirely.
 # WARNING: only use in trusted networks — disables MITM protection.
-insecure_host_key: true
+insecure_host_key: false
 
 defaults:
   keepalive_interval: 30s

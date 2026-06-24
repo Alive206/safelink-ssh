@@ -19,7 +19,7 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
       setList(await tunnels.list())
       setErr(null)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'load failed')
+      setErr(e instanceof Error ? e.message : '加载失败')
     }
   }
 
@@ -43,7 +43,7 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
 
   async function action(name: string, fn: () => Promise<unknown>) {
     try { await fn() } catch (e) {
-      setErr(e instanceof Error ? e.message : 'action failed')
+      setErr(e instanceof Error ? e.message : '操作失败')
     } finally { refresh() }
   }
 
@@ -58,7 +58,7 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
   }
 
   async function remove(name: string) {
-    if (!confirm(`Delete tunnel "${name}"?`)) return
+    if (!confirm(`确认删除隧道 "${name}"？`)) return
     await action(name, () => tunnels.remove(name))
   }
 
@@ -69,13 +69,13 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
           <div className="flex items-center gap-2">
             <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-900 text-white text-xs font-bold">SL</span>
             <span className="text-lg font-semibold">SafeLink</span>
-            <span className="text-xs text-slate-500">control panel</span>
+            <span className="text-xs text-slate-500">控制面板</span>
           </div>
           <div className="flex items-center gap-2">
             <button onClick={onShowLogs}
-              className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">Logs</button>
+              className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">日志</button>
             <button onClick={onLogout}
-              className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">Sign out</button>
+              className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">退出登录</button>
           </div>
         </div>
       </header>
@@ -86,28 +86,28 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
         )}
 
         <section className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <StatsCard label="Tunnels" value={list.length} />
-          <StatsCard label="Active conns" value={totals.active} hint={`${totals.total} since start`} />
-          <StatsCard label="Bytes in"   value={formatBytes(totals.in)} />
-          <StatsCard label="Bytes out"  value={formatBytes(totals.out)} />
+          <StatsCard label="隧道数" value={list.length} />
+          <StatsCard label="活动连接" value={totals.active} hint={`自启动以来共 ${totals.total} 次`} />
+          <StatsCard label="入站流量"   value={formatBytes(totals.in)} />
+          <StatsCard label="出站流量"  value={formatBytes(totals.out)} />
         </section>
 
         <section className="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
-            <h2 className="font-semibold">Tunnels</h2>
+            <h2 className="font-semibold">隧道列表</h2>
             <button onClick={() => setEditing({ mode: 'create' })}
-              className="px-3 py-1.5 rounded bg-slate-900 text-white text-sm hover:bg-slate-800">+ Add tunnel</button>
+              className="px-3 py-1.5 rounded bg-slate-900 text-white text-sm hover:bg-slate-800">+ 添加隧道</button>
           </div>
           <table className="w-full text-sm">
             <thead className="bg-slate-50 text-slate-600 text-xs uppercase">
               <tr>
-                <Th>Name</Th><Th>Mode</Th><Th>Listen → Forward</Th><Th>State</Th>
-                <Th>Conns</Th><Th>Traffic</Th><Th>Uptime</Th><Th className="text-right">Actions</Th>
+                <Th>名称</Th><Th>模式</Th><Th>监听 → 转发</Th><Th>状态</Th>
+                <Th>连接</Th><Th>流量</Th><Th>运行时长</Th><Th className="text-right">操作</Th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {list.length === 0 && (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-slate-500">No tunnels configured.</td></tr>
+                <tr><td colSpan={8} className="px-4 py-8 text-center text-slate-500">暂无隧道配置</td></tr>
               )}
               {list.map((s) => (
                 <tr key={s.config.name}>
@@ -130,18 +130,18 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
                   </Td>
                   <Td className="text-xs">
                     {s.state === 'running' ? `${s.uptime_seconds}s` : '—'}
-                    <div className="text-slate-400">{s.run_count} runs</div>
+                    <div className="text-slate-400">{s.run_count} 次运行</div>
                   </Td>
                   <Td>
                     <div className="flex justify-end gap-1">
                       {s.state === 'stopped' ? (
-                        <Btn onClick={() => action(s.config.name, () => tunnels.start(s.config.name))}>Start</Btn>
+                        <Btn onClick={() => action(s.config.name, () => tunnels.start(s.config.name))}>启动</Btn>
                       ) : (
-                        <Btn onClick={() => action(s.config.name, () => tunnels.stop(s.config.name))}>Stop</Btn>
+                        <Btn onClick={() => action(s.config.name, () => tunnels.stop(s.config.name))}>停止</Btn>
                       )}
-                      <Btn onClick={() => action(s.config.name, () => tunnels.restart(s.config.name))}>Restart</Btn>
-                      <Btn onClick={() => setEditing({ mode: 'edit', t: s.config })}>Edit</Btn>
-                      <Btn danger onClick={() => remove(s.config.name)}>Delete</Btn>
+                      <Btn onClick={() => action(s.config.name, () => tunnels.restart(s.config.name))}>重启</Btn>
+                      <Btn onClick={() => setEditing({ mode: 'edit', t: s.config })}>编辑</Btn>
+                      <Btn danger onClick={() => remove(s.config.name)}>删除</Btn>
                     </div>
                   </Td>
                 </tr>

@@ -22,12 +22,12 @@ export default function Logs({ onClose }: Props) {
   return (
     <div className="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 p-4 space-y-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold">Live logs</h2>
+        <h2 className="text-lg font-semibold">实时日志</h2>
         <button onClick={onClose}
-          className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">Close</button>
+          className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">关闭</button>
       </div>
       <div className="font-mono text-xs bg-slate-900 text-slate-100 rounded p-3 h-[60vh] overflow-auto whitespace-pre-wrap">
-        {lines.length === 0 && <div className="text-slate-400">Waiting for logs…</div>}
+        {lines.length === 0 && <div className="text-slate-400">等待日志…</div>}
         {lines.map((raw, i) => {
           const l = parse(raw)
           const lvl = (l.level || 'INFO').toUpperCase()

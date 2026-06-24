@@ -41,7 +41,7 @@ export default function App() {
     setView('login')
   }
 
-  if (view === 'loading') return <div className="p-6 text-slate-500">Loading…</div>
+  if (view === 'loading') return <div className="p-6 text-slate-500">加载中…</div>
   if (view === 'login') return <Login onSuccess={() => setView('dashboard')} />
   if (view === 'logs') return <Logs onClose={() => setView('dashboard')} />
   return <Dashboard onLogout={logout} onShowLogs={() => setView('logs')} />

@@ -37,7 +37,7 @@ export default function TunnelForm({ initial, isEdit, onSubmit, onCancel }: Prop
       setKeys(list)
       setKeysErr(null)
     } catch (e) {
-      setKeysErr(e instanceof Error ? e.message : 'load keys failed')
+      setKeysErr(e instanceof Error ? e.message : '加载密钥失败')
     }
   }
 
@@ -53,7 +53,7 @@ export default function TunnelForm({ initial, isEdit, onSubmit, onCancel }: Prop
       // Auto-select the freshly uploaded key.
       upSSH('identity_file', info.path)
     } catch (err) {
-      setKeysErr(err instanceof Error ? err.message : 'upload failed')
+      setKeysErr(err instanceof Error ? err.message : '上传失败')
     } finally {
       setUploading(false)
     }
@@ -81,7 +81,7 @@ export default function TunnelForm({ initial, isEdit, onSubmit, onCancel }: Prop
       }
       await onSubmit(clean)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'save failed')
+      setErr(e instanceof Error ? e.message : '保存失败')
     } finally {
       setBusy(false)
     }
@@ -89,50 +89,50 @@ export default function TunnelForm({ initial, isEdit, onSubmit, onCancel }: Prop
 
   return (
     <form onSubmit={submit} className="bg-white rounded-lg shadow-sm ring-1 ring-slate-200 p-5 space-y-4">
-      <h2 className="text-lg font-semibold">{isEdit ? 'Edit tunnel' : 'Add tunnel'}</h2>
+      <h2 className="text-lg font-semibold">{isEdit ? '编辑隧道' : '添加隧道'}</h2>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <Field label="Name">
+        <Field label="名称">
           <input className={input} value={t.name} disabled={isEdit}
             onChange={(e) => up('name', e.target.value)} required />
         </Field>
-        <Field label="Mode">
+        <Field label="模式">
           <select className={input} value={t.mode}
             onChange={(e) => up('mode', e.target.value as TunnelCfg['mode'])}>
-            <option value="local">local (-L)</option>
-            <option value="remote">remote (-R)</option>
-            <option value="dynamic">dynamic (-D, SOCKS5)</option>
+            <option value="local">本地转发 (-L)</option>
+            <option value="remote">远程转发 (-R)</option>
+            <option value="dynamic">动态转发 (-D, SOCKS5)</option>
           </select>
         </Field>
-        <Field label="Listen">
+        <Field label="监听地址">
           <input className={input} value={t.listen} placeholder="127.0.0.1:5433"
             onChange={(e) => up('listen', e.target.value)} required />
         </Field>
-        <Field label="Forward" hint="ignored for dynamic">
+        <Field label="转发地址" hint="动态模式忽略此项">
           <input className={input} value={t.forward ?? ''} placeholder="db.internal:5432"
             disabled={t.mode === 'dynamic'}
             onChange={(e) => up('forward', e.target.value)} />
         </Field>
       </div>
 
-      <h3 className="text-sm font-semibold text-slate-700 pt-2 border-t border-slate-200">SSH server</h3>
+      <h3 className="text-sm font-semibold text-slate-700 pt-2 border-t border-slate-200">SSH 服务器</h3>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <Field label="Address">
+        <Field label="服务器地址">
           <input className={input} value={t.ssh.addr} placeholder="jump.example.com:22"
             onChange={(e) => upSSH('addr', e.target.value)} required />
         </Field>
-        <Field label="User">
+        <Field label="用户名">
           <input className={input} value={t.ssh.user}
             onChange={(e) => upSSH('user', e.target.value)} required />
         </Field>
-        <Field label="Identity file" hint="upload an SSH private key; the daemon stores it under configs/keys with 0600 perms">
+        <Field label="密钥文件" hint="上传 SSH 私钥；守护进程以 0600 权限存储在 configs/keys 目录下">
           <div className="flex gap-2">
             <select
               className={input}
               value={t.ssh.identity_file ?? ''}
               onChange={(e) => upSSH('identity_file', e.target.value)}
             >
-              <option value="">— none (use password) —</option>
+              <option value="">— 无（使用密码）—</option>
               {/* If the tunnel was edited and references a path that's no longer
                   in the keys directory, surface it so the user can see/clear it. */}
               {t.ssh.identity_file && !keys.some(k => k.path === t.ssh.identity_file) && (
@@ -149,9 +149,9 @@ export default function TunnelForm({ initial, isEdit, onSubmit, onCancel }: Prop
               onClick={() => fileRef.current?.click()}
               disabled={uploading}
               className="shrink-0 px-2.5 py-1.5 rounded ring-1 ring-slate-300 text-xs hover:bg-slate-50 disabled:opacity-50"
-              title="Upload a private key file"
+              title="上传私钥文件"
             >
-              {uploading ? 'Uploading…' : 'Upload'}
+              {uploading ? '上传中…' : '上传'}
             </button>
             <input
               ref={fileRef}
@@ -163,11 +163,11 @@ export default function TunnelForm({ initial, isEdit, onSubmit, onCancel }: Prop
           </div>
           {keysErr && <span className="block text-xs text-rose-600 mt-1">{keysErr}</span>}
         </Field>
-        <Field label="Passphrase">
+        <Field label="密钥密码">
           <input className={input} type="password" value={t.ssh.passphrase ?? ''}
             onChange={(e) => upSSH('passphrase', e.target.value)} />
         </Field>
-        <Field label="Password" hint="leave blank if using identity">
+        <Field label="密码" hint="使用密钥时留空">
           <input className={input} type="password" value={t.ssh.password ?? ''}
             onChange={(e) => upSSH('password', e.target.value)} />
         </Field>
@@ -177,10 +177,10 @@ export default function TunnelForm({ initial, isEdit, onSubmit, onCancel }: Prop
 
       <div className="flex justify-end gap-2 pt-2">
         <button type="button" onClick={onCancel}
-          className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">Cancel</button>
+          className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">取消</button>
         <button type="submit" disabled={busy}
           className="px-3 py-1.5 rounded bg-slate-900 text-white text-sm hover:bg-slate-800 disabled:opacity-50">
-          {busy ? 'Saving…' : isEdit ? 'Save' : 'Create'}
+          {busy ? '保存中…' : isEdit ? '保存' : '创建'}
         </button>
       </div>
     </form>

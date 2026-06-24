@@ -19,7 +19,7 @@ export default function Login({ onSuccess }: Props) {
       await auth.login(u, p)
       onSuccess()
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : 'login failed')
+      setErr(e instanceof ApiError ? e.message : '登录失败')
     } finally {
       setBusy(false)
     }
@@ -32,16 +32,16 @@ export default function Login({ onSuccess }: Props) {
           <span className="inline-flex h-8 w-8 items-center justify-center rounded-md bg-slate-900 text-white text-sm font-bold">SL</span>
           <h1 className="text-xl font-semibold">SafeLink</h1>
         </div>
-        <p className="text-sm text-slate-500">Sign in to manage your secure tunnels.</p>
+        <p className="text-sm text-slate-500">登录以管理安全隧道</p>
         <div className="space-y-1">
-          <label className="text-sm font-medium">Username</label>
+          <label className="text-sm font-medium">用户名</label>
           <input
             className="w-full rounded border-slate-300 ring-1 ring-slate-300 focus:ring-slate-500 px-3 py-2 outline-none"
             value={u} onChange={(e) => setU(e.target.value)} autoFocus
           />
         </div>
         <div className="space-y-1">
-          <label className="text-sm font-medium">Password</label>
+          <label className="text-sm font-medium">密码</label>
           <input
             type="password"
             className="w-full rounded border-slate-300 ring-1 ring-slate-300 focus:ring-slate-500 px-3 py-2 outline-none"
@@ -54,7 +54,7 @@ export default function Login({ onSuccess }: Props) {
           disabled={busy || !u || !p}
           className="w-full rounded bg-slate-900 text-white py-2 font-medium hover:bg-slate-800 disabled:opacity-50"
         >
-          {busy ? 'Signing in…' : 'Sign in'}
+          {busy ? '登录中…' : '登录'}
         </button>
       </form>
     </div>

@@ -1,28 +1,20 @@
 @echo off
-REM Register sshtunneld to auto-start when the current user logs in.
-REM Implementation: drop a .lnk shortcut into the per-user Startup folder
-REM that points at start.cmd in this directory.  No admin rights required,
-REM nothing in HKLM, and easy to inspect (Win+R -> shell:startup).
+REM 设置 SafeLink 开机自启动（当前用户）
+REM 在启动文件夹中创建快捷方式，无需管理员权限
 
 setlocal
-set "ROOT=%~dp0"
-set "TARGET=%ROOT%start.cmd"
-if not exist "%TARGET%" (
-  echo Cannot find %TARGET%.
-  pause
-  exit /b 1
-)
-
-set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
-set "LNK=%STARTUP%\sshtunneld.lnk"
+cd /d "%~dp0"
+set STARTUP="%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+set LNK=%STARTUP%\SafeLink.lnk
 
 powershell -NoProfile -Command ^
   "$s = New-Object -ComObject WScript.Shell;" ^
   "$lnk = $s.CreateShortcut('%LNK%');" ^
-  "$lnk.TargetPath = '%TARGET%';" ^
-  "$lnk.WorkingDirectory = '%ROOT%';" ^
+  "$lnk.TargetPath = '%CD%\safelink.exe';" ^
+  "$lnk.Arguments = '-config configs/safelink.yaml -no-open';" ^
+  "$lnk.WorkingDirectory = '%CD%';" ^
   "$lnk.WindowStyle = 7;" ^
-  "$lnk.Description = 'sshtunneld auto-start';" ^
+  "$lnk.Description = 'SafeLink SSH Tunnel Daemon';" ^
   "$lnk.Save()"
 
 if errorlevel 1 (
@@ -33,7 +25,6 @@ if errorlevel 1 (
 
 echo Auto-start installed.
 echo   Shortcut: %LNK%
-echo   Will run: %TARGET%
 echo.
-echo Sign out and back in to verify, or run start.cmd now.
+echo SafeLink will auto-start on next login.
 endlocal

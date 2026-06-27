@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,13 +28,14 @@ var ErrExists = errors.New("tunnel already exists")
 
 // Status is the JSON-friendly snapshot exposed by the HTTP layer.
 type Status struct {
-	Config    config.TunnelCfg `json:"config"`
-	State     string           `json:"state"`
-	LastError string           `json:"last_error,omitempty"`
-	StartedAt *time.Time       `json:"started_at,omitempty"`
-	UptimeSec int64            `json:"uptime_seconds"`
-	RunCount  int64            `json:"run_count"`
-	Stats     tunnel.Snapshot  `json:"stats"`
+	Config      config.TunnelCfg `json:"config"`
+	State       string           `json:"state"`
+	LastError   string           `json:"last_error,omitempty"`
+	StartedAt   *time.Time       `json:"started_at,omitempty"`
+	UptimeSec   int64            `json:"uptime_seconds"`
+	RunCount    int64            `json:"run_count"`
+	Stats       tunnel.Snapshot  `json:"stats"`
+	RouteActive bool             `json:"route_active,omitempty"`
 }
 
 // managedTunnel is the manager's per-tunnel runtime container.
@@ -46,6 +48,7 @@ type managedTunnel struct {
 	lastErr  atomic.Value       // string
 	runCount atomic.Int64
 	startAt  atomic.Value // time.Time when the supervisor entered Running
+	vpn      *tunnel.VPN  // non-nil for VPN tunnels while running
 }
 
 func (m *managedTunnel) loadState() sshclient.State {
@@ -85,6 +88,10 @@ type Manager struct {
 // KeysDir exposes the on-disk directory holding uploaded SSH private keys,
 // passing through to the underlying store.
 func (m *Manager) KeysDir() string { return m.store.KeysDir() }
+
+// Store returns the underlying store instance for direct access to
+// non-tunnel persisted data (e.g. VPN servers).
+func (m *Manager) Store() *store.Store { return m.store }
 
 // IsKeyInUse reports whether any tunnel currently references the given
 // absolute key path.  Used by the keys API to refuse deletion of an
@@ -158,6 +165,9 @@ func (m *Manager) List() []Status {
 		out = append(out, m.statusOf(mt))
 	}
 	m.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Config.Name < out[j].Config.Name
+	})
 	return out
 }
 
@@ -292,6 +302,48 @@ func (m *Manager) Restart(name string) error {
 	return m.startTunnel(name)
 }
 
+// SetVPNRoute dynamically enables/disables the global route for a VPN tunnel.
+// When enabling, it automatically disables the route on all other VPN tunnels
+// (mutual exclusion: only one tunnel can have the global route active).
+func (m *Manager) SetVPNRoute(name string, enable bool) error {
+	m.mu.RLock()
+	mt, ok := m.tunnels[name]
+	m.mu.RUnlock()
+	if !ok {
+		return ErrNotFound
+	}
+	if mt.cfg.Mode != config.ModeVPN {
+		return fmt.Errorf("tunnel %q is not a VPN tunnel", name)
+	}
+	if mt.vpn == nil {
+		return fmt.Errorf("vpn tunnel %q is not running", name)
+	}
+
+	// Mutual exclusion: disable route on all other VPN tunnels first.
+	if enable {
+		m.mu.RLock()
+		for n, other := range m.tunnels {
+			if n != name && other.vpn != nil && other.vpn.RouteActive() {
+				_ = other.vpn.SetRoute(false)
+			}
+		}
+		m.mu.RUnlock()
+	}
+
+	return mt.vpn.SetRoute(enable)
+}
+
+// VPNRouteActive reports whether the VPN tunnel's global route is active.
+func (m *Manager) VPNRouteActive(name string) bool {
+	m.mu.RLock()
+	mt, ok := m.tunnels[name]
+	m.mu.RUnlock()
+	if !ok || mt.vpn == nil {
+		return false
+	}
+	return mt.vpn.RouteActive()
+}
+
 // ----- internals ---------------------------------------------------------
 
 func (m *Manager) statusOf(mt *managedTunnel) Status {
@@ -309,12 +361,8 @@ func (m *Manager) statusOf(mt *managedTunnel) Status {
 		st.StartedAt = &ts
 		st.UptimeSec = int64(time.Since(t).Seconds())
 	}
-	// Mask secrets in the JSON view; actual storage keeps the originals.
-	if st.Config.SSH.Password != "" {
-		st.Config.SSH.Password = "***"
-	}
-	if st.Config.SSH.Passphrase != "" {
-		st.Config.SSH.Passphrase = "***"
+	if mt.vpn != nil {
+		st.RouteActive = mt.vpn.RouteActive()
 	}
 	return st
 }
@@ -338,6 +386,11 @@ func (m *Manager) startTunnel(name string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("build tunnel: %w", err)
 	}
+
+		if mt.cfg.Mode == config.ModeVPN {
+			return m.startVPN(mt, t.(*tunnel.VPN))
+		}
+
 	sup := sshclient.NewSupervisor(mt.cfg, m.defaults, m.knownHosts, m.insecureHostKey, t, m.log)
 	sup.OnStateChange = func(state sshclient.State, lastErr error) {
 		mt.state.Store(state)
@@ -373,6 +426,41 @@ func (m *Manager) startTunnel(name string) error {
 	return nil
 }
 
+
+func (m *Manager) startVPN(mt *managedTunnel, vpn *tunnel.VPN) error {
+	mt.vpn = vpn
+	vpn.OnStateChange = func(state string, lastErr error) {
+		mt.state.Store(sshclient.State(state))
+		if lastErr != nil {
+			mt.lastErr.Store(lastErr.Error())
+		} else if state == "running" {
+			mt.lastErr.Store("")
+		}
+		switch state {
+		case "running":
+			mt.startAt.Store(time.Now())
+			mt.runCount.Add(1)
+		case "stopped":
+			mt.startAt.Store(time.Time{})
+		}
+	}
+	ctx, cancel := context.WithCancel(m.rootCtx)
+	mt.cancel = cancel
+	mt.done = make(chan struct{})
+	m.mu.Unlock()
+	go func() {
+		defer close(mt.done)
+		vpn.Run(ctx)
+		m.mu.Lock()
+		mt.vpn = nil
+		if mt.cancel != nil {
+			mt.cancel = nil
+		}
+		m.mu.Unlock()
+	}()
+	return nil
+}
+
 func (m *Manager) stopManaged(mt *managedTunnel) {
 	m.mu.Lock()
 	cancel := mt.cancel
@@ -388,6 +476,8 @@ func (m *Manager) stopManaged(mt *managedTunnel) {
 	}
 }
 
+
+
 func (m *Manager) persist() error {
 	if m.store == nil {
 		return nil
@@ -399,4 +489,46 @@ func (m *Manager) persist() error {
 	}
 	m.mu.RUnlock()
 	return m.store.SaveTunnels(out)
+}
+
+// Configs returns a copy of all tunnel configurations (for subscription export).
+func (m *Manager) Configs() []config.TunnelCfg {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]config.TunnelCfg, 0, len(m.tunnels))
+	for _, mt := range m.tunnels {
+		out = append(out, mt.cfg)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// BulkMerge imports a batch of tunnels: updates existing by name, adds new ones.
+// Returns counts of imported/skipped and any error messages.
+func (m *Manager) BulkMerge(incoming []config.TunnelCfg, prefix string) (imported, skipped int, errs []string) {
+	for _, tc := range incoming {
+		if prefix != "" {
+			tc.Name = prefix + tc.Name
+		}
+		if _, err := m.Get(tc.Name); err == nil {
+			// Already exists → update.
+			if err := m.Update(tc.Name, tc); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", tc.Name, err))
+				skipped++
+			} else {
+				imported++
+			}
+		} else {
+			// New → add.
+			if err := m.Add(tc); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", tc.Name, err))
+				skipped++
+			} else {
+				imported++
+			}
+		}
+	}
+	return
 }

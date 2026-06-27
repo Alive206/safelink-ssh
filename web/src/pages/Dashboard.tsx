@@ -1,15 +1,17 @@
 import { useEffect, useState } from 'react'
-import { tunnels, TunnelStatus, TunnelCfg } from '../api/client'
+import { tunnels, TunnelStatus, TunnelCfg, AppRole } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
 import StatsCard, { formatBytes } from '../components/StatsCard'
 import TunnelForm from './TunnelForm'
 
 interface Props {
+  role: AppRole
   onLogout: () => void
   onShowLogs: () => void
+  onShowSubscription: () => void
 }
 
-export default function Dashboard({ onLogout, onShowLogs }: Props) {
+export default function Dashboard({ role, onLogout, onShowLogs, onShowSubscription }: Props) {
   const [list, setList] = useState<TunnelStatus[]>([])
   const [err, setErr] = useState<string | null>(null)
   const [editing, setEditing] = useState<null | { mode: 'create' } | { mode: 'edit'; t: TunnelCfg }>(null)
@@ -72,6 +74,8 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
             <span className="text-xs text-slate-500">控制面板</span>
           </div>
           <div className="flex items-center gap-2">
+            <button onClick={onShowSubscription}
+              className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">订阅</button>
             <button onClick={onShowLogs}
               className="px-3 py-1.5 rounded ring-1 ring-slate-300 text-sm hover:bg-slate-50">日志</button>
             <button onClick={onLogout}
@@ -112,10 +116,13 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
               {list.map((s) => (
                 <tr key={s.config.name}>
                   <Td><span className="font-medium">{s.config.name}</span></Td>
-                  <Td><span className="text-slate-600">{s.config.mode}</span></Td>
+                  <Td><span className="text-slate-600">{modeLabel(s.config.mode)}</span></Td>
                   <Td className="font-mono text-xs">
-                    {s.config.listen}
-                    {s.config.mode !== 'dynamic' && s.config.forward ? ` → ${s.config.forward}` : ''}
+                    {s.config.mode === 'vpn' ? (
+                      <span>子网 {s.config.listen}{s.config.forward ? ` → ${s.config.forward}` : ''}</span>
+                    ) : (
+                      <>{s.config.listen}{s.config.mode !== 'dynamic' && s.config.forward ? ` → ${s.config.forward}` : ''}</>
+                    )}
                   </Td>
                   <Td>
                     <div className="flex flex-col gap-1">
@@ -134,6 +141,20 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
                   </Td>
                   <Td>
                     <div className="flex justify-end gap-1">
+                      {s.config.mode === 'vpn' && s.state === 'running' && (
+                        <button
+                          onClick={() => action(s.config.name, () => tunnels.setRoute(s.config.name, !s.route_active))}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                            s.route_active ? 'bg-emerald-500' : 'bg-slate-300'
+                          }`}
+                          title={s.route_active ? '点击关闭全局代理' : '点击开启全局代理'}
+                        >
+                          <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                            s.route_active ? 'translate-x-6' : 'translate-x-1'
+                          }`} />
+                        </button>
+                      )}
+
                       {s.state === 'stopped' ? (
                         <Btn onClick={() => action(s.config.name, () => tunnels.start(s.config.name))}>启动</Btn>
                       ) : (
@@ -165,6 +186,15 @@ export default function Dashboard({ onLogout, onShowLogs }: Props) {
   )
 }
 
+function modeLabel(mode: string): string {
+  switch (mode) {
+    case 'local': return '本地转发'
+    case 'remote': return '远程转发'
+    case 'dynamic': return '动态转发'
+    case 'vpn': return 'VPN'
+    default: return mode
+  }
+}
 function Th({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return <th className={`text-left font-medium px-4 py-2 ${className}`}>{children}</th>
 }

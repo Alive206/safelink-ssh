@@ -140,7 +140,7 @@ func (s *Supervisor) serve(ctx context.Context, client *ssh.Client) {
 
 // dial constructs the ssh.ClientConfig and opens a new TCP+SSH connection.
 func (s *Supervisor) dial(ctx context.Context) (*ssh.Client, error) {
-	authMethods, err := buildAuthMethods(s.tunnelCfg.SSH)
+	authMethods, err := BuildAuthMethods(s.tunnelCfg.SSH)
 	if err != nil {
 		return nil, err
 	}

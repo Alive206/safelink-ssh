@@ -1,0 +1,42 @@
+{
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "identity": {
+          "name": "SafeLink",
+          "version": "1.0.0.0"
+        },
+        "description": "SafeLink SSH Tunnel Manager",
+        "minimum-os": "win10",
+        "execution-level": "requireAdministrator",
+        "ui-access": false,
+        "auto-elevate": false,
+        "dpi-awareness": "system"
+      }
+    }
+  },
+  "RT_GROUP_ICON": {
+    "#1": {
+      "0000": "icon.ico"
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "1.0.0.0",
+          "product_version": "1.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "ProductName": "SafeLink",
+            "FileDescription": "SafeLink System Tray",
+            "CompanyName": "",
+            "OriginalFilename": "safelink-tray.exe",
+            "LegalCopyright": ""
+          }
+        }
+      }
+    }
+  }
+}

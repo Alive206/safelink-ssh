@@ -1,7 +1,7 @@
 @echo off
-REM Stop a running sshtunneld instance launched with start.cmd.
+REM 停止正在运行的 SafeLink 守护进程
 
 setlocal
-powershell -NoProfile -Command "Get-Process sshtunneld -ErrorAction SilentlyContinue | Stop-Process -Force"
-echo sshtunneld stopped.
+powershell -NoProfile -Command "Get-Process safelink -ErrorAction SilentlyContinue | Stop-Process -Force"
+echo SafeLink stopped.
 endlocal

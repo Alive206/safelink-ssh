@@ -85,7 +85,8 @@ func RunWithOptions(cfgPath string, opts Options) error {
 	mgr := manager.New(cfg, log, st)
 	mgr.Start(ctx)
 
-	srv := web.New(cfg.Web, mgr, bcast, log)
+	srv := web.New(cfg.Web, cfg.Role, mgr, bcast, log)
+	srv.SetShutdownFunc(stop) // allow POST /api/shutdown to trigger graceful exit
 
 	var wg sync.WaitGroup
 	wg.Add(1)

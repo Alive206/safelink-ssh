@@ -12,6 +12,17 @@ import (
 // applyDefaultsAndExpand fills zero-valued duration fields and expands ~ in
 // any path-like field.
 func (c *Config) applyDefaultsAndExpand() error {
+	// Role default and validation.
+	if c.Role == "" {
+		c.Role = RoleStandalone
+	}
+	switch c.Role {
+	case RoleServer, RoleClient, RoleStandalone:
+		// valid
+	default:
+		return fmt.Errorf("invalid role %q: must be server, client, or standalone", c.Role)
+	}
+
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
@@ -57,6 +68,20 @@ func (c *Config) applyDefaultsAndExpand() error {
 				return err
 			}
 			c.Tunnels[i].SSH.IdentityFile = expanded
+		}
+		if c.Tunnels[i].Tun.TLSCert != "" {
+			expanded, err := expandHome(c.Tunnels[i].Tun.TLSCert)
+			if err != nil {
+				return err
+			}
+			c.Tunnels[i].Tun.TLSCert = expanded
+		}
+		if c.Tunnels[i].Tun.TLSKey != "" {
+			expanded, err := expandHome(c.Tunnels[i].Tun.TLSKey)
+			if err != nil {
+				return err
+			}
+			c.Tunnels[i].Tun.TLSKey = expanded
 		}
 	}
 	return nil
@@ -120,8 +145,19 @@ func validateTunnel(t TunnelCfg) error {
 		if t.Listen == "" {
 			return errors.New("dynamic mode requires listen")
 		}
+	case ModeVPN:
+		if t.Forward == "" {
+			return errors.New("vpn mode requires forward (remote server address)")
+		}
+		if t.SSH.User == "" {
+			return errors.New("vpn mode requires ssh.user (auth username)")
+		}
+		if t.SSH.Password == "" {
+			return errors.New("vpn mode requires ssh.password (auth secret)")
+		}
+		return nil // VPN doesn't require SSH addr/identity
 	default:
-		return fmt.Errorf("unknown mode %q (want local|remote|dynamic)", t.Mode)
+		return fmt.Errorf("unknown mode %q (want local|remote|dynamic|vpn)", t.Mode)
 	}
 	if t.SSH.Addr == "" || t.SSH.User == "" {
 		return errors.New("ssh.addr and ssh.user are required")

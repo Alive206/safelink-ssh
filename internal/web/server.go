@@ -21,13 +21,14 @@ type Server struct {
 	httpSrv *http.Server
 	auth    *authenticator
 	log     *slog.Logger
+	handler *handler
 }
 
 // New wires the manager + auth + log broadcaster into an *http.Server.
 // The server is not started until Run is called.
-func New(cfg config.WebCfg, mgr *manager.Manager, bcast *logging.Broadcaster, log *slog.Logger) *Server {
+func New(cfg config.WebCfg, role string, mgr *manager.Manager, bcast *logging.Broadcaster, log *slog.Logger) *Server {
 	auth := newAuthenticator(cfg.Auth)
-	h := newHandler(mgr, bcast, auth, log)
+	h := newHandler(mgr, bcast, auth, log, role)
 
 	mux := http.NewServeMux()
 	h.routes(mux)
@@ -37,7 +38,12 @@ func New(cfg config.WebCfg, mgr *manager.Manager, bcast *logging.Broadcaster, lo
 		Handler:           withLogging(log, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	return &Server{httpSrv: srv, auth: auth, log: log.With("component", "web")}
+	return &Server{httpSrv: srv, auth: auth, log: log.With("component", "web"), handler: h}
+}
+
+// SetShutdownFunc sets the function called when POST /api/shutdown is invoked.
+func (s *Server) SetShutdownFunc(fn func()) {
+	s.handler.shutdownFn = fn
 }
 
 // Run blocks serving HTTP until ctx is cancelled, then performs a graceful
@@ -65,6 +71,11 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 	}()
+
+	// Subscription auto-refresh loop (only for client/standalone).
+	if s.handler.role != config.RoleServer {
+		go s.handler.subscriptionRefreshLoop(ctx)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

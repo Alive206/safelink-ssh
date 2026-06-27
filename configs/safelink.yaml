@@ -5,6 +5,12 @@
 #
 # All durations use Go's time.ParseDuration syntax: e.g. 30s, 1m, 1m30s.
 
+# Application role: server | client | standalone (default)
+#   server     — VPN deployment, subscription publishing, server management
+#   client     — SSH tunnel connections, VPN client, subscription import
+#   standalone — all features enabled (backward compatible)
+role: standalone
+
 log_level: info
 
 # Path to the strict-mode known_hosts file.  Must already contain the SSH
@@ -29,7 +35,7 @@ web:
     api_token: ""
     users:
       - username: admin
-        password_hash: "$2a$12$NKg2AegLKuPaRdIa.kPHMOzx5CdB6BnhdRZtJ7LJH570nfpD89G6q"   # Generate with: safelink.exe passwd admin
+        password_hash: "$2a$12$KXVNZ0McwBWr4kPFkV9cdOILKrYbOw9twEPCsG7htPGHNrEsz6INi"   # password: admin123
 
 # Tunnels can be added via the web UI or by editing this section.
 tunnels: []

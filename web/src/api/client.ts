@@ -34,6 +34,18 @@ export const api = {
   del: <T>(p: string) => request<T>('DELETE', p),
 }
 
+// ----- role -----
+
+export type AppRole = 'server' | 'client' | 'standalone'
+
+export interface RoleInfo {
+  role: AppRole
+}
+
+export const appRole = {
+  get: () => api.get<RoleInfo>('/api/role'),
+}
+
 // ----- domain types -----
 
 export interface SSHCfg {
@@ -44,12 +56,19 @@ export interface SSHCfg {
   password?: string
 }
 
+export interface TunCfg {
+  subnet: string
+  dns?: string[]
+  auto_route?: boolean
+}
+
 export interface TunnelCfg {
   name: string
-  mode: 'local' | 'remote' | 'dynamic'
+  mode: 'local' | 'remote' | 'dynamic' | 'vpn'
   listen: string
   forward?: string
   ssh: SSHCfg
+  tun?: TunCfg
 }
 
 export interface Snapshot {
@@ -67,6 +86,7 @@ export interface TunnelStatus {
   uptime_seconds: number
   run_count: number
   stats: Snapshot
+  route_active?: boolean
 }
 
 export interface AuthInfo {
@@ -84,6 +104,7 @@ export const tunnels = {
   start: (name: string) => api.post<void>(`/api/tunnels/${encodeURIComponent(name)}/start`),
   stop: (name: string) => api.post<void>(`/api/tunnels/${encodeURIComponent(name)}/stop`),
   restart: (name: string) => api.post<void>(`/api/tunnels/${encodeURIComponent(name)}/restart`),
+  setRoute: (name: string, enable: boolean) => api.post<{ ok: boolean; route_active: boolean }>(`/api/tunnels/${encodeURIComponent(name)}/route`, { enable }),
 }
 
 export const auth = {
@@ -126,4 +147,114 @@ export const keys = {
     }
     return data as KeyInfo
   },
+}
+
+// ----- vpn driver -----
+
+export interface DriverStatus {
+  os: string
+  installed: boolean
+  driver_path?: string
+  message: string
+  can_auto_fix: boolean
+}
+
+export const vpn = {
+  checkDriver: () => api.get<DriverStatus>('/api/vpn/driver'),
+  installDriver: () => api.post<DriverStatus>('/api/vpn/driver/install'),
+}
+
+// ----- vpn deploy -----
+
+export interface VPSDeployParams {
+  ssh: SSHCfg
+  subnet: string
+  vpn_user: string
+  vpn_pass: string
+  local_name?: string
+  force?: boolean
+}
+
+export interface VPSDeployResult {
+  server_addr: string
+  server_port: string
+  subnet: string
+  vpn_user: string
+  vpn_pass: string
+  egress_iface: string
+  status: string
+  build_method?: string
+  error_message?: string
+  tunnel_name?: string
+}
+
+export const deploy = {
+  toVPS: (params: VPSDeployParams) => api.post<VPSDeployResult>('/api/vpn/deploy', params),
+}
+
+// ----- vpn servers -----
+
+export interface VPNServer {
+  id: string
+  name: string
+  server_addr: string
+  server_port: string
+  subnet: string
+  vpn_user: string
+  vpn_pass: string
+  ssh_addr?: string
+  ssh_user?: string
+  ssh_password?: string
+  egress_iface?: string
+  status: string
+  created_at: string
+}
+
+export const vpnServers = {
+  list: () => api.get<VPNServer[]>('/api/vpn/servers'),
+  add: (srv: Partial<VPNServer>) => api.post<VPNServer>('/api/vpn/servers', srv),
+  remove: (id: string) => api.del<void>(`/api/vpn/servers/${encodeURIComponent(id)}`),
+}
+
+// ----- subscription -----
+
+export interface SubscriptionToken {
+  token: string
+  url: string
+}
+
+export interface SubscriptionSource {
+  id: string
+  name: string
+  url: string
+  format: 'auto' | 'json' | 'clash'
+  auto_refresh: boolean
+  interval_min: number
+  last_refresh?: string
+  last_error?: string
+  tunnel_count: number
+}
+
+export interface ImportResult {
+  imported: number
+  skipped: number
+  errors: string[]
+  nodes?: NodeInfo[]
+}
+
+export interface NodeInfo {
+  name: string
+  mode: string
+  address: string
+}
+
+export const subscription = {
+  getToken: () => api.get<SubscriptionToken>('/api/subscription/token'),
+  regenerateToken: () => api.post<SubscriptionToken>('/api/subscription/token/regenerate'),
+  getNodes: () => api.get<NodeInfo[]>('/api/subscription/nodes'),
+  listImports: () => api.get<SubscriptionSource[]>('/api/subscription/imports'),
+  addImport: (src: { name: string; url: string; format?: string; auto_refresh?: boolean; interval_min?: number }) =>
+    api.post<SubscriptionSource>('/api/subscription/imports', src),
+  removeImport: (id: string) => api.del<void>(`/api/subscription/imports/${encodeURIComponent(id)}`),
+  refreshImport: (id: string) => api.post<ImportResult>(`/api/subscription/imports/${encodeURIComponent(id)}/refresh`),
 }

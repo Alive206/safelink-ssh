@@ -1,5 +1,5 @@
-// Package tunnel implements the three SSH forwarding modes (-L / -R / -D) on
-// top of an established *ssh.Client.
+// Package tunnel implements the forwarding modes (-L / -R / -D / VPN) on
+// top of an established *ssh.Client (or QUIC transport for VPN).
 package tunnel
 
 import (
@@ -26,6 +26,8 @@ func Build(t config.TunnelCfg, log *slog.Logger, stats *Stats) (sshclient.Tunnel
 		return &Remote{cfg: t, log: tlog, stats: stats}, nil
 	case config.ModeDynamic:
 		return &Dynamic{cfg: t, log: tlog, stats: stats}, nil
+	case config.ModeVPN:
+		return NewVPN(t, tlog, stats), nil
 	default:
 		return nil, fmt.Errorf("unknown tunnel mode %q", t.Mode)
 	}

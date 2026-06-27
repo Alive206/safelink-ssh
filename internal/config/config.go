@@ -18,6 +18,7 @@ import (
 // rewrite.  The YAML may still embed `tunnels:` for backwards compatibility;
 // the store layer decides which source wins.
 type Config struct {
+	Role            string       `yaml:"role" json:"role"`
 	LogLevel        string       `yaml:"log_level" json:"log_level"`
 	KnownHosts      string       `yaml:"known_hosts" json:"known_hosts"`
 	InsecureHostKey bool         `yaml:"insecure_host_key" json:"insecure_host_key"`
@@ -62,12 +63,58 @@ type UserCfg struct {
 //	mode=local   listen on local addr, dial forward via SSH
 //	mode=remote  ask remote sshd to listen, dial forward locally
 //	mode=dynamic local SOCKS5 server, dial via SSH
+//	mode=vpn     TUN virtual NIC + SOCKS5 packet forwarder
 type TunnelCfg struct {
 	Name    string `yaml:"name" json:"name"`
 	Mode    string `yaml:"mode" json:"mode"`
 	SSH     SSHCfg `yaml:"ssh" json:"ssh"`
 	Listen  string `yaml:"listen" json:"listen"`
 	Forward string `yaml:"forward" json:"forward"`
+
+	// Transport wraps the SSH TCP connection before the ssh handshake.
+	// "direct" (default) uses a plain TCP dial; "tls" wraps with TLS to
+	// resemble HTTPS traffic and evade detection.
+	Transport string `yaml:"transport" json:"transport"`
+
+	// Tun is required when Mode is "vpn" and ignored otherwise.
+	Tun TunCfg `yaml:"tun" json:"tun"`
+}
+
+// TunCfg configures the TUN virtual network interface for VPN mode.
+type TunCfg struct {
+	// Subnet is the CIDR for the TUN interface IP and netmask,
+	// e.g. "10.0.8.1/24".  The first IP is assigned to the TUN interface.
+	Subnet string `yaml:"subnet" json:"subnet"`
+
+	// DNS lists DNS server addresses pushed when the TUN interface comes up.
+	DNS []string `yaml:"dns" json:"dns"`
+
+	// AutoRoute when true automatically adds a default route through the TUN
+	// so all traffic (0.0.0.0/0) is forwarded via the VPN gateway.
+	AutoRoute bool `yaml:"auto_route" json:"auto_route"`
+
+	// TLSCert is the path to the TLS certificate file (PEM) for the QUIC
+	// server.  When empty, a self-signed certificate is generated.
+	TLSCert string `yaml:"tls_cert" json:"tls_cert"`
+
+	// TLSKey is the path to the TLS private key file (PEM) for the QUIC
+	// server.  Required when TLSCert is set.
+	TLSKey string `yaml:"tls_key" json:"tls_key"`
+
+	// SNI is the Server Name Indication sent in the TLS ClientHello.
+	// When empty, defaults to a common CDN domain for traffic disguise.
+	SNI string `yaml:"sni" json:"sni"`
+
+	// PinSHA256 is the hex-encoded SHA-256 hash of the server's TLS
+	// certificate public key (SPKI).  When set, the client verifies the
+	// server's certificate fingerprint against this value, providing MITM
+	// protection without needing a CA.  When empty, no pinning is performed.
+	PinSHA256 string `yaml:"pin_sha256" json:"pin_sha256"`
+
+	// Padding enables packet-length obfuscation.  Data frames are padded
+	// to multiples of PaddingBlock bytes to defeat statistical traffic
+	// analysis.  Defaults to true.
+	Padding *bool `yaml:"padding" json:"padding"`
 }
 
 // SSHCfg describes how to authenticate to the SSH server.
@@ -86,6 +133,14 @@ const (
 	ModeLocal   = "local"
 	ModeRemote  = "remote"
 	ModeDynamic = "dynamic"
+	ModeVPN     = "vpn"
+)
+
+// Role values.
+const (
+	RoleServer     = "server"
+	RoleClient     = "client"
+	RoleStandalone = "standalone"
 )
 
 // Load reads and parses the YAML config from path, expands ${ENV} references

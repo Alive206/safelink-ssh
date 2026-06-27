@@ -10,12 +10,12 @@ import (
 	"github.com/example/sshtunneld/internal/config"
 )
 
-// buildAuthMethods produces the ordered list of ssh.AuthMethod to advertise.
+// BuildAuthMethods produces the ordered list of ssh.AuthMethod to advertise.
 // Public-key (when an identity_file is given) is always offered first; a
 // password method is appended if password is set.  This lets users combine
 // both: the SSH server picks whichever it accepts, and the client falls back
 // to password authentication if publickey is rejected.
-func buildAuthMethods(c config.SSHCfg) ([]ssh.AuthMethod, error) {
+func BuildAuthMethods(c config.SSHCfg) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
 	if c.IdentityFile != "" {

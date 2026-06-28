@@ -145,6 +145,15 @@ func (v *VPN) runOnce(ctx context.Context) error {
 		return fmt.Errorf("quic dial: %w", err)
 	}
 	defer qconn.CloseWithError(0, "session done")
+	cancelCloseDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = qconn.CloseWithError(0, "context canceled")
+		case <-cancelCloseDone:
+		}
+	}()
+	defer close(cancelCloseDone)
 
 	// Open a control stream for authentication.
 	ctl, err := qconn.OpenStreamSync(ctx)

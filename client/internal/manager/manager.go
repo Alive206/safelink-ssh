@@ -114,15 +114,29 @@ func (m *Manager) Start(ctx context.Context) {
 
 // StopAll cancels every running supervisor.
 func (m *Manager) StopAll() {
+	m.stopAllWithTimeout(0)
+}
+
+// StopAllTimeout cancels every running tunnel and waits up to timeout per tunnel.
+// It returns false if any tunnel did not report completion before the timeout.
+func (m *Manager) StopAllTimeout(timeout time.Duration) bool {
+	return m.stopAllWithTimeout(timeout)
+}
+
+func (m *Manager) stopAllWithTimeout(timeout time.Duration) bool {
 	m.mu.RLock()
 	mts := make([]*managedTunnel, 0, len(m.tunnels))
 	for _, mt := range m.tunnels {
 		mts = append(mts, mt)
 	}
 	m.mu.RUnlock()
+	ok := true
 	for _, mt := range mts {
-		m.stopManaged(mt)
+		if !m.stopManagedWithTimeout(mt, timeout) {
+			ok = false
+		}
 	}
+	return ok
 }
 
 // List returns all tunnel statuses.
@@ -163,6 +177,9 @@ func (m *Manager) Stats() map[string]tunnel.Snapshot {
 
 // Add validates, inserts, persists, and starts a new tunnel.
 func (m *Manager) Add(tc config.TunnelCfg) error {
+	if err := config.ValidateTunnel(tc); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if _, exists := m.tunnels[tc.Name]; exists {
 		m.mu.Unlock()
@@ -185,6 +202,9 @@ func (m *Manager) Add(tc config.TunnelCfg) error {
 // Update replaces a tunnel's config.
 func (m *Manager) Update(name string, tc config.TunnelCfg) error {
 	tc.Name = name
+	if err := config.ValidateTunnel(tc); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	mt, ok := m.tunnels[name]
 	if !ok {
@@ -292,6 +312,44 @@ func (m *Manager) BulkMerge(incoming []config.TunnelCfg, prefix string) (importe
 		}
 	}
 	return
+}
+
+// BulkUpsert imports tunnel configs without starting new tunnels.
+func (m *Manager) BulkUpsert(incoming []config.TunnelCfg, prefix string) (imported, skipped int, errs []string) {
+	m.mu.Lock()
+	for _, tc := range incoming {
+		if prefix != "" {
+			tc.Name = prefix + tc.Name
+		}
+		if err := config.ValidateTunnel(tc); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", tc.Name, err))
+			skipped++
+			continue
+		}
+		if mt, exists := m.tunnels[tc.Name]; exists {
+			if mt.cancel != nil {
+				errs = append(errs, fmt.Sprintf("%s: running tunnel was not updated", tc.Name))
+				skipped++
+				continue
+			}
+			mt.cfg = tc
+			imported++
+			continue
+		}
+		mt := &managedTunnel{cfg: tc, stats: tunnel.NewStats()}
+		mt.state.Store(sshclient.StateStopped)
+		m.tunnels[tc.Name] = mt
+		imported++
+	}
+	m.mu.Unlock()
+
+	if imported == 0 {
+		return imported, skipped, errs
+	}
+	if err := m.persist(); err != nil {
+		errs = append(errs, fmt.Sprintf("persist tunnels: %v", err))
+	}
+	return imported, skipped, errs
 }
 
 // --- internals ---
@@ -409,18 +467,34 @@ func (m *Manager) startVPN(mt *managedTunnel, vpn *tunnel.VPN) error {
 }
 
 func (m *Manager) stopManaged(mt *managedTunnel) {
+	m.stopManagedWithTimeout(mt, 0)
+}
+
+func (m *Manager) stopManagedWithTimeout(mt *managedTunnel, timeout time.Duration) bool {
 	m.mu.Lock()
 	cancel := mt.cancel
 	done := mt.done
 	mt.cancel = nil
 	m.mu.Unlock()
 	if cancel == nil {
-		return
+		return true
 	}
 	cancel()
 	if done != nil {
-		<-done
+		if timeout <= 0 {
+			<-done
+			return true
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+			return true
+		case <-timer.C:
+			return false
+		}
 	}
+	return true
 }
 
 func (m *Manager) persist() error {

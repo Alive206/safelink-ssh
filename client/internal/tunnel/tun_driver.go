@@ -13,11 +13,13 @@ import (
 
 // DriverStatus describes the TUN driver state on the current system.
 type DriverStatus struct {
-	OS         string `json:"os"`
-	Installed  bool   `json:"installed"`
-	DriverPath string `json:"driver_path,omitempty"`
-	Message    string `json:"message"`
-	CanAutoFix bool   `json:"can_auto_fix"`
+	OS              string `json:"os"`
+	Installed       bool   `json:"installed"`
+	DriverPath      string `json:"driver_path,omitempty"`
+	Message         string `json:"message"`
+	CanAutoFix      bool   `json:"can_auto_fix"`
+	IsAdmin         bool   `json:"is_admin"`
+	CanRequestAdmin bool   `json:"can_request_admin"`
 }
 
 // CheckDriver detects whether the TUN driver is available.
@@ -32,6 +34,9 @@ func CheckDriver() (*DriverStatus, error) {
 		return st, nil
 
 	case "windows":
+		st.IsAdmin = IsRunningAsAdmin()
+		st.CanRequestAdmin = !st.IsAdmin
+
 		dirs := []string{
 			filepath.Dir(os.Args[0]),
 			".",
@@ -45,8 +50,12 @@ func CheckDriver() (*DriverStatus, error) {
 			if _, err := os.Stat(p); err == nil {
 				st.Installed = true
 				st.DriverPath = p
-				st.Message = "Wintun driver installed"
-				st.CanAutoFix = false
+				if st.IsAdmin {
+					st.Message = "Wintun driver installed"
+				} else {
+					st.Message = "Wintun driver installed, but administrator privileges are required to create TUN device"
+				}
+				st.CanAutoFix = !st.IsAdmin
 				return st, nil
 			}
 		}

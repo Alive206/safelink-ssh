@@ -24,13 +24,13 @@ func ValidateTunnel(t TunnelCfg) error {
 		}
 	case ModeVPN:
 		if t.Forward == "" {
-			return errors.New("vpn mode requires forward (remote server address)")
+			return errors.New("vpn mode requires server address")
 		}
 		if t.SSH.User == "" {
-			return errors.New("vpn mode requires ssh.user (auth username)")
+			return errors.New("vpn mode requires auth username")
 		}
 		if t.SSH.Password == "" {
-			return errors.New("vpn mode requires ssh.password (auth secret)")
+			return errors.New("vpn mode requires auth password or token")
 		}
 		return nil
 	default:

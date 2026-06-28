@@ -1,0 +1,10 @@
+log_level: info
+known_hosts: ${USERPROFILE}\.ssh\known_hosts
+insecure_host_key: false
+defaults:
+  keepalive_interval: 30s
+  keepalive_max_fails: 3
+  dial_timeout: 10s
+  reconnect_initial: 1s
+  reconnect_max: 60s
+tunnels: []

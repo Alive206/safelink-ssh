@@ -1,0 +1,18 @@
+# SafeLink Server Configuration
+listen: :1562
+subnet: 10.0.8.0/24
+
+web:
+  addr: 0.0.0.0:8080
+  auth:
+    users:
+      - username: admin
+        password_hash: "$2a$12$KXVNZ0McwBWr4kPFkV9cdOILKrYbOw9twEPCsG7htPGHNrEsz6INi"
+
+tls:
+  cert: ""
+  key: ""
+
+nat:
+  enabled: true
+  iface: eth0

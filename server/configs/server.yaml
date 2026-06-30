@@ -7,7 +7,7 @@ web:
   auth:
     users:
       - username: admin
-        password_hash: "$2a$12$KXVNZ0McwBWr4kPFkV9cdOILKrYbOw9twEPCsG7htPGHNrEsz6INi"
+        password_hash: "$2a$12$NBYtqM3qNrAl0UgNp9wGDORn5qwALLplGp3oSs2s78AfV392ouqVC"
 
 tls:
   cert: ""

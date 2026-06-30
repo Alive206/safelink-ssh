@@ -5,17 +5,21 @@ services:
       dockerfile: server/Dockerfile
     ports:
       - "1562:1562/udp"
-      - "8080:8080"
+      - "8081:8080"
     volumes:
       - safelink-data:/data
     cap_add:
       - NET_ADMIN
+    privileged: true
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
       - VPN_SUBNET=10.0.8.0/24
+      - VPN_CLIENT_SUBNET=10.8.0.2/24
       - VPN_USER=admin
       - VPN_PASS=changeme
+      - VPN_PUBLIC_ADDR=vpn.example.com:1562
+      - SUBSCRIPTION_TOKEN=change-this-token
     restart: unless-stopped
 
 volumes:

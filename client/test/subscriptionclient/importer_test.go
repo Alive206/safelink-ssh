@@ -51,7 +51,7 @@ func TestImportFetchesAndImportsVPNTunnels(t *testing.T) {
 	if len(subs) != 1 {
 		t.Fatalf("len(subs) = %d, want 1", len(subs))
 	}
-	if subs[0].Format != subscription.FormatSafeLinkJSON || subs[0].TunnelCount != 1 || subs[0].LastRefresh == "" {
+	if subs[0].Format != subscription.FormatSafeLinkJSON || subs[0].TunnelCount != 1 || subs[0].LastRefresh == "" || !subs[0].Enabled {
 		t.Fatalf("subscription metadata not updated: %+v", subs[0])
 	}
 
@@ -87,6 +87,9 @@ proxies:
 	}
 	if result.Kind != store.SubscriptionKindProxy || result.Imported != 1 {
 		t.Fatalf("unexpected import result: %+v", result)
+	}
+	if !result.Source.Enabled {
+		t.Fatalf("imported subscription should be enabled by default: %+v", result.Source)
 	}
 
 	nodes, err := st.LoadProxyNodes()

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/example/safelink/client/internal/manager"
@@ -15,6 +16,7 @@ import (
 	"github.com/example/safelink/client/internal/sshsession"
 	"github.com/example/safelink/client/internal/store"
 	"github.com/example/safelink/client/internal/subscriptionclient"
+	"github.com/example/safelink/client/internal/sysproxy"
 	"github.com/example/safelink/client/internal/tunnel"
 	"github.com/example/safelink/pkg/config"
 	"github.com/example/safelink/pkg/proxysubscription"
@@ -30,6 +32,16 @@ type App struct {
 	sshTerm *sshsession.Manager
 	proxy   *proxycore.Runner
 	log     *slog.Logger
+	logMu   sync.Mutex
+	logs    []LogEntry
+}
+
+// LogEntry is a lightweight UI-visible event log.
+type LogEntry struct {
+	Time    string `json:"time"`
+	Level   string `json:"level"`
+	Module  string `json:"module"`
+	Message string `json:"message"`
 }
 
 // NewApp creates a new App application struct.
@@ -51,9 +63,11 @@ func (a *App) startup(ctx context.Context) {
 	_ = os.MkdirAll(dataDir, 0o755)
 
 	a.store = store.New(dataDir)
+	settings, _ := a.store.LoadSettings()
 	a.proxy = proxycore.New(proxycore.Options{
 		CorePath: proxycore.FindCorePath(filepath.Dir(os.Args[0])),
 		WorkDir:  filepath.Join(dataDir, "proxy"),
+		Mode:     settings.ProxyMode,
 	})
 	tunnels, _ := a.store.LoadTunnels()
 	defaults := config.ConnDefaults{
@@ -88,6 +102,14 @@ func (a *App) shutdown(_ context.Context) {
 	if a.sshTerm != nil {
 		a.sshTerm.CloseAll()
 	}
+	if a.store != nil {
+		if settings, err := a.store.LoadSettings(); err == nil && settings.SystemProxy {
+			if err := sysproxy.SetSystemProxy(false, "", ""); err == nil {
+				settings.SystemProxy = false
+				_ = a.store.SaveSettings(settings)
+			}
+		}
+	}
 	if a.proxy != nil {
 		_ = a.proxy.Stop()
 	}
@@ -105,32 +127,44 @@ func (a *App) ListTunnels() []manager.Status {
 
 // AddTunnel adds and starts a new tunnel.
 func (a *App) AddTunnel(cfg config.TunnelCfg) error {
-	return a.manager.Add(cfg)
+	err := a.manager.Add(cfg)
+	a.recordLog("info", "SSH 隧道", fmt.Sprintf("新增隧道：%s", cfg.Name), err)
+	return err
 }
 
 // UpdateTunnel updates an existing tunnel config.
 func (a *App) UpdateTunnel(name string, cfg config.TunnelCfg) error {
-	return a.manager.Update(name, cfg)
+	err := a.manager.Update(name, cfg)
+	a.recordLog("info", "SSH 隧道", fmt.Sprintf("更新隧道：%s", name), err)
+	return err
 }
 
 // DeleteTunnel removes a tunnel.
 func (a *App) DeleteTunnel(name string) error {
-	return a.manager.Delete(name)
+	err := a.manager.Delete(name)
+	a.recordLog("info", "SSH 隧道", fmt.Sprintf("删除隧道：%s", name), err)
+	return err
 }
 
 // StartTunnel starts a stopped tunnel.
 func (a *App) StartTunnel(name string) error {
-	return a.manager.StartTunnel(name)
+	err := a.manager.StartTunnel(name)
+	a.recordLog("info", "SSH 隧道", fmt.Sprintf("启动隧道：%s", name), err)
+	return err
 }
 
 // StopTunnel stops a running tunnel.
 func (a *App) StopTunnel(name string) error {
-	return a.manager.Stop(name)
+	err := a.manager.Stop(name)
+	a.recordLog("info", "SSH 隧道", fmt.Sprintf("停止隧道：%s", name), err)
+	return err
 }
 
 // RestartTunnel restarts a tunnel.
 func (a *App) RestartTunnel(name string) error {
-	return a.manager.Restart(name)
+	err := a.manager.Restart(name)
+	a.recordLog("info", "SSH 隧道", fmt.Sprintf("重启隧道：%s", name), err)
+	return err
 }
 
 // ToggleRoute enables or disables the global route for a VPN tunnel.
@@ -172,20 +206,79 @@ func (a *App) ListSSHConnections() ([]store.SSHConnection, error) {
 
 // SaveSSHConnection creates or updates a saved SSH terminal connection profile.
 func (a *App) SaveSSHConnection(conn store.SSHConnection) (store.SSHConnection, error) {
-	return a.store.SaveSSHConnection(conn)
+	saved, err := a.store.SaveSSHConnection(conn)
+	a.recordLog("info", "SSH 终端", fmt.Sprintf("保存连接：%s", conn.Name), err)
+	return saved, err
 }
 
 // DeleteSSHConnection removes a saved SSH terminal connection profile.
 func (a *App) DeleteSSHConnection(id string) error {
-	return a.store.DeleteSSHConnection(id)
+	err := a.store.DeleteSSHConnection(id)
+	a.recordLog("info", "SSH 终端", fmt.Sprintf("删除连接：%s", id), err)
+	return err
 }
 
 // --- Subscription Management ---
 
 // ImportSubscription adds a subscription URL and fetches its tunnels.
 func (a *App) ImportSubscription(name, url string) error {
-	_, err := subscriptionclient.Import(a.ctx, a.manager, a.store, name, url)
+	result, err := subscriptionclient.Import(a.ctx, a.manager, a.store, name, url)
+	message := fmt.Sprintf("导入订阅：%s", name)
+	if err == nil {
+		message = fmt.Sprintf("导入订阅：%s（%s，%d 条）", name, result.Kind, result.Imported)
+	}
+	a.recordLog("info", "订阅", message, err)
 	return err
+}
+
+// RefreshSubscription refreshes a stored subscription by ID.
+func (a *App) RefreshSubscription(id string) error {
+	result, err := subscriptionclient.Refresh(a.ctx, a.manager, a.store, id)
+	message := fmt.Sprintf("刷新订阅：%s", id)
+	if err == nil {
+		message = fmt.Sprintf("刷新订阅：%s（%d 条）", result.Source.Name, result.Imported)
+	}
+	a.recordLog("info", "订阅", message, err)
+	return err
+}
+
+// RefreshAllSubscriptions refreshes all stored subscriptions.
+func (a *App) RefreshAllSubscriptions() (int, int, []string) {
+	imported, skipped, errs := subscriptionclient.RefreshAll(a.ctx, a.manager, a.store)
+	a.recordLog("info", "订阅", fmt.Sprintf("刷新全部订阅：导入 %d 条，跳过 %d 条", imported, skipped), nil)
+	return imported, skipped, errs
+}
+
+// UpdateSubscription updates subscription metadata and refreshes it.
+func (a *App) UpdateSubscription(id, name, url string, autoRefresh bool, intervalMin int) error {
+	result, err := subscriptionclient.Update(a.ctx, a.manager, a.store, id, name, url, autoRefresh, intervalMin)
+	message := fmt.Sprintf("更新订阅：%s", name)
+	if err == nil {
+		message = fmt.Sprintf("更新订阅：%s（%d 条）", result.Source.Name, result.Imported)
+	}
+	a.recordLog("info", "订阅", message, err)
+	return err
+}
+
+// ToggleSubscription enables or disables a subscription as an active node source.
+func (a *App) ToggleSubscription(id string, enabled bool) error {
+	src, err := a.store.SetSubscriptionEnabled(id, enabled)
+	if err != nil {
+		a.recordLog("error", "订阅", fmt.Sprintf("切换订阅：%s", id), err)
+		return err
+	}
+	if !enabled {
+		if err := a.stopProxyIfSubscriptionDisabled(id); err != nil {
+			a.recordLog("error", "订阅", fmt.Sprintf("停用订阅：%s", src.Name), err)
+			return err
+		}
+	}
+	state := "停用"
+	if enabled {
+		state = "启用"
+	}
+	a.recordLog("info", "订阅", fmt.Sprintf("%s订阅：%s", state, src.Name), nil)
+	return nil
 }
 
 // ListSubscriptions returns all subscription sources.
@@ -195,36 +288,250 @@ func (a *App) ListSubscriptions() ([]store.SubscriptionSource, error) {
 
 // DeleteSubscription removes a subscription by ID.
 func (a *App) DeleteSubscription(id string) error {
-	return a.store.DeleteSubscription(id)
+	err := a.store.DeleteSubscription(id)
+	a.recordLog("info", "订阅", fmt.Sprintf("删除订阅：%s", id), err)
+	return err
 }
 
 // ListProxyNodes returns all proxy nodes imported from mainstream subscriptions.
 func (a *App) ListProxyNodes() ([]proxysubscription.ProxyNode, error) {
-	return a.store.LoadProxyNodes()
+	return a.store.LoadActiveProxyNodes()
+}
+
+// GetClientSettings returns locally persisted proxy and startup settings.
+func (a *App) GetClientSettings() (store.ClientSettings, error) {
+	return a.store.LoadSettings()
+}
+
+// SetProxyMode changes the sing-box routing mode and restarts the running node if needed.
+func (a *App) SetProxyMode(mode string) error {
+	mode = proxycore.NormalizeMode(mode)
+	settings, err := a.store.LoadSettings()
+	if err != nil {
+		return err
+	}
+	settings.ProxyMode = mode
+	if err := a.store.SaveSettings(settings); err != nil {
+		return err
+	}
+	a.proxy.SetMode(mode)
+
+	status := a.proxy.Status()
+	if status.State == proxycore.StateRunning && status.NodeName != "" {
+		if err := a.restartProxyNode(status.NodeName, settings); err != nil {
+			a.recordLog("error", "代理模式", fmt.Sprintf("切换模式：%s", mode), err)
+			return err
+		}
+	}
+	a.recordLog("info", "代理模式", fmt.Sprintf("切换模式：%s", proxyModeLabel(mode)), nil)
+	return nil
+}
+
+// SetSystemProxyEnabled enables or disables the OS system proxy.
+func (a *App) SetSystemProxyEnabled(enabled bool) error {
+	settings, err := a.store.LoadSettings()
+	if err != nil {
+		return err
+	}
+	status := a.proxy.Status()
+	if enabled && status.State != proxycore.StateRunning {
+		return errors.New("请先连接节点，再启用系统代理")
+	}
+	if err := sysproxy.SetSystemProxy(enabled, status.HTTPAddr, status.SOCKSAddr); err != nil {
+		a.recordLog("error", "系统代理", "切换系统代理", err)
+		return err
+	}
+	settings.SystemProxy = enabled
+	if err := a.store.SaveSettings(settings); err != nil {
+		return err
+	}
+	state := "关闭"
+	if enabled {
+		state = "开启"
+	}
+	a.recordLog("info", "系统代理", state+"系统代理", nil)
+	return nil
+}
+
+// SetAutoStartEnabled adds or removes SafeLink from the user startup entries.
+func (a *App) SetAutoStartEnabled(enabled bool) error {
+	settings, err := a.store.LoadSettings()
+	if err != nil {
+		return err
+	}
+	if err := sysproxy.SetAutoStart(enabled); err != nil {
+		a.recordLog("error", "启动项", "切换开机自启", err)
+		return err
+	}
+	settings.AutoStart = enabled
+	if err := a.store.SaveSettings(settings); err != nil {
+		return err
+	}
+	state := "关闭"
+	if enabled {
+		state = "开启"
+	}
+	a.recordLog("info", "启动项", state+"开机自启", nil)
+	return nil
 }
 
 // StartProxyNode starts sing-box with a selected proxy node.
 func (a *App) StartProxyNode(nodeName string) error {
-	nodes, err := a.store.LoadProxyNodes()
+	nodes, err := a.store.LoadActiveProxyNodes()
 	if err != nil {
 		return err
 	}
+	settings, err := a.store.LoadSettings()
+	if err != nil {
+		return err
+	}
+	a.proxy.SetMode(settings.ProxyMode)
 	for _, node := range nodes {
 		if node.Name == nodeName {
-			return a.proxy.Start(a.ctx, node)
+			if status := a.proxy.Status(); status.State == proxycore.StateRunning {
+				if status.NodeName == node.Name {
+					return a.enableSystemProxy(&settings)
+				}
+				if err := a.proxy.Stop(); err != nil {
+					return err
+				}
+			}
+			err := a.proxy.Start(a.ctx, node)
+			if err == nil {
+				if proxyErr := a.enableSystemProxy(&settings); proxyErr != nil {
+					_ = a.proxy.Stop()
+					err = proxyErr
+				}
+			}
+			a.recordLog("info", "节点", fmt.Sprintf("切换节点：%s", node.Name), err)
+			return err
 		}
 	}
-	return fmt.Errorf("proxy node %q not found", nodeName)
+	err = fmt.Errorf("proxy node %q not found", nodeName)
+	a.recordLog("error", "节点", fmt.Sprintf("切换节点：%s", nodeName), err)
+	return err
+}
+
+// TestProxyNode measures HTTP latency through a selected proxy node.
+func (a *App) TestProxyNode(nodeName string) proxycore.TestResult {
+	nodes, err := a.store.LoadActiveProxyNodes()
+	if err != nil {
+		return proxycore.TestResult{NodeName: nodeName, OK: false, Error: err.Error(), TestedAt: time.Now().Format(time.RFC3339)}
+	}
+	for _, node := range nodes {
+		if node.Name == nodeName {
+			result := a.proxy.Test(a.ctx, node, 8*time.Second)
+			if result.OK {
+				a.recordLog("info", "节点", fmt.Sprintf("测试节点：%s，延迟 %d ms", node.Name, result.LatencyMS), nil)
+			} else {
+				a.recordLog("error", "节点", fmt.Sprintf("测试节点：%s", node.Name), errors.New(result.Error))
+			}
+			return result
+		}
+	}
+	err = fmt.Errorf("proxy node %q not found", nodeName)
+	a.recordLog("error", "节点", fmt.Sprintf("测试节点：%s", nodeName), err)
+	return proxycore.TestResult{NodeName: nodeName, OK: false, Error: err.Error(), TestedAt: time.Now().Format(time.RFC3339)}
 }
 
 // StopProxy stops the running sing-box process.
 func (a *App) StopProxy() error {
-	return a.proxy.Stop()
+	settings, settingsErr := a.store.LoadSettings()
+	if settingsErr == nil && settings.SystemProxy {
+		if err := sysproxy.SetSystemProxy(false, "", ""); err != nil {
+			a.recordLog("error", "系统代理", "关闭系统代理", err)
+			return err
+		}
+		settings.SystemProxy = false
+		if err := a.store.SaveSettings(settings); err != nil {
+			return err
+		}
+	}
+	err := a.proxy.Stop()
+	a.recordLog("info", "节点", "断开代理连接", err)
+	return err
 }
 
 // ProxyStatus returns the current sing-box runner status.
 func (a *App) ProxyStatus() proxycore.Status {
 	return a.proxy.Status()
+}
+
+func (a *App) restartProxyNode(nodeName string, settings store.ClientSettings) error {
+	nodes, err := a.store.LoadActiveProxyNodes()
+	if err != nil {
+		return err
+	}
+	var selected *proxysubscription.ProxyNode
+	for i := range nodes {
+		if nodes[i].Name == nodeName {
+			selected = &nodes[i]
+			break
+		}
+	}
+	if selected == nil {
+		return fmt.Errorf("proxy node %q not found", nodeName)
+	}
+	if err := a.proxy.Stop(); err != nil {
+		return err
+	}
+	a.proxy.SetMode(settings.ProxyMode)
+	if err := a.proxy.Start(a.ctx, *selected); err != nil {
+		return err
+	}
+	if settings.SystemProxy {
+		if err := a.enableSystemProxy(&settings); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) enableSystemProxy(settings *store.ClientSettings) error {
+	status := a.proxy.Status()
+	if status.State != proxycore.StateRunning {
+		return errors.New("请先连接节点，再启用系统代理")
+	}
+	if err := sysproxy.SetSystemProxy(true, status.HTTPAddr, status.SOCKSAddr); err != nil {
+		a.recordLog("error", "系统代理", "开启系统代理", err)
+		return err
+	}
+	if !settings.SystemProxy {
+		settings.SystemProxy = true
+		if err := a.store.SaveSettings(*settings); err != nil {
+			return err
+		}
+	}
+	a.recordLog("info", "系统代理", "开启系统代理", nil)
+	return nil
+}
+
+func proxyModeLabel(mode string) string {
+	switch proxycore.NormalizeMode(mode) {
+	case proxycore.ProxyModeGlobal:
+		return "全局模式"
+	case proxycore.ProxyModeDirect:
+		return "直连模式"
+	default:
+		return "规则模式"
+	}
+}
+
+func (a *App) stopProxyIfSubscriptionDisabled(subscriptionID string) error {
+	status := a.proxy.Status()
+	if status.State != proxycore.StateRunning || status.NodeName == "" {
+		return nil
+	}
+	nodes, err := a.store.LoadProxyNodes()
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if node.Name == status.NodeName && node.SubscriptionID == subscriptionID {
+			return a.StopProxy()
+		}
+	}
+	return nil
 }
 
 // --- Driver Status ---
@@ -289,6 +596,22 @@ func (a *App) GetDataDir() string {
 	return defaultDataDir()
 }
 
+// GetLogs returns recent UI-visible event logs.
+func (a *App) GetLogs() []LogEntry {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	out := make([]LogEntry, len(a.logs))
+	copy(out, a.logs)
+	return out
+}
+
+// ClearLogs clears UI-visible event logs.
+func (a *App) ClearLogs() {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	a.logs = nil
+}
+
 // BulkImportTunnels imports a batch of tunnel configs (from subscription).
 func (a *App) BulkImportTunnels(tunnels []config.TunnelCfg, prefix string) (int, int, []string) {
 	return a.manager.BulkMerge(tunnels, prefix)
@@ -297,4 +620,23 @@ func (a *App) BulkImportTunnels(tunnels []config.TunnelCfg, prefix string) (int,
 // Greet is a simple test binding.
 func (a *App) Greet(name string) string {
 	return fmt.Sprintf("Hello %s, SafeLink is running!", name)
+}
+
+func (a *App) recordLog(level, module, message string, err error) {
+	if err != nil {
+		level = "error"
+		message = fmt.Sprintf("%s：%v", message, err)
+	}
+	entry := LogEntry{
+		Time:    time.Now().Format(time.RFC3339),
+		Level:   level,
+		Module:  module,
+		Message: message,
+	}
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	a.logs = append(a.logs, entry)
+	if len(a.logs) > 500 {
+		a.logs = append([]LogEntry(nil), a.logs[len(a.logs)-500:]...)
+	}
 }

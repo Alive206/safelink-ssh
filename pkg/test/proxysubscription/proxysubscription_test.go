@@ -95,6 +95,8 @@ func TestParseSingleTrojanURI(t *testing.T) {
 
 func TestParseMixedAnyTLSTrojanBase64Subscription(t *testing.T) {
 	body := strings.Join([]string{
+		"anytls://69ea31ea-6a04-4680-b56d-a005c6bef593@xsus.xs-us.net:8001/?type=tcp&insecure=0&fp=chrome&sni=sni.example.com#剩余流量：142.45 GB",
+		"anytls://69ea31ea-6a04-4680-b56d-a005c6bef593@xsus.xs-us.net:8001/?type=tcp&insecure=0&fp=chrome&sni=sni.example.com#套餐到期：长期有效",
 		"anytls://69ea31ea-6a04-4680-b56d-a005c6bef593@xsus.xs-us.net:8001/?type=tcp&insecure=0&fp=chrome&sni=sni.example.com#anytls-node",
 		"trojan://69ea31ea-6a04-4680-b56d-a005c6bef593@zl.example.com:46613?allowInsecure=1&peer=us01.example.com&sni=us01.example.com&type=tcp#trojan-node",
 		"unsupported://bad-node",
@@ -113,6 +115,9 @@ func TestParseMixedAnyTLSTrojanBase64Subscription(t *testing.T) {
 	}
 	if nodes[0].Protocol != proxysubscription.ProtocolAnyTLS || nodes[0].Password == "" || nodes[0].TLS == nil {
 		t.Fatalf("unexpected anytls node: %+v", nodes[0])
+	}
+	if nodes[0].TLS.Fingerprint != "chrome" {
+		t.Fatalf("anytls fingerprint was not parsed: %+v", nodes[0].TLS)
 	}
 	if nodes[1].Protocol != proxysubscription.ProtocolTrojan || !nodes[1].TLS.Insecure {
 		t.Fatalf("unexpected trojan node: %+v", nodes[1])

@@ -7,6 +7,7 @@ import {proxysubscription} from '../models';
 import {store} from '../models';
 import {manager} from '../models';
 import {proxycore} from '../models';
+import {main} from '../models';
 
 export function AddTunnel(arg1:config.TunnelCfg):Promise<void>;
 
@@ -25,6 +26,10 @@ export function DeleteSubscription(arg1:string):Promise<void>;
 export function DeleteTunnel(arg1:string):Promise<void>;
 
 export function GetDataDir():Promise<string>;
+
+export function GetClientSettings():Promise<store.ClientSettings>;
+
+export function GetLogs():Promise<Array<main.LogEntry>>;
 
 export function GetStats():Promise<{[key: string]: tunnel.Snapshot}>;
 
@@ -50,7 +55,13 @@ export function ListTunnels():Promise<Array<manager.Status>>;
 
 export function ProxyStatus():Promise<proxycore.Status>;
 
+export function ClearLogs():Promise<void>;
+
 export function RequestAdminRestart():Promise<void>;
+
+export function RefreshAllSubscriptions():Promise<[number, number, Array<string>]>;
+
+export function RefreshSubscription(arg1:string):Promise<void>;
 
 export function ResizeSSHSession(arg1:string,arg2:number,arg3:number):Promise<void>;
 
@@ -60,6 +71,12 @@ export function SaveSSHConnection(arg1:store.SSHConnection):Promise<store.SSHCon
 
 export function SendSSHInput(arg1:string,arg2:string):Promise<void>;
 
+export function SetAutoStartEnabled(arg1:boolean):Promise<void>;
+
+export function SetProxyMode(arg1:string):Promise<void>;
+
+export function SetSystemProxyEnabled(arg1:boolean):Promise<void>;
+
 export function StartProxyNode(arg1:string):Promise<void>;
 
 export function StartTunnel(arg1:string):Promise<void>;
@@ -68,6 +85,12 @@ export function StopProxy():Promise<void>;
 
 export function StopTunnel(arg1:string):Promise<void>;
 
+export function TestProxyNode(arg1:string):Promise<proxycore.TestResult>;
+
 export function ToggleRoute(arg1:string,arg2:boolean):Promise<void>;
+
+export function ToggleSubscription(arg1:string,arg2:boolean):Promise<void>;
+
+export function UpdateSubscription(arg1:string,arg2:string,arg3:string,arg4:boolean,arg5:number):Promise<void>;
 
 export function UpdateTunnel(arg1:string,arg2:config.TunnelCfg):Promise<void>;

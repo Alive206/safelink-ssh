@@ -95,21 +95,10 @@ func New(cfgs []config.TunnelCfg, defaults config.ConnDefaults, log *slog.Logger
 	return m
 }
 
-// Start begins running every tunnel currently in the manager.
+// Start binds the manager to the application lifecycle context.
+// Tunnels remain stopped until StartTunnel is called explicitly.
 func (m *Manager) Start(ctx context.Context) {
 	m.rootCtx = ctx
-	m.mu.RLock()
-	names := make([]string, 0, len(m.tunnels))
-	for n := range m.tunnels {
-		names = append(names, n)
-	}
-	m.mu.RUnlock()
-
-	for _, name := range names {
-		if err := m.startTunnel(name); err != nil {
-			m.log.Warn("auto-start tunnel failed", "tunnel", name, "err", err)
-		}
-	}
 }
 
 // StopAll cancels every running supervisor.

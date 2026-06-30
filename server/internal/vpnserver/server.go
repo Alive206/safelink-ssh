@@ -41,10 +41,18 @@ type VPNServer struct {
 	TLSOpts    transport.TLSOpts
 	Padding    bool
 	Log        *slog.Logger
+	Runtime    *Runtime
 }
 
 // Run starts the VPN server and blocks until ctx is cancelled.
 func (s *VPNServer) Run(ctx context.Context) error {
+	if s.Runtime == nil {
+		s.Runtime = NewRuntime(RuntimeConfig{
+			ListenAddr: s.ListenAddr,
+			Subnet:     s.Subnet,
+			Padding:    s.Padding,
+		})
+	}
 	ln, err := transport.ListenQUIC(s.ListenAddr, s.TLSOpts)
 	if err != nil {
 		return fmt.Errorf("vpn server listen: %w", err)
@@ -129,19 +137,34 @@ func (s *VPNServer) handleClient(ctx context.Context, conn quic.Connection) {
 	}
 	ctl.Close()
 	log.Info("authenticated")
+	clientID := ""
+	if s.Runtime != nil {
+		clientID = s.Runtime.RegisterClient(conn.RemoteAddr())
+		s.Runtime.SetClientUser(clientID, s.Username)
+		defer s.Runtime.UnregisterClient(clientID)
+	}
 
 	// Create TUN device.
 	iface, err := createTUN("tun0")
 	if err != nil {
 		log.Warn("create TUN", "err", err)
+		if s.Runtime != nil {
+			s.Runtime.SetClientError(clientID, err)
+		}
 		conn.CloseWithError(3, "tun error")
 		return
 	}
 	defer iface.Close()
+	if s.Runtime != nil {
+		s.Runtime.SetClientTUN(clientID, iface.Name())
+	}
 
 	serverIP := serverIPFromSubnet(s.Subnet)
 	if err := configureTUN(iface, serverIP); err != nil {
 		log.Warn("configure TUN", "err", err)
+		if s.Runtime != nil {
+			s.Runtime.SetClientError(clientID, err)
+		}
 	}
 
 	data, err := conn.AcceptStream(ctx)
@@ -153,19 +176,22 @@ func (s *VPNServer) handleClient(ctx context.Context, conn quic.Connection) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); s.pipeQUICtoTUN(data, iface) }()
-	go func() { defer wg.Done(); s.pipeTUNtoQUIC(iface, data) }()
+	go func() { defer wg.Done(); s.pipeQUICtoTUN(clientID, data, iface) }()
+	go func() { defer wg.Done(); s.pipeTUNtoQUIC(clientID, iface, data) }()
 	wg.Wait()
 	_ = conn.CloseWithError(0, "done")
 	log.Info("disconnected")
 }
 
-func (s *VPNServer) pipeTUNtoQUIC(tun TUNDevice, data quic.Stream) {
+func (s *VPNServer) pipeTUNtoQUIC(clientID string, tun TUNDevice, data quic.Stream) {
 	buf := make([]byte, 65536)
 	for {
 		n, err := tun.Read(buf)
 		if err != nil {
 			return
+		}
+		if s.Runtime != nil {
+			s.Runtime.AddClientTraffic(clientID, 0, uint64(n))
 		}
 		h := make([]byte, protocol.HeaderSize)
 		binary.BigEndian.PutUint32(h, uint32(n))
@@ -187,7 +213,7 @@ func (s *VPNServer) pipeTUNtoQUIC(tun TUNDevice, data quic.Stream) {
 	}
 }
 
-func (s *VPNServer) pipeQUICtoTUN(data quic.Stream, tun TUNDevice) {
+func (s *VPNServer) pipeQUICtoTUN(clientID string, data quic.Stream, tun TUNDevice) {
 	buf := make([]byte, 65536)
 	h := make([]byte, protocol.HeaderSize)
 	for {
@@ -204,6 +230,9 @@ func (s *VPNServer) pipeQUICtoTUN(data quic.Stream, tun TUNDevice) {
 		}
 		if _, err := io.ReadFull(data, buf[:readLen]); err != nil {
 			return
+		}
+		if s.Runtime != nil {
+			s.Runtime.AddClientTraffic(clientID, uint64(l), 0)
 		}
 		if _, err := tun.Write(buf[:l]); err != nil {
 			return

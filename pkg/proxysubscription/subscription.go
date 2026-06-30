@@ -51,12 +51,13 @@ type ProxyNode struct {
 }
 
 type TLSOptions struct {
-	Enabled    bool     `json:"enabled" yaml:"enabled"`
-	ServerName string   `json:"server_name,omitempty" yaml:"server_name,omitempty"`
-	Insecure   bool     `json:"insecure,omitempty" yaml:"insecure,omitempty"`
-	ALPN       []string `json:"alpn,omitempty" yaml:"alpn,omitempty"`
-	PublicKey  string   `json:"public_key,omitempty" yaml:"public_key,omitempty"`
-	ShortID    string   `json:"short_id,omitempty" yaml:"short_id,omitempty"`
+	Enabled     bool     `json:"enabled" yaml:"enabled"`
+	ServerName  string   `json:"server_name,omitempty" yaml:"server_name,omitempty"`
+	Insecure    bool     `json:"insecure,omitempty" yaml:"insecure,omitempty"`
+	ALPN        []string `json:"alpn,omitempty" yaml:"alpn,omitempty"`
+	PublicKey   string   `json:"public_key,omitempty" yaml:"public_key,omitempty"`
+	ShortID     string   `json:"short_id,omitempty" yaml:"short_id,omitempty"`
+	Fingerprint string   `json:"fingerprint,omitempty" yaml:"fingerprint,omitempty"`
 }
 
 type TransportOptions struct {
@@ -185,6 +186,9 @@ func parseClashYAML(data []byte) ([]ProxyNode, error) {
 		if !ok {
 			continue
 		}
+		if IsInformationalNodeName(node.Name) {
+			continue
+		}
 		if err := validateNode(node); err != nil {
 			return nil, err
 		}
@@ -267,6 +271,9 @@ func parseSingBoxJSON(data []byte) ([]ProxyNode, error) {
 			TLS:       outbound.TLS,
 			Transport: outbound.Transport,
 		}
+		if IsInformationalNodeName(node.Name) {
+			continue
+		}
 		if err := validateNode(node); err != nil {
 			return nil, err
 		}
@@ -293,6 +300,9 @@ func parseURIList(data []byte) ([]ProxyNode, error) {
 	for _, line := range lines {
 		node, err := parseURI(line)
 		if err != nil {
+			continue
+		}
+		if IsInformationalNodeName(node.Name) {
 			continue
 		}
 		nodes = append(nodes, node)
@@ -442,11 +452,12 @@ func parseUserInfoURI(raw, protocol string) (ProxyNode, error) {
 	}
 	if shouldEnableTLS(q) {
 		node.TLS = &TLSOptions{
-			Enabled:    true,
-			ServerName: firstNonEmpty(q.Get("sni"), q.Get("peer")),
-			Insecure:   tlsInsecureFromQuery(q),
-			PublicKey:  q.Get("pbk"),
-			ShortID:    q.Get("sid"),
+			Enabled:     true,
+			ServerName:  firstNonEmpty(q.Get("sni"), q.Get("peer")),
+			Insecure:    tlsInsecureFromQuery(q),
+			PublicKey:   q.Get("pbk"),
+			ShortID:     q.Get("sid"),
+			Fingerprint: firstNonEmpty(q.Get("fp"), q.Get("fingerprint")),
 		}
 	}
 	return node, validateNode(node)
@@ -596,6 +607,37 @@ func isSupportedProtocol(protocol string) bool {
 	default:
 		return false
 	}
+}
+
+func IsInformationalNodeName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	keywords := []string{
+		"剩余流量",
+		"流量",
+		"套餐到期",
+		"到期",
+		"过期",
+		"官网",
+		"重置",
+		"订阅",
+		"traffic",
+		"remaining",
+		"expire",
+		"expired",
+		"reset",
+		"official",
+		"website",
+		"subscription",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(name, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeFormat(format string) string {

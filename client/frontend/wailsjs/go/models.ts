@@ -1,16 +1,16 @@
 export namespace config {
-	
+
 	export class SSHCfg {
 	    addr: string;
 	    user: string;
 	    identity_file: string;
 	    passphrase: string;
 	    password: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new SSHCfg(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.addr = source["addr"];
@@ -29,11 +29,11 @@ export namespace config {
 	    sni: string;
 	    pin_sha256: string;
 	    padding?: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TunCfg(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.subnet = source["subnet"];
@@ -54,11 +54,11 @@ export namespace config {
 	    forward: string;
 	    transport: string;
 	    tun: TunCfg;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TunnelCfg(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -69,7 +69,7 @@ export namespace config {
 	        this.transport = source["transport"];
 	        this.tun = this.convertValues(source["tun"], TunCfg);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -91,8 +91,31 @@ export namespace config {
 
 }
 
+export namespace main {
+
+	export class LogEntry {
+	    time: string;
+	    level: string;
+	    module: string;
+	    message: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LogEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.time = source["time"];
+	        this.level = source["level"];
+	        this.module = source["module"];
+	        this.message = source["message"];
+	    }
+	}
+
+}
+
 export namespace manager {
-	
+
 	export class Status {
 	    config: config.TunnelCfg;
 	    state: string;
@@ -103,11 +126,11 @@ export namespace manager {
 	    run_count: number;
 	    stats: tunnel.Snapshot;
 	    route_active?: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Status(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.config = this.convertValues(source["config"], config.TunnelCfg);
@@ -119,7 +142,7 @@ export namespace manager {
 	        this.stats = this.convertValues(source["stats"], tunnel.Snapshot);
 	        this.route_active = source["route_active"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -142,44 +165,80 @@ export namespace manager {
 }
 
 export namespace proxycore {
-	
+
 	export class Status {
 	    state: string;
 	    node_name?: string;
 	    socks_addr: string;
 	    http_addr: string;
+	    mode: string;
+	    core_path?: string;
+	    core_available: boolean;
 	    last_error?: string;
 	    started_at?: string;
-	
+	    upload_speed_bps: number;
+	    download_speed_bps: number;
+	    upload_total_bytes: number;
+	    download_total_bytes: number;
+
 	    static createFrom(source: any = {}) {
 	        return new Status(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.state = source["state"];
 	        this.node_name = source["node_name"];
 	        this.socks_addr = source["socks_addr"];
 	        this.http_addr = source["http_addr"];
+	        this.mode = source["mode"];
+	        this.core_path = source["core_path"];
+	        this.core_available = source["core_available"];
 	        this.last_error = source["last_error"];
 	        this.started_at = source["started_at"];
+	        this.upload_speed_bps = source["upload_speed_bps"];
+	        this.download_speed_bps = source["download_speed_bps"];
+	        this.upload_total_bytes = source["upload_total_bytes"];
+	        this.download_total_bytes = source["download_total_bytes"];
+	    }
+	}
+	export class TestResult {
+	    node_name: string;
+	    ok: boolean;
+	    latency_ms?: number;
+	    speed_mbps?: number;
+	    error?: string;
+	    tested_at: string;
+
+	    static createFrom(source: any = {}) {
+	        return new TestResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.node_name = source["node_name"];
+	        this.ok = source["ok"];
+	        this.latency_ms = source["latency_ms"];
+	        this.speed_mbps = source["speed_mbps"];
+	        this.error = source["error"];
+	        this.tested_at = source["tested_at"];
 	    }
 	}
 
 }
 
 export namespace proxysubscription {
-	
+
 	export class TransportOptions {
 	    type?: string;
 	    path?: string;
 	    host?: string;
 	    headers?: {[key: string]: string};
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TransportOptions(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.type = source["type"];
@@ -195,11 +254,12 @@ export namespace proxysubscription {
 	    alpn?: string[];
 	    public_key?: string;
 	    short_id?: string;
-	
+	    fingerprint?: string;
+
 	    static createFrom(source: any = {}) {
 	        return new TLSOptions(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.enabled = source["enabled"];
@@ -208,6 +268,7 @@ export namespace proxysubscription {
 	        this.alpn = source["alpn"];
 	        this.public_key = source["public_key"];
 	        this.short_id = source["short_id"];
+	        this.fingerprint = source["fingerprint"];
 	    }
 	}
 	export class ProxyNode {
@@ -226,11 +287,11 @@ export namespace proxysubscription {
 	    udp?: boolean;
 	    tls?: TLSOptions;
 	    transport?: TransportOptions;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ProxyNode(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -249,7 +310,7 @@ export namespace proxysubscription {
 	        this.tls = this.convertValues(source["tls"], TLSOptions);
 	        this.transport = this.convertValues(source["transport"], TransportOptions);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -268,12 +329,12 @@ export namespace proxysubscription {
 		    return a;
 		}
 	}
-	
+
 
 }
 
 export namespace sshsession {
-	
+
 	export class Config {
 	    addr: string;
 	    user: string;
@@ -282,11 +343,11 @@ export namespace sshsession {
 	    password: string;
 	    rows: number;
 	    cols: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.addr = source["addr"];
@@ -302,18 +363,40 @@ export namespace sshsession {
 }
 
 export namespace store {
-	
+
+	export class ClientSettings {
+	    proxy_mode: string;
+	    system_proxy: boolean;
+	    auto_start: boolean;
+	    bypass_lan: boolean;
+	    auto_connect: boolean;
+	    minimize_to_tray: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ClientSettings(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.proxy_mode = source["proxy_mode"];
+	        this.system_proxy = source["system_proxy"];
+	        this.auto_start = source["auto_start"];
+	        this.bypass_lan = source["bypass_lan"];
+	        this.auto_connect = source["auto_connect"];
+	        this.minimize_to_tray = source["minimize_to_tray"];
+	    }
+	}
 	export class SSHConnection {
 	    id: string;
 	    name: string;
 	    addr: string;
 	    user: string;
 	    password: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new SSHConnection(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -329,17 +412,18 @@ export namespace store {
 	    url: string;
 	    format: string;
 	    kind?: string;
+	    enabled: boolean;
 	    auto_refresh: boolean;
 	    interval_min: number;
 	    last_refresh?: string;
 	    last_error?: string;
 	    tunnel_count: number;
 	    node_count?: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new SubscriptionSource(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -347,6 +431,7 @@ export namespace store {
 	        this.url = source["url"];
 	        this.format = source["format"];
 	        this.kind = source["kind"];
+	        this.enabled = source["enabled"];
 	        this.auto_refresh = source["auto_refresh"];
 	        this.interval_min = source["interval_min"];
 	        this.last_refresh = source["last_refresh"];
@@ -359,7 +444,7 @@ export namespace store {
 }
 
 export namespace tunnel {
-	
+
 	export class DriverStatus {
 	    os: string;
 	    installed: boolean;
@@ -368,11 +453,11 @@ export namespace tunnel {
 	    can_auto_fix: boolean;
 	    is_admin: boolean;
 	    can_request_admin: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DriverStatus(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.os = source["os"];
@@ -389,11 +474,11 @@ export namespace tunnel {
 	    bytes_out: number;
 	    conn_active: number;
 	    conn_total: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Snapshot(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.bytes_in = source["bytes_in"];
@@ -404,4 +489,3 @@ export namespace tunnel {
 	}
 
 }
-

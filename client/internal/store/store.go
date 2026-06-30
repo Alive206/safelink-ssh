@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/example/safelink/pkg/config"
@@ -27,6 +28,7 @@ type SubscriptionSource struct {
 	URL         string `json:"url"`
 	Format      string `json:"format"`
 	Kind        string `json:"kind,omitempty"`
+	Enabled     bool   `json:"enabled"`
 	AutoRefresh bool   `json:"auto_refresh"`
 	IntervalMin int    `json:"interval_min"`
 	LastRefresh string `json:"last_refresh,omitempty"`
@@ -44,6 +46,17 @@ type SSHConnection struct {
 	Password string `json:"password"`
 }
 
+// ClientSettings stores local app preferences that affect proxy startup.
+type ClientSettings struct {
+	ProxyMode      string `json:"proxy_mode"`
+	SystemProxy    bool   `json:"system_proxy"`
+	AutoStart      bool   `json:"auto_start"`
+	BypassLAN      bool   `json:"bypass_lan"`
+	AutoConnect    bool   `json:"auto_connect"`
+	MinimizeToTray bool   `json:"minimize_to_tray"`
+	RuleModeRules  []config.ProxyRule `json:"rule_mode_rules"`
+}
+
 // Store persists tunnels and subscriptions to JSON files.
 type Store struct {
 	mu             sync.Mutex
@@ -52,6 +65,7 @@ type Store struct {
 	subsPath       string
 	proxyNodesPath string
 	sshConnsPath   string
+	settingsPath   string
 }
 
 // New returns a Store rooted at the given data directory.
@@ -62,7 +76,40 @@ func New(dataDir string) *Store {
 		subsPath:       filepath.Join(dataDir, "subscriptions.json"),
 		proxyNodesPath: filepath.Join(dataDir, "proxy_nodes.json"),
 		sshConnsPath:   filepath.Join(dataDir, "ssh_connections.json"),
+		settingsPath:   filepath.Join(dataDir, "settings.json"),
 	}
+}
+
+// LoadSettings reads settings.json, returning defaults when no file exists.
+func (s *Store) LoadSettings() (ClientSettings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.settingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return normalizeSettings(ClientSettings{}), nil
+	}
+	if err != nil {
+		return ClientSettings{}, fmt.Errorf("read %s: %w", s.settingsPath, err)
+	}
+	var settings ClientSettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return ClientSettings{}, fmt.Errorf("parse %s: %w", s.settingsPath, err)
+	}
+	return normalizeSettings(settings), nil
+}
+
+// SaveSettings writes settings.json atomically.
+func (s *Store) SaveSettings(settings ClientSettings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	settings = normalizeSettings(settings)
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+	return s.writeFileAtomic(s.settingsPath, data)
 }
 
 // LoadTunnels reads tunnels.json. Returns empty slice if not found.
@@ -150,6 +197,40 @@ func (s *Store) LoadProxyNodes() ([]proxysubscription.ProxyNode, error) {
 		return nil, fmt.Errorf("parse %s: %w", s.proxyNodesPath, err)
 	}
 	return nodes, nil
+}
+
+// LoadActiveProxyNodes reads proxy nodes that belong to enabled proxy subscriptions.
+func (s *Store) LoadActiveProxyNodes() ([]proxysubscription.ProxyNode, error) {
+	sources, err := s.LoadSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	activeSubscriptions := make(map[string]struct{}, len(sources))
+	for _, src := range sources {
+		if src.Kind == SubscriptionKindProxy && src.Enabled {
+			activeSubscriptions[src.ID] = struct{}{}
+		}
+	}
+	if len(activeSubscriptions) == 0 {
+		return []proxysubscription.ProxyNode{}, nil
+	}
+	nodes, err := s.LoadProxyNodes()
+	if err != nil {
+		return nil, err
+	}
+	active := make([]proxysubscription.ProxyNode, 0, len(nodes))
+	for _, node := range nodes {
+		if proxysubscription.IsInformationalNodeName(node.Name) {
+			continue
+		}
+		if _, ok := activeSubscriptions[node.SubscriptionID]; ok {
+			active = append(active, node)
+		}
+	}
+	sort.SliceStable(active, func(i, j int) bool {
+		return proxyNodeProtocolRank(active[i].Protocol) < proxyNodeProtocolRank(active[j].Protocol)
+	})
+	return active, nil
 }
 
 // SaveProxyNodes writes proxy nodes atomically.
@@ -310,6 +391,45 @@ func (s *Store) AddSubscription(src SubscriptionSource) error {
 	return s.SaveSubscriptions(sources)
 }
 
+// UpdateSubscription replaces a subscription by ID and saves.
+func (s *Store) UpdateSubscription(src SubscriptionSource) error {
+	if src.ID == "" {
+		return fmt.Errorf("subscription id is required")
+	}
+	sources, err := s.LoadSubscriptions()
+	if err != nil {
+		return err
+	}
+	for i := range sources {
+		if sources[i].ID == src.ID {
+			if src.Kind == "" {
+				src.Kind = sources[i].Kind
+			}
+			sources[i] = src
+			return s.SaveSubscriptions(sources)
+		}
+	}
+	return fmt.Errorf("subscription %q not found", src.ID)
+}
+
+// SetSubscriptionEnabled updates whether a subscription contributes nodes to the UI.
+func (s *Store) SetSubscriptionEnabled(id string, enabled bool) (SubscriptionSource, error) {
+	sources, err := s.LoadSubscriptions()
+	if err != nil {
+		return SubscriptionSource{}, err
+	}
+	for i := range sources {
+		if sources[i].ID == id {
+			sources[i].Enabled = enabled
+			if err := s.SaveSubscriptions(sources); err != nil {
+				return SubscriptionSource{}, err
+			}
+			return sources[i], nil
+		}
+	}
+	return SubscriptionSource{}, fmt.Errorf("subscription %q not found", id)
+}
+
 // DeleteSubscription removes a subscription by ID and saves.
 func (s *Store) DeleteSubscription(id string) error {
 	sources, err := s.LoadSubscriptions()
@@ -358,6 +478,38 @@ func (s *Store) DeleteProxyNodesBySubscriptionID(id string) error {
 // NewID returns a random store identifier for callers that need to reference it immediately.
 func NewID() string {
 	return randomID()
+}
+
+func normalizeSettings(settings ClientSettings) ClientSettings {
+	switch settings.ProxyMode {
+	case "rule", "global", "direct":
+	default:
+		settings.ProxyMode = "rule"
+	}
+	if settings.RuleModeRules == nil {
+		settings.RuleModeRules = config.DefaultProxyRules()
+	} else {
+		settings.RuleModeRules = config.NormalizeProxyRules(settings.RuleModeRules)
+	}
+	for i := range settings.RuleModeRules {
+		if settings.RuleModeRules[i].ID == "" {
+			settings.RuleModeRules[i].ID = randomID()
+		}
+	}
+	return settings
+}
+
+func proxyNodeProtocolRank(protocol string) int {
+	switch protocol {
+	case proxysubscription.ProtocolShadowsocks, proxysubscription.ProtocolTrojan, proxysubscription.ProtocolVLESS, proxysubscription.ProtocolVMess:
+		return 0
+	case proxysubscription.ProtocolHysteria2, proxysubscription.ProtocolHysteria, proxysubscription.ProtocolTUIC:
+		return 1
+	case proxysubscription.ProtocolAnyTLS:
+		return 2
+	default:
+		return 3
+	}
 }
 
 func (s *Store) writeFileAtomic(path string, data []byte) error {

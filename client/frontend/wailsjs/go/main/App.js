@@ -34,8 +34,20 @@ export function DeleteTunnel(arg1) {
   return window['go']['main']['App']['DeleteTunnel'](arg1);
 }
 
+export function ClearLogs() {
+  return window['go']['main']['App']['ClearLogs']();
+}
+
 export function GetDataDir() {
   return window['go']['main']['App']['GetDataDir']();
+}
+
+export function GetClientSettings() {
+  return window['go']['main']['App']['GetClientSettings']();
+}
+
+export function GetLogs() {
+  return window['go']['main']['App']['GetLogs']();
 }
 
 export function GetStats() {
@@ -90,6 +102,14 @@ export function RequestAdminRestart() {
   return window['go']['main']['App']['RequestAdminRestart']();
 }
 
+export function RefreshAllSubscriptions() {
+  return window['go']['main']['App']['RefreshAllSubscriptions']();
+}
+
+export function RefreshSubscription(arg1) {
+  return window['go']['main']['App']['RefreshSubscription'](arg1);
+}
+
 export function ResizeSSHSession(arg1, arg2, arg3) {
   return window['go']['main']['App']['ResizeSSHSession'](arg1, arg2, arg3);
 }
@@ -104,6 +124,18 @@ export function SaveSSHConnection(arg1) {
 
 export function SendSSHInput(arg1, arg2) {
   return window['go']['main']['App']['SendSSHInput'](arg1, arg2);
+}
+
+export function SetAutoStartEnabled(arg1) {
+  return window['go']['main']['App']['SetAutoStartEnabled'](arg1);
+}
+
+export function SetProxyMode(arg1) {
+  return window['go']['main']['App']['SetProxyMode'](arg1);
+}
+
+export function SetSystemProxyEnabled(arg1) {
+  return window['go']['main']['App']['SetSystemProxyEnabled'](arg1);
 }
 
 export function StartProxyNode(arg1) {
@@ -122,8 +154,20 @@ export function StopTunnel(arg1) {
   return window['go']['main']['App']['StopTunnel'](arg1);
 }
 
+export function TestProxyNode(arg1) {
+  return window['go']['main']['App']['TestProxyNode'](arg1);
+}
+
 export function ToggleRoute(arg1, arg2) {
   return window['go']['main']['App']['ToggleRoute'](arg1, arg2);
+}
+
+export function ToggleSubscription(arg1, arg2) {
+  return window['go']['main']['App']['ToggleSubscription'](arg1, arg2);
+}
+
+export function UpdateSubscription(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['UpdateSubscription'](arg1, arg2, arg3, arg4, arg5);
 }
 
 export function UpdateTunnel(arg1, arg2) {

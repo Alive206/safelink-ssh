@@ -11,6 +11,11 @@ const (
 	ProxyRuleTypeDomainSuffix  = "domain_suffix"
 	ProxyRuleTypeDomainKeyword = "domain_keyword"
 	ProxyRuleTypeIPCIDR        = "ip_cidr"
+	ProxyRuleTypeRuleSet       = "rule_set"
+
+	ProxyRuleSetGeoIPCN                 = "geoip-cn"
+	ProxyRuleSetGeositeGeolocationCN    = "geosite-geolocation-cn"
+	ProxyRuleSetGeositeGeolocationNotCN = "geosite-geolocation-!cn"
 
 	ProxyRuleOutboundProxy  = "selected"
 	ProxyRuleOutboundDirect = "direct"
@@ -27,8 +32,8 @@ type ProxyRule struct {
 	Enabled  bool   `json:"enabled"`
 }
 
-// DefaultProxyRules returns the built-in rule-mode behavior: keep local and
-// private networks direct, and let unmatched traffic use the selected proxy.
+// DefaultProxyRules returns the built-in rule-mode behavior: keep local,
+// private and mainland China traffic direct, then proxy unmatched traffic.
 func DefaultProxyRules() []ProxyRule {
 	return []ProxyRule{
 		defaultIPRule("lan-ipv4-this-network", "IPv4 保留地址", "0.0.0.0/8"),
@@ -42,6 +47,9 @@ func DefaultProxyRules() []ProxyRule {
 		defaultIPRule("lan-ipv6-loopback", "IPv6 本机地址", "::1/128"),
 		defaultIPRule("lan-ipv6-unique-local", "IPv6 私有地址", "fc00::/7"),
 		defaultIPRule("lan-ipv6-link-local", "IPv6 链路本地", "fe80::/10"),
+		defaultRuleSetRule("foreign-geosite", "国外域名", ProxyRuleSetGeositeGeolocationNotCN, ProxyRuleOutboundProxy),
+		defaultRuleSetRule("cn-geosite", "国内域名", ProxyRuleSetGeositeGeolocationCN, ProxyRuleOutboundDirect),
+		defaultRuleSetRule("cn-geoip", "国内 IP", ProxyRuleSetGeoIPCN, ProxyRuleOutboundDirect),
 	}
 }
 
@@ -52,6 +60,17 @@ func defaultIPRule(id, name, value string) ProxyRule {
 		Type:     ProxyRuleTypeIPCIDR,
 		Value:    value,
 		Outbound: ProxyRuleOutboundDirect,
+		Enabled:  true,
+	}
+}
+
+func defaultRuleSetRule(id, name, value, outbound string) ProxyRule {
+	return ProxyRule{
+		ID:       id,
+		Name:     name,
+		Type:     ProxyRuleTypeRuleSet,
+		Value:    value,
+		Outbound: outbound,
 		Enabled:  true,
 	}
 }
@@ -68,6 +87,9 @@ func NormalizeProxyRules(rules []ProxyRule) []ProxyRule {
 		rule.Name = strings.TrimSpace(rule.Name)
 		rule.Type = NormalizeProxyRuleType(rule.Type)
 		rule.Value = strings.TrimSpace(rule.Value)
+		if rule.Type == ProxyRuleTypeRuleSet {
+			rule.Value = strings.ToLower(rule.Value)
+		}
 		rule.Outbound = NormalizeProxyRuleOutbound(rule.Outbound)
 		normalized = append(normalized, rule)
 	}
@@ -82,8 +104,19 @@ func NormalizeProxyRuleType(ruleType string) string {
 		return ProxyRuleTypeDomainKeyword
 	case ProxyRuleTypeIPCIDR, "cidr":
 		return ProxyRuleTypeIPCIDR
+	case ProxyRuleTypeRuleSet, "rule-set", "ruleset":
+		return ProxyRuleTypeRuleSet
 	default:
 		return ProxyRuleTypeDomainSuffix
+	}
+}
+
+func IsKnownProxyRuleSet(ruleSet string) bool {
+	switch strings.ToLower(strings.TrimSpace(ruleSet)) {
+	case ProxyRuleSetGeoIPCN, ProxyRuleSetGeositeGeolocationCN, ProxyRuleSetGeositeGeolocationNotCN:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -116,6 +149,9 @@ func ValidateProxyRules(rules []ProxyRule) error {
 			if _, err := netip.ParsePrefix(rule.Value); err != nil {
 				return fmt.Errorf("rule %d has invalid CIDR %q: %w", index+1, rule.Value, err)
 			}
+		}
+		if rule.Type == ProxyRuleTypeRuleSet && !IsKnownProxyRuleSet(rule.Value) {
+			return fmt.Errorf("rule %d uses unsupported rule set %q", index+1, rule.Value)
 		}
 	}
 	return nil

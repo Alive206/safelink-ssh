@@ -1,5 +1,27 @@
 export namespace config {
 
+	export class ProxyRule {
+	    id: string;
+	    name: string;
+	    type: string;
+	    value: string;
+	    outbound: string;
+	    enabled: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ProxyRule(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.type = source["type"];
+	        this.value = source["value"];
+	        this.outbound = source["outbound"];
+	        this.enabled = source["enabled"];
+	    }
+	}
 	export class SSHCfg {
 	    addr: string;
 	    user: string;
@@ -93,6 +115,18 @@ export namespace config {
 
 export namespace main {
 
+	export class LaunchOptions {
+	    ssh_connection_id: string;
+
+	    static createFrom(source: any = {}) {
+	        return new LaunchOptions(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ssh_connection_id = source["ssh_connection_id"];
+	    }
+	}
 	export class LogEntry {
 	    time: string;
 	    level: string;
@@ -109,6 +143,28 @@ export namespace main {
 	        this.level = source["level"];
 	        this.module = source["module"];
 	        this.message = source["message"];
+	    }
+	}
+	export class MachineInfo {
+	    hostname: string;
+	    username: string;
+	    os: string;
+	    arch: string;
+	    cpu_cores: number;
+	    ips: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new MachineInfo(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.hostname = source["hostname"];
+	        this.username = source["username"];
+	        this.os = source["os"];
+	        this.arch = source["arch"];
+	        this.cpu_cores = source["cpu_cores"];
+	        this.ips = source["ips"];
 	    }
 	}
 
@@ -371,6 +427,8 @@ export namespace store {
 	    bypass_lan: boolean;
 	    auto_connect: boolean;
 	    minimize_to_tray: boolean;
+	    rule_mode_rules: config.ProxyRule[];
+	    rule_mode_rules_version: number;
 
 	    static createFrom(source: any = {}) {
 	        return new ClientSettings(source);
@@ -384,6 +442,8 @@ export namespace store {
 	        this.bypass_lan = source["bypass_lan"];
 	        this.auto_connect = source["auto_connect"];
 	        this.minimize_to_tray = source["minimize_to_tray"];
+	        this.rule_mode_rules = source["rule_mode_rules"] ? source["rule_mode_rules"].map((item: any) => new config.ProxyRule(item)) : [];
+	        this.rule_mode_rules_version = source["rule_mode_rules_version"];
 	    }
 	}
 	export class SSHConnection {

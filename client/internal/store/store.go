@@ -19,6 +19,8 @@ import (
 const (
 	SubscriptionKindVPN   = "vpn"
 	SubscriptionKindProxy = "proxy"
+
+	ruleModeRulesVersion = 1
 )
 
 // SubscriptionSource represents a remote subscription URL.
@@ -48,13 +50,14 @@ type SSHConnection struct {
 
 // ClientSettings stores local app preferences that affect proxy startup.
 type ClientSettings struct {
-	ProxyMode      string `json:"proxy_mode"`
-	SystemProxy    bool   `json:"system_proxy"`
-	AutoStart      bool   `json:"auto_start"`
-	BypassLAN      bool   `json:"bypass_lan"`
-	AutoConnect    bool   `json:"auto_connect"`
-	MinimizeToTray bool   `json:"minimize_to_tray"`
-	RuleModeRules  []config.ProxyRule `json:"rule_mode_rules"`
+	ProxyMode            string             `json:"proxy_mode"`
+	SystemProxy          bool               `json:"system_proxy"`
+	AutoStart            bool               `json:"auto_start"`
+	BypassLAN            bool               `json:"bypass_lan"`
+	AutoConnect          bool               `json:"auto_connect"`
+	MinimizeToTray       bool               `json:"minimize_to_tray"`
+	RuleModeRules        []config.ProxyRule `json:"rule_mode_rules"`
+	RuleModeRulesVersion int                `json:"rule_mode_rules_version,omitempty"`
 }
 
 // Store persists tunnels and subscriptions to JSON files.
@@ -490,13 +493,31 @@ func normalizeSettings(settings ClientSettings) ClientSettings {
 		settings.RuleModeRules = config.DefaultProxyRules()
 	} else {
 		settings.RuleModeRules = config.NormalizeProxyRules(settings.RuleModeRules)
+		if settings.RuleModeRulesVersion < ruleModeRulesVersion {
+			settings.RuleModeRules = migrateRuleModeRules(settings.RuleModeRules)
+		}
 	}
+	settings.RuleModeRulesVersion = ruleModeRulesVersion
 	for i := range settings.RuleModeRules {
 		if settings.RuleModeRules[i].ID == "" {
 			settings.RuleModeRules[i].ID = randomID()
 		}
 	}
 	return settings
+}
+
+func migrateRuleModeRules(rules []config.ProxyRule) []config.ProxyRule {
+	for _, rule := range rules {
+		if rule.Type == config.ProxyRuleTypeRuleSet {
+			return rules
+		}
+	}
+	for _, rule := range config.DefaultProxyRules() {
+		if rule.Type == config.ProxyRuleTypeRuleSet {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
 }
 
 func proxyNodeProtocolRank(protocol string) int {

@@ -3,17 +3,19 @@
 import {config} from '../models';
 import {tunnel} from '../models';
 import {sshsession} from '../models';
-import {proxysubscription} from '../models';
 import {store} from '../models';
+import {main} from '../models';
+import {proxysubscription} from '../models';
 import {manager} from '../models';
 import {proxycore} from '../models';
-import {main} from '../models';
 
 export function AddTunnel(arg1:config.TunnelCfg):Promise<void>;
 
 export function BulkImportTunnels(arg1:Array<config.TunnelCfg>,arg2:string):Promise<number>;
 
 export function CheckDriver():Promise<tunnel.DriverStatus>;
+
+export function ClearLogs():Promise<void>;
 
 export function CloseSSHSession(arg1:string):Promise<void>;
 
@@ -25,11 +27,15 @@ export function DeleteSubscription(arg1:string):Promise<void>;
 
 export function DeleteTunnel(arg1:string):Promise<void>;
 
-export function GetDataDir():Promise<string>;
-
 export function GetClientSettings():Promise<store.ClientSettings>;
 
+export function GetDataDir():Promise<string>;
+
+export function GetLaunchOptions():Promise<main.LaunchOptions>;
+
 export function GetLogs():Promise<Array<main.LogEntry>>;
+
+export function GetMachineInfo():Promise<main.MachineInfo>;
 
 export function GetStats():Promise<{[key: string]: tunnel.Snapshot}>;
 
@@ -53,15 +59,15 @@ export function ListSubscriptions():Promise<Array<store.SubscriptionSource>>;
 
 export function ListTunnels():Promise<Array<manager.Status>>;
 
+export function OpenSSHConnectionWindow(arg1:string):Promise<void>;
+
 export function ProxyStatus():Promise<proxycore.Status>;
 
-export function ClearLogs():Promise<void>;
-
-export function RequestAdminRestart():Promise<void>;
-
-export function RefreshAllSubscriptions():Promise<[number, number, Array<string>]>;
+export function RefreshAllSubscriptions():Promise<number>;
 
 export function RefreshSubscription(arg1:string):Promise<void>;
+
+export function RequestAdminRestart():Promise<void>;
 
 export function ResizeSSHSession(arg1:string,arg2:number,arg3:number):Promise<void>;
 
@@ -74,6 +80,8 @@ export function SendSSHInput(arg1:string,arg2:string):Promise<void>;
 export function SetAutoStartEnabled(arg1:boolean):Promise<void>;
 
 export function SetProxyMode(arg1:string):Promise<void>;
+
+export function SetProxyRules(arg1:Array<config.ProxyRule>):Promise<void>;
 
 export function SetSystemProxyEnabled(arg1:boolean):Promise<void>;
 

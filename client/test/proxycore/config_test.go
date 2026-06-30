@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/example/safelink/client/internal/proxycore"
+	"github.com/example/safelink/pkg/config"
 	"github.com/example/safelink/pkg/proxysubscription"
 )
 
@@ -102,6 +103,94 @@ func TestBuildConfigAppliesProxyModeRoute(t *testing.T) {
 	}
 }
 
+func TestBuildConfigAppliesEditableRuleModeRules(t *testing.T) {
+	node := proxysubscription.ProxyNode{
+		Name:     "ss-hk",
+		Protocol: proxysubscription.ProtocolShadowsocks,
+		Server:   "ss.example.com",
+		Port:     8388,
+		Method:   "aes-128-gcm",
+		Password: "secret",
+	}
+	data, err := proxycore.BuildConfig(node, proxycore.Options{
+		Mode: proxycore.ProxyModeRule,
+		RuleModeRules: []config.ProxyRule{
+			{Name: "direct suffix", Type: config.ProxyRuleTypeDomainSuffix, Value: "example.cn", Outbound: config.ProxyRuleOutboundDirect, Enabled: true},
+			{Name: "proxy keyword", Type: config.ProxyRuleTypeDomainKeyword, Value: "google", Outbound: config.ProxyRuleOutboundProxy, Enabled: true},
+			{Name: "disabled", Type: config.ProxyRuleTypeDomain, Value: "disabled.example", Outbound: config.ProxyRuleOutboundBlock, Enabled: false},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+	}
+	route := cfg["route"].(map[string]any)
+	rules := route["rules"].([]any)
+	if len(rules) != 2 {
+		t.Fatalf("len(route.rules) = %d, want 2", len(rules))
+	}
+	directRule := rules[0].(map[string]any)
+	if directRule["outbound"] != "direct" || directRule["domain_suffix"].([]any)[0] != "example.cn" {
+		t.Fatalf("unexpected direct rule: %+v", directRule)
+	}
+	proxyRule := rules[1].(map[string]any)
+	if proxyRule["outbound"] != "selected" || proxyRule["domain_keyword"].([]any)[0] != "google" {
+		t.Fatalf("unexpected proxy rule: %+v", proxyRule)
+	}
+	if _, ok := route["rule_set"]; ok {
+		t.Fatalf("custom rules without rule_set should not add remote rule sets: %+v", route["rule_set"])
+	}
+}
+
+func TestBuildConfigIncludesDefaultRuleSetsForChinaBypass(t *testing.T) {
+	node := proxysubscription.ProxyNode{
+		Name:     "ss-hk",
+		Protocol: proxysubscription.ProtocolShadowsocks,
+		Server:   "ss.example.com",
+		Port:     8388,
+		Method:   "aes-128-gcm",
+		Password: "secret",
+	}
+	data, err := proxycore.BuildConfig(node, proxycore.Options{Mode: proxycore.ProxyModeRule})
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+	}
+
+	route := cfg["route"].(map[string]any)
+	if route["final"] != "selected" {
+		t.Fatalf("route.final = %q, want selected", route["final"])
+	}
+	rules := route["rules"].([]any)
+	if !routeRulesContainRuleSet(rules, config.ProxyRuleSetGeositeGeolocationNotCN, "selected") {
+		t.Fatalf("route.rules missing foreign geosite proxy rule: %+v", rules)
+	}
+	if !routeRulesContainRuleSet(rules, config.ProxyRuleSetGeositeGeolocationCN, "direct") {
+		t.Fatalf("route.rules missing China geosite direct rule: %+v", rules)
+	}
+	if !routeRulesContainRuleSet(rules, config.ProxyRuleSetGeoIPCN, "direct") {
+		t.Fatalf("route.rules missing China geoip direct rule: %+v", rules)
+	}
+
+	ruleSets := route["rule_set"].([]any)
+	if !remoteRuleSetsContain(ruleSets, config.ProxyRuleSetGeositeGeolocationNotCN) ||
+		!remoteRuleSetsContain(ruleSets, config.ProxyRuleSetGeositeGeolocationCN) ||
+		!remoteRuleSetsContain(ruleSets, config.ProxyRuleSetGeoIPCN) {
+		t.Fatalf("route.rule_set missing expected remote definitions: %+v", ruleSets)
+	}
+	experimental := cfg["experimental"].(map[string]any)
+	cacheFile := experimental["cache_file"].(map[string]any)
+	if cacheFile["enabled"] != true {
+		t.Fatalf("cache_file.enabled = %v, want true", cacheFile["enabled"])
+	}
+}
+
 func TestBuildConfigOmitsAnyTLSTransportAndKeepsUTLSFingerprint(t *testing.T) {
 	node := proxysubscription.ProxyNode{
 		Name:      "anytls-hk",
@@ -175,6 +264,30 @@ func TestNodeMeasuresDelayThroughCoreAPI(t *testing.T) {
 	if result.LatencyMS <= 0 {
 		t.Fatalf("LatencyMS = %d, want > 0", result.LatencyMS)
 	}
+}
+
+func routeRulesContainRuleSet(rules []any, tag, outbound string) bool {
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		values, ok := rule["rule_set"].([]any)
+		if !ok || len(values) == 0 {
+			continue
+		}
+		if values[0] == tag && rule["outbound"] == outbound {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteRuleSetsContain(ruleSets []any, tag string) bool {
+	for _, raw := range ruleSets {
+		ruleSet := raw.(map[string]any)
+		if ruleSet["tag"] == tag && ruleSet["type"] == "remote" && ruleSet["format"] == "binary" {
+			return true
+		}
+	}
+	return false
 }
 
 func writeHelperCore(t *testing.T) string {

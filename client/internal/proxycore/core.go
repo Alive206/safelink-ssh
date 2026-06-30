@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/safelink/pkg/config"
 	"github.com/example/safelink/pkg/proxysubscription"
 )
 
@@ -33,7 +34,16 @@ const (
 	ProxyModeDirect = "direct"
 )
 
+var remoteProxyRuleSetURLs = map[string]string{
+	config.ProxyRuleSetGeoIPCN:                 "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+	config.ProxyRuleSetGeositeGeolocationCN:    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs",
+	config.ProxyRuleSetGeositeGeolocationNotCN: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
+}
+
 var testURLs = []string{
+	"https://www.gstatic.com/generate_204",
+	"https://connectivitycheck.gstatic.com/generate_204",
+	"https://cp.cloudflare.com/generate_204",
 	"http://cp.cloudflare.com/generate_204",
 	"http://www.gstatic.com/generate_204",
 	"http://connectivitycheck.gstatic.com/generate_204",
@@ -42,12 +52,13 @@ var testURLs = []string{
 }
 
 type Options struct {
-	CorePath     string
-	WorkDir      string
-	SOCKSAddr    string
-	HTTPAddr     string
-	ClashAPIAddr string
-	Mode         string
+	CorePath      string
+	WorkDir       string
+	SOCKSAddr     string
+	HTTPAddr      string
+	ClashAPIAddr  string
+	Mode          string
+	RuleModeRules []config.ProxyRule
 }
 
 type Status struct {
@@ -99,6 +110,12 @@ func (r *Runner) SetMode(mode string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.opts.Mode = NormalizeMode(mode)
+}
+
+func (r *Runner) SetRuleModeRules(rules []config.ProxyRule) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.opts.RuleModeRules = normalizeRuleModeRules(rules)
 }
 
 func (r *Runner) Start(ctx context.Context, node proxysubscription.ProxyNode) error {
@@ -163,6 +180,7 @@ func (r *Runner) Start(ctx context.Context, node proxysubscription.ProxyNode) er
 	r.lastTrafficAt = time.Time{}
 	r.lastTrafficNode = node.Name
 	done := r.done
+	readyAddrs := proxyReadyAddrs(opts)
 	r.mu.Unlock()
 
 	go func() {
@@ -184,6 +202,27 @@ func (r *Runner) Start(ctx context.Context, node proxysubscription.ProxyNode) er
 		}
 		close(done)
 	}()
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer readyCancel()
+	for _, addr := range readyAddrs {
+		if err := waitForLocalTCPWithDone(readyCtx, addr, done, "proxy listener"); err != nil {
+			cancel()
+			if done != nil {
+				<-done
+			}
+			r.mu.Lock()
+			r.state = StateError
+			r.nodeName = node.Name
+			r.lastError = err.Error()
+			r.startedAt = time.Time{}
+			r.lastTraffic = connectionTraffic{}
+			r.lastTrafficAt = time.Time{}
+			r.lastTrafficNode = ""
+			r.mu.Unlock()
+			return err
+		}
+	}
 	return nil
 }
 
@@ -383,8 +422,12 @@ func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Option
 
 	latency, err := testCoreDelay(testCtx, clashAPIAddr, timeout)
 	if err != nil {
-		result.Error = err.Error()
-		return result
+		fallbackLatency, fallbackErr := testHTTPInboundDelay(testCtx, httpAddr, timeout)
+		if fallbackErr != nil {
+			result.Error = fmt.Sprintf("%v; fallback proxy request failed: %v", err, fallbackErr)
+			return result
+		}
+		latency = fallbackLatency
 	}
 	result.OK = true
 	result.LatencyMS = latency
@@ -434,6 +477,28 @@ func testHTTPThroughProxy(ctx context.Context, client *http.Client) (int64, erro
 		return 0, errors.New("no test URL available")
 	}
 	return 0, fmt.Errorf("proxy test failed: %s", strings.Join(attempts, "; "))
+}
+
+func testHTTPInboundDelay(ctx context.Context, httpAddr string, timeout time.Duration) (int64, error) {
+	if err := waitForLocalTCP(ctx, httpAddr); err != nil {
+		return 0, err
+	}
+	dialTimeout := timeout
+	if dialTimeout <= 0 || dialTimeout > 3*time.Second {
+		dialTimeout = 3 * time.Second
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: httpAddr}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyURL(proxyURL),
+		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		TLSHandshakeTimeout:   dialTimeout,
+		ResponseHeaderTimeout: timeout,
+	}
+	defer transport.CloseIdleConnections()
+	return testHTTPThroughProxy(ctx, &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	})
 }
 
 type clashDelayResponse struct {
@@ -609,6 +674,10 @@ func freeLoopbackAddr() (string, error) {
 }
 
 func waitForLocalTCP(ctx context.Context, addr string) error {
+	return waitForLocalTCPWithDone(ctx, addr, nil, "sing-box test inbound")
+}
+
+func waitForLocalTCPWithDone(ctx context.Context, addr string, done <-chan struct{}, label string) error {
 	deadline := time.NewTimer(3 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
@@ -623,16 +692,35 @@ func waitForLocalTCP(ctx context.Context, addr string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-done:
+			return fmt.Errorf("%s exited before %s became ready", label, addr)
 		case <-deadline.C:
-			return fmt.Errorf("timed out waiting for sing-box test inbound %s", addr)
+			return fmt.Errorf("timed out waiting for %s %s", label, addr)
 		case <-ticker.C:
 		}
 	}
 }
 
+func proxyReadyAddrs(opts Options) []string {
+	addrs := make([]string, 0, 2)
+	if opts.ClashAPIAddr != "" {
+		addrs = append(addrs, opts.ClashAPIAddr)
+	}
+	if opts.HTTPAddr != "" {
+		addrs = append(addrs, opts.HTTPAddr)
+	} else if opts.SOCKSAddr != "" {
+		addrs = append(addrs, opts.SOCKSAddr)
+	}
+	return addrs
+}
+
 func BuildConfig(node proxysubscription.ProxyNode, opts Options) ([]byte, error) {
 	opts = normalizeOptions(opts)
 	outbound, err := buildOutbound(node)
+	if err != nil {
+		return nil, err
+	}
+	route, err := buildRoute(opts.Mode, opts.RuleModeRules)
 	if err != nil {
 		return nil, err
 	}
@@ -649,48 +737,101 @@ func BuildConfig(node proxysubscription.ProxyNode, opts Options) ([]byte, error)
 			{"type": "direct", "tag": "direct"},
 			{"type": "block", "tag": "block"},
 		},
-		"route": buildRoute(opts.Mode),
+		"route": route,
+	}
+	experimental := make(map[string]any)
+	if _, ok := route["rule_set"]; ok {
+		experimental["cache_file"] = map[string]any{
+			"enabled": true,
+		}
 	}
 	if opts.ClashAPIAddr != "" {
-		cfg["experimental"] = map[string]any{
-			"clash_api": map[string]any{
-				"external_controller": opts.ClashAPIAddr,
-				"secret":              "",
-			},
+		experimental["clash_api"] = map[string]any{
+			"external_controller": opts.ClashAPIAddr,
+			"secret":              "",
 		}
+	}
+	if len(experimental) > 0 {
+		cfg["experimental"] = experimental
 	}
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-func buildRoute(mode string) map[string]any {
+func buildRoute(mode string, rules []config.ProxyRule) (map[string]any, error) {
 	switch NormalizeMode(mode) {
 	case ProxyModeDirect:
-		return map[string]any{"final": "direct"}
+		return map[string]any{"final": "direct"}, nil
 	case ProxyModeGlobal:
-		return map[string]any{"final": "selected"}
+		return map[string]any{"final": "selected"}, nil
 	default:
-		return map[string]any{
-			"rules": []map[string]any{
-				{
-					"ip_cidr": []string{
-						"0.0.0.0/8",
-						"10.0.0.0/8",
-						"100.64.0.0/10",
-						"127.0.0.0/8",
-						"169.254.0.0/16",
-						"172.16.0.0/12",
-						"192.168.0.0/16",
-						"224.0.0.0/4",
-						"::1/128",
-						"fc00::/7",
-						"fe80::/10",
-					},
-					"outbound": "direct",
-				},
-			},
+		rules = normalizeRuleModeRules(rules)
+		if err := config.ValidateProxyRules(rules); err != nil {
+			return nil, err
+		}
+		routeRules := make([]map[string]any, 0, len(rules))
+		ruleSets := make([]string, 0)
+		for _, rule := range rules {
+			if !rule.Enabled || strings.TrimSpace(rule.Value) == "" {
+				continue
+			}
+			routeRule := map[string]any{
+				proxyRuleRouteKey(rule.Type): []string{rule.Value},
+				"outbound":                   rule.Outbound,
+			}
+			if rule.Type == config.ProxyRuleTypeRuleSet {
+				ruleSets = append(ruleSets, rule.Value)
+			}
+			routeRules = append(routeRules, routeRule)
+		}
+		route := map[string]any{
+			"rules": routeRules,
 			"final": "selected",
 		}
+		if definitions := buildRemoteRuleSetDefinitions(ruleSets); len(definitions) > 0 {
+			route["rule_set"] = definitions
+		}
+		return route, nil
 	}
+}
+
+func proxyRuleRouteKey(ruleType string) string {
+	switch config.NormalizeProxyRuleType(ruleType) {
+	case config.ProxyRuleTypeDomain:
+		return "domain"
+	case config.ProxyRuleTypeDomainKeyword:
+		return "domain_keyword"
+	case config.ProxyRuleTypeIPCIDR:
+		return "ip_cidr"
+	case config.ProxyRuleTypeRuleSet:
+		return "rule_set"
+	default:
+		return "domain_suffix"
+	}
+}
+
+func buildRemoteRuleSetDefinitions(ruleSets []string) []map[string]any {
+	seen := make(map[string]bool, len(ruleSets))
+	definitions := make([]map[string]any, 0, len(ruleSets))
+	for _, ruleSet := range ruleSets {
+		tag := strings.ToLower(strings.TrimSpace(ruleSet))
+		if seen[tag] {
+			continue
+		}
+		url, ok := remoteProxyRuleSetURLs[tag]
+		if !ok {
+			continue
+		}
+		seen[tag] = true
+		definitions = append(definitions, map[string]any{
+			"type":            "remote",
+			"tag":             tag,
+			"format":          "binary",
+			"url":             url,
+			"download_detour": "selected",
+			"update_interval": "24h",
+		})
+	}
+	return definitions
 }
 
 func buildInbound(tag, inboundType, addr string) map[string]any {
@@ -840,7 +981,18 @@ func normalizeOptions(opts Options) Options {
 		opts.WorkDir = filepath.Join(os.TempDir(), "safelink-proxy")
 	}
 	opts.Mode = NormalizeMode(opts.Mode)
+	opts.RuleModeRules = normalizeRuleModeRules(opts.RuleModeRules)
 	return opts
+}
+
+func normalizeRuleModeRules(rules []config.ProxyRule) []config.ProxyRule {
+	if rules == nil {
+		rules = config.DefaultProxyRules()
+	}
+	normalized := config.NormalizeProxyRules(rules)
+	result := make([]config.ProxyRule, len(normalized))
+	copy(result, normalized)
+	return result
 }
 
 func NormalizeMode(mode string) string {

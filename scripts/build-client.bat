@@ -16,6 +16,13 @@ wails build -platform windows/amd64
 if errorlevel 1 (
     echo.
     echo Wails CLI build failed. Falling back to go build with Wails production tags...
+    echo Preparing Windows icon resource...
+    go run github.com/akavel/rsrc@v0.10.2 -manifest "build\windows\wails.exe.manifest" -ico "build\windows\icon.ico" -o "rsrc_windows_amd64.syso"
+    if errorlevel 1 (
+        echo ERROR: Windows icon resource generation failed.
+        pause
+        exit /b 1
+    )
     go build -tags "desktop,production" -ldflags "-w -s -H windowsgui" -o "build\bin\SafeLink.exe" .
     if errorlevel 1 (
         echo ERROR: fallback go build failed.

@@ -1,4 +1,5 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import type { FormEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
@@ -10,9 +11,10 @@ import {
   DeleteSSHConnection,
   DeleteSubscription,
   DeleteTunnel,
-  GetDataDir,
   GetClientSettings,
+  GetLaunchOptions,
   GetLogs,
+  GetMachineInfo,
   GetVersion,
   ImportSubscription,
   ListProxyNodes,
@@ -27,6 +29,7 @@ import {
   SendSSHInput,
   SetAutoStartEnabled,
   SetProxyMode,
+  SetProxyRules,
   SetSystemProxyEnabled,
   StartProxyNode,
   StartTunnel,
@@ -70,6 +73,8 @@ type TunnelRow = {
   forward: string
   detail: string
   endpoint: string
+  state: string
+  lastError: string
   running: boolean
   updatedAt: string
   source?: manager.Status
@@ -83,11 +88,30 @@ type SSHRow = {
   source?: store.SSHConnection
 }
 
-const NODE_TEST_CONCURRENCY = 6
+type MachineInfo = {
+  hostname?: string
+  username?: string
+  os?: string
+  arch?: string
+  cpu_cores?: number
+  ips?: string[]
+}
+
+const NODE_TEST_CONCURRENCY = 12
+const TUNNEL_POLL_INTERVAL_MS = 350
+const TUNNEL_START_TIMEOUT_MS = 20000
+const TUNNEL_STOP_TIMEOUT_MS = 8000
+const SSH_TERMINAL_ENABLED = true
 
 type ModalKind = 'subscription' | 'tunnel' | 'ssh' | null
 
 type ProxyMode = 'rule' | 'global' | 'direct'
+type SettingsTab = 'general' | 'routing'
+type ProxyRuleType = 'domain' | 'domain_suffix' | 'domain_keyword' | 'ip_cidr' | 'rule_set'
+type ProxyRuleOutbound = 'selected' | 'direct' | 'block'
+type TunnelPendingAction = 'starting' | 'stopping'
+type LogLevelFilter = 'all' | 'info' | 'warn' | 'error'
+type LogRangeFilter = 'all' | '1h' | '24h' | '7d'
 
 type SubscriptionForm = {
   id: string
@@ -126,19 +150,57 @@ type SSHClosedEvent = {
   message?: string
 }
 
-const navItems: Array<{ key: NavKey; label: string; icon: string }> = [
+type TerminalTab = {
+  id: string
+  sessionID: string
+  connectionID: string
+  title: string
+  host: string
+  addr: string
+  user: string
+  password: string
+  connected: boolean
+}
+
+type TerminalTabMenu = {
+  tabID: string
+  x: number
+  y: number
+}
+
+const navItems: Array<{ key: NavKey; label: string; icon: string; badge?: string }> = [
   { key: 'home', label: '首页', icon: 'home' },
   { key: 'nodes', label: '节点', icon: 'node' },
   { key: 'subscriptions', label: '订阅', icon: 'sub' },
   { key: 'tunnels', label: 'SSH 隧道', icon: 'tunnel' },
-  { key: 'terminal', label: 'SSH 终端', icon: 'term' },
+  ...(SSH_TERMINAL_ENABLED ? [{ key: 'terminal' as const, label: 'SSH 终端', icon: 'term', badge: '开发中' }] : []),
   { key: 'settings', label: '设置', icon: 'gear' },
   { key: 'logs', label: '日志', icon: 'log' },
 ]
 
 const logoSrc = new URL('./static/logo.png', import.meta.url).href
 
-const settingsTabs = ['常规设置', '代理设置', '连接设置', '订阅设置', 'SSH 设置', '外观设置', '高级设置']
+const settingsTabs: Array<{ key: SettingsTab; label: string }> = [
+  { key: 'general', label: '常规设置' },
+  { key: 'routing', label: '路由设置' },
+]
+
+const defaultRouteRules: config.ProxyRule[] = [
+  { id: 'lan-ipv4-this-network', name: 'IPv4 保留地址', type: 'ip_cidr', value: '0.0.0.0/8', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv4-private-10', name: 'IPv4 私有地址', type: 'ip_cidr', value: '10.0.0.0/8', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv4-carrier', name: '运营商内网', type: 'ip_cidr', value: '100.64.0.0/10', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv4-loopback', name: '本机地址', type: 'ip_cidr', value: '127.0.0.0/8', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv4-link-local', name: '链路本地', type: 'ip_cidr', value: '169.254.0.0/16', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv4-private-172', name: 'IPv4 私有地址', type: 'ip_cidr', value: '172.16.0.0/12', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv4-private-192', name: 'IPv4 私有地址', type: 'ip_cidr', value: '192.168.0.0/16', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv4-multicast', name: '组播地址', type: 'ip_cidr', value: '224.0.0.0/4', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv6-loopback', name: 'IPv6 本机地址', type: 'ip_cidr', value: '::1/128', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv6-unique-local', name: 'IPv6 私有地址', type: 'ip_cidr', value: 'fc00::/7', outbound: 'direct', enabled: true },
+  { id: 'lan-ipv6-link-local', name: 'IPv6 链路本地', type: 'ip_cidr', value: 'fe80::/10', outbound: 'direct', enabled: true },
+  { id: 'foreign-geosite', name: '国外域名', type: 'rule_set', value: 'geosite-geolocation-!cn', outbound: 'selected', enabled: true },
+  { id: 'cn-geosite', name: '国内域名', type: 'rule_set', value: 'geosite-geolocation-cn', outbound: 'direct', enabled: true },
+  { id: 'cn-geoip', name: '国内 IP', type: 'rule_set', value: 'geoip-cn', outbound: 'direct', enabled: true },
+]
 
 const defaultClientSettings: store.ClientSettings = {
   proxy_mode: 'rule',
@@ -147,12 +209,42 @@ const defaultClientSettings: store.ClientSettings = {
   bypass_lan: false,
   auto_connect: false,
   minimize_to_tray: false,
-}
+  rule_mode_rules: defaultRouteRules,
+  rule_mode_rules_version: 1,
+} as store.ClientSettings
 
 const proxyModeOptions: Array<{ value: ProxyMode; label: string }> = [
   { value: 'rule', label: '规则模式' },
   { value: 'global', label: '全局模式' },
   { value: 'direct', label: '直连模式' },
+]
+
+const routeRuleTypeOptions: Array<{ value: ProxyRuleType; label: string }> = [
+  { value: 'domain_suffix', label: '域名后缀' },
+  { value: 'domain', label: '完整域名' },
+  { value: 'domain_keyword', label: '域名关键词' },
+  { value: 'ip_cidr', label: 'IP CIDR' },
+  { value: 'rule_set', label: '规则集' },
+]
+
+const routeOutboundOptions: Array<{ value: ProxyRuleOutbound; label: string }> = [
+  { value: 'direct', label: '白名单' },
+  { value: 'selected', label: '代理' },
+  { value: 'block', label: '阻断' },
+]
+
+const logLevelOptions: Array<{ value: LogLevelFilter; label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: 'info', label: '信息' },
+  { value: 'warn', label: '警告' },
+  { value: 'error', label: '错误' },
+]
+
+const logRangeOptions: Array<{ value: LogRangeFilter; label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: '1h', label: '最近 1 小时' },
+  { value: '24h', label: '最近 24 小时' },
+  { value: '7d', label: '最近 7 天' },
 ]
 
 const emptySubscriptionForm: SubscriptionForm = {
@@ -167,11 +259,37 @@ const emptyTunnelForm: TunnelForm = {
   editingName: '',
   name: '',
   mode: 'local',
-  listen: '127.0.0.1:1080',
+  listen: '',
   forward: '',
   sshAddr: '',
   sshUser: '',
   password: '',
+}
+
+const tunnelModeGuides: Record<TunnelForm['mode'], {
+  listenPlaceholder: string
+  forwardPlaceholder: string
+  listenHelp: string
+  forwardHelp: string
+}> = {
+  local: {
+    listenPlaceholder: '例如：127.0.0.1:3307',
+    forwardPlaceholder: '例如：127.0.0.1:3306 或 intranet-db:3306',
+    listenHelp: '本地转发会在当前电脑监听这个地址，连接会通过 SSH 服务器转发出去。',
+    forwardHelp: '目标地址填写 SSH 服务器侧可以访问的服务地址，例如远端内网数据库或服务端本机端口。',
+  },
+  remote: {
+    listenPlaceholder: '例如：0.0.0.0:8080',
+    forwardPlaceholder: '例如：127.0.0.1:3000 或 192.168.1.10:80',
+    listenHelp: '内网穿透会让 SSH 服务器监听这个地址，公网或服务器侧访问这里会回到你的本机。',
+    forwardHelp: '目标地址填写当前电脑或当前内网可访问的服务地址，例如本地开发服务或内网设备。',
+  },
+  dynamic: {
+    listenPlaceholder: '例如：127.0.0.1:1080',
+    forwardPlaceholder: '动态转发无需填写',
+    listenHelp: '动态转发会在当前电脑开启一个 SOCKS5 代理入口，应用通过这个地址按需访问目标站点。',
+    forwardHelp: '动态转发没有固定目标地址，最终访问目标由浏览器或代理客户端的请求决定。',
+  },
 }
 
 const emptySSHForm: SSHForm = {
@@ -185,16 +303,20 @@ const emptySSHForm: SSHForm = {
 function App() {
   const [activeNav, setActiveNav] = useState<NavKey>('home')
   const [version, setVersion] = useState('1.0.0')
-  const [dataDir, setDataDir] = useState('')
+  const [machineInfo, setMachineInfo] = useState<MachineInfo>(() => browserMachineInfo())
   const [tunnels, setTunnels] = useState<manager.Status[]>([])
   const [subscriptions, setSubscriptions] = useState<store.SubscriptionSource[]>([])
   const [proxyNodes, setProxyNodes] = useState<proxysubscription.ProxyNode[]>([])
   const [proxyStatus, setProxyStatus] = useState<proxycore.Status | null>(null)
   const [clientSettings, setClientSettings] = useState<store.ClientSettings>(defaultClientSettings)
+  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>('general')
+  const [routeRules, setRouteRules] = useState<config.ProxyRule[]>(() => cloneRouteRules(defaultRouteRules))
+  const [routeRulesDirty, setRouteRulesDirty] = useState(false)
   const [sshConnections, setSSHConnections] = useState<store.SSHConnection[]>([])
   const [logs, setLogs] = useState<main.LogEntry[]>([])
   const [proxyTestResults, setProxyTestResults] = useState<Record<string, proxycore.TestResult>>({})
   const [testingNodeNames, setTestingNodeNames] = useState<Set<string>>(() => new Set())
+  const [tunnelPending, setTunnelPending] = useState<Record<string, TunnelPendingAction>>({})
   const [selectedNodeID, setSelectedNodeID] = useState('')
   const [selectedTunnelID, setSelectedTunnelID] = useState('')
   const [selectedSSHID, setSelectedSSHID] = useState('')
@@ -202,13 +324,18 @@ function App() {
   const [subscriptionForm, setSubscriptionForm] = useState<SubscriptionForm>(emptySubscriptionForm)
   const [tunnelForm, setTunnelForm] = useState<TunnelForm>(emptyTunnelForm)
   const [sshForm, setSSHForm] = useState<SSHForm>(emptySSHForm)
-  const [terminalSessionID, setTerminalSessionID] = useState('')
-  const [terminalTitle, setTerminalTitle] = useState('')
-  const [terminalHost, setTerminalHost] = useState('')
-  const [terminalConnected, setTerminalConnected] = useState(false)
+  const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([])
+  const [activeTerminalTabID, setActiveTerminalTabID] = useState('')
+  const [terminalTabMenu, setTerminalTabMenu] = useState<TerminalTabMenu | null>(null)
+  const [launchSSHConnectionID, setLaunchSSHConnectionID] = useState('')
+  const [handledLaunchSSHConnectionID, setHandledLaunchSSHConnectionID] = useState('')
+  const [logLevelFilter, setLogLevelFilter] = useState<LogLevelFilter>('all')
+  const [logRangeFilter, setLogRangeFilter] = useState<LogRangeFilter>('all')
+  const [logSearch, setLogSearch] = useState('')
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
+  const routeRulesDirtyRef = useRef(false)
 
   const backendReady = isBackendReady()
 
@@ -218,7 +345,7 @@ function App() {
     }
 
     try {
-      const [nextVersion, nextTunnels, nextSubscriptions, nextProxyNodes, nextProxyStatus, nextSettings, nextSSHConnections, nextDataDir, nextLogs] = await Promise.all([
+      const [nextVersion, nextTunnels, nextSubscriptions, nextProxyNodes, nextProxyStatus, nextSettings, nextSSHConnections, nextMachineInfo, nextLogs] = await Promise.all([
         GetVersion(),
         ListTunnels(),
         ListSubscriptions(),
@@ -226,7 +353,7 @@ function App() {
         ProxyStatus(),
         GetClientSettings(),
         ListSSHConnections(),
-        GetDataDir(),
+        GetMachineInfo(),
         GetLogs(),
       ])
       setVersion(nextVersion || '1.0.0')
@@ -234,9 +361,13 @@ function App() {
       setSubscriptions(nextSubscriptions ?? [])
       setProxyNodes(nextProxyNodes ?? [])
       setProxyStatus(nextProxyStatus ?? null)
-      setClientSettings({ ...defaultClientSettings, ...(nextSettings ?? {}) })
+      const mergedSettings = mergeClientSettings(nextSettings)
+      setClientSettings(mergedSettings)
+      if (!routeRulesDirtyRef.current) {
+        setRouteRules(normalizeRouteRuleDrafts(mergedSettings.rule_mode_rules))
+      }
       setSSHConnections(nextSSHConnections ?? [])
-      setDataDir(nextDataDir || '')
+      setMachineInfo(nextMachineInfo ?? browserMachineInfo())
       setLogs(nextLogs ?? [])
       setError('')
     } catch (err) {
@@ -251,16 +382,54 @@ function App() {
   }, [refresh])
 
   useEffect(() => {
-    if (!backendReady || !terminalSessionID) {
+    if (!SSH_TERMINAL_ENABLED && activeNav === 'terminal') {
+      setActiveNav('home')
+    }
+  }, [activeNav])
+
+  useEffect(() => {
+    if (!backendReady || !SSH_TERMINAL_ENABLED) {
       return
     }
     const offClosed = EventsOn('ssh:closed', (event: SSHClosedEvent) => {
-      if (event?.session_id === terminalSessionID) {
-        setTerminalConnected(false)
+      if (!event?.session_id) {
+        return
       }
+      setTerminalTabs((current) =>
+        current.map((tab) => (tab.sessionID === event.session_id ? { ...tab, connected: false } : tab)),
+      )
     })
     return () => offClosed()
-  }, [backendReady, terminalSessionID])
+  }, [backendReady])
+
+  useEffect(() => {
+    if (!backendReady || !SSH_TERMINAL_ENABLED) {
+      return
+    }
+    GetLaunchOptions()
+      .then((options) => setLaunchSSHConnectionID(options?.ssh_connection_id || ''))
+      .catch(() => undefined)
+  }, [backendReady])
+
+  useEffect(() => {
+    if (!terminalTabMenu) {
+      return
+    }
+    const closeMenu = () => setTerminalTabMenu(null)
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeMenu()
+      }
+    }
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('resize', closeMenu)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('resize', closeMenu)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [terminalTabMenu])
 
   const nodes = useMemo(() => {
     return proxyNodes.map((node, index) => toDashboardNode(node, index, proxyTestResults[node.name], testingNodeNames.has(node.name)))
@@ -269,6 +438,12 @@ function App() {
   const sshTunnels = useMemo(() => tunnels.filter((item) => normalizeMode(item.config.mode) !== 'vpn'), [tunnels])
   const tunnelRows = useMemo(() => sshTunnels.map(toTunnelRow), [sshTunnels])
   const sshRows = useMemo(() => sshConnections.map(toSSHRow), [sshConnections])
+  const activeTerminalTab = useMemo(() => {
+    if (!activeTerminalTabID) {
+      return terminalTabs[0]
+    }
+    return terminalTabs.find((tab) => tab.id === activeTerminalTabID) ?? terminalTabs[0]
+  }, [activeTerminalTabID, terminalTabs])
 
   useEffect(() => {
     if (nodes.length === 0) {
@@ -305,13 +480,41 @@ function App() {
     }
   }, [selectedSSHID, sshRows])
 
+  useEffect(() => {
+    if (!launchSSHConnectionID || handledLaunchSSHConnectionID === launchSSHConnectionID || sshRows.length === 0) {
+      return
+    }
+    const row = sshRows.find((item) => item.source?.id === launchSSHConnectionID)
+    if (!row) {
+      return
+    }
+    setHandledLaunchSSHConnectionID(launchSSHConnectionID)
+    setSelectedSSHID(row.id)
+    void openTerminal(row)
+  }, [handledLaunchSSHConnectionID, launchSSHConnectionID, sshRows])
+
+  useEffect(() => {
+    if (terminalTabs.length === 0) {
+      if (activeTerminalTabID) {
+        setActiveTerminalTabID('')
+      }
+      return
+    }
+    if (!activeTerminalTabID || !terminalTabs.some((tab) => tab.id === activeTerminalTabID)) {
+      setActiveTerminalTabID(terminalTabs[0].id)
+    }
+  }, [activeTerminalTabID, terminalTabs])
+
   const selectedNode = nodes.find((node) => node.id === selectedNodeID) ?? nodes[0]
   const selectedTunnel = tunnelRows.find((row) => row.id === selectedTunnelID) ?? tunnelRows[0]
   const selectedSSH = sshRows.find((row) => row.id === selectedSSHID) ?? sshRows[0]
-  const connected = proxyStatus?.state === 'running'
+  const proxyState = proxyStatus?.state ?? 'stopped'
+  const connected = proxyState === 'running'
+  const connectionStateText = proxyState === 'error' ? '连接异常' : connected ? '已连接' : '未连接'
+  const connectionDotClass = proxyState === 'error' ? 'red' : connected ? 'green' : 'gray'
   const proxyMode = normalizeProxyMode(clientSettings.proxy_mode || proxyStatus?.mode || 'rule')
   const runningNode = nodes.find((node) => node.name === proxyStatus?.node_name)
-  const currentNode = connected ? runningNode : undefined
+  const currentNode = connected || proxyState === 'error' ? runningNode : undefined
   const homePreviewNodes = useMemo(() => topLatencyNodes(nodes), [nodes])
   const tunnelUploadBytes = tunnels.reduce((sum, item) => sum + (item.stats?.bytes_out ?? 0), 0)
   const tunnelDownloadBytes = tunnels.reduce((sum, item) => sum + (item.stats?.bytes_in ?? 0), 0)
@@ -320,7 +523,9 @@ function App() {
   const uploadSpeedBps = proxyStatus?.upload_speed_bps ?? 0
   const downloadSpeedBps = proxyStatus?.download_speed_bps ?? 0
   const connectedSince = proxyStatus?.started_at ? formatClockDuration(proxyStatus.started_at) : '00:00:00'
-  const terminalLabel = terminalTitle ? formatSSHConnectionLabel(terminalTitle, terminalHost) : selectedSSH ? sshRowLabel(selectedSSH) : '未选择连接'
+  const terminalLabel = activeTerminalTab ? formatSSHConnectionLabel(activeTerminalTab.title, activeTerminalTab.host) : selectedSSH ? sshRowLabel(selectedSSH) : '未选择连接'
+  const testingNodes = testingNodeNames.size > 0
+  const filteredLogs = useMemo(() => filterLogs(logs, logLevelFilter, logRangeFilter, logSearch), [logs, logLevelFilter, logRangeFilter, logSearch])
 
   async function runAction(label: string, action: () => Promise<unknown>) {
     if (!backendReady) {
@@ -360,6 +565,9 @@ function App() {
   }
 
   async function testAllNodes() {
+    if (testingNodes) {
+      return
+    }
     const testableNodes = nodes.filter((node): node is DashboardNode & { source: proxysubscription.ProxyNode } => Boolean(node.source))
     if (testableNodes.length === 0) {
       setNotice('暂无可测试节点')
@@ -374,7 +582,6 @@ function App() {
 
     const total = testableNodes.length
     const testNames = new Set(testableNodes.map((node) => node.source.name))
-    setBusy(`测试节点 0/${total}`)
     setNotice(`节点测试中：0/${total}`)
     setError('')
     setTestingNodeNames(testNames)
@@ -411,7 +618,6 @@ function App() {
           next.delete(result.node_name)
           return next
         })
-        setBusy(`测试节点 ${completedCount}/${total}`)
         setNotice(`节点测试中：${completedCount}/${total}，${okCount} 可用`)
       }
 
@@ -430,7 +636,6 @@ function App() {
       setError(errorMessage(err))
     } finally {
       setTestingNodeNames(new Set())
-      setBusy('')
     }
   }
 
@@ -459,11 +664,114 @@ function App() {
     await runAction(clientSettings.auto_start ? '关闭开机自启' : '开启开机自启', () => SetAutoStartEnabled(!clientSettings.auto_start))
   }
 
-  async function toggleTunnel(row: TunnelRow) {
-    if (!row.source) {
+  function markRouteRulesDirty(nextRules: config.ProxyRule[]) {
+    routeRulesDirtyRef.current = true
+    setRouteRulesDirty(true)
+    setRouteRules(nextRules)
+  }
+
+  function addRouteRule(outbound: ProxyRuleOutbound) {
+    markRouteRulesDirty([...routeRules, createRouteRule(outbound)])
+  }
+
+  function updateRouteRule(id: string, patch: Partial<config.ProxyRule>) {
+    markRouteRulesDirty(routeRules.map((rule) => (rule.id === id ? { ...rule, ...patch } : rule)))
+  }
+
+  function deleteRouteRule(id: string) {
+    markRouteRulesDirty(routeRules.filter((rule) => rule.id !== id))
+  }
+
+  function resetRouteRules() {
+    markRouteRulesDirty(cloneRouteRules(defaultRouteRules))
+  }
+
+  async function saveRouteRules() {
+    if (busy) {
       return
     }
-    await runAction(row.running ? '停止隧道' : '启动隧道', () => (row.running ? StopTunnel(row.source!.config.name) : StartTunnel(row.source!.config.name)))
+    const invalid = routeRules.find((rule) => rule.enabled && !rule.value.trim())
+    if (invalid) {
+      setError('请填写已启用规则的匹配内容')
+      return
+    }
+    const hasWhitespace = routeRules.find((rule) => rule.enabled && /\s/.test(rule.value.trim()))
+    if (hasWhitespace) {
+      setError('匹配内容不能包含空格或换行')
+      return
+    }
+    const rules = sanitizeRouteRules(routeRules)
+    await runAction('保存路由规则', async () => {
+      await SetProxyRules(rules)
+      routeRulesDirtyRef.current = false
+      setRouteRulesDirty(false)
+      setRouteRules(rules)
+    })
+  }
+
+  async function toggleTunnel(row: TunnelRow) {
+    if (!row.source || busy || tunnelPending[row.id] || (!row.running && tunnelIsTransitioning(row))) {
+      return
+    }
+    if (!backendReady) {
+      setNotice('当前为前端预览模式')
+      window.setTimeout(() => setNotice(''), 1800)
+      return
+    }
+
+    const action: TunnelPendingAction = row.running ? 'stopping' : 'starting'
+    const label = row.running ? '停止隧道' : '启动隧道'
+    const targetState = row.running ? 'stopped' : 'running'
+    const timeoutMs = row.running ? TUNNEL_STOP_TIMEOUT_MS : TUNNEL_START_TIMEOUT_MS
+    const tunnelName = row.source.config.name
+
+    setNotice('')
+    setError('')
+    setTunnelPending((current) => ({ ...current, [row.id]: action }))
+    try {
+      if (row.running) {
+        await StopTunnel(tunnelName)
+      } else {
+        await StartTunnel(tunnelName)
+      }
+
+      const status = await waitForTunnelState(tunnelName, targetState, timeoutMs)
+      if (status?.state === targetState) {
+        setNotice(`${label}成功`)
+      } else if (row.running) {
+        setNotice('停止已提交，状态稍后自动刷新')
+      } else {
+        setNotice(status?.state === 'reconnecting' ? '启动已提交，正在重试连接' : '启动已提交，仍在连接中')
+      }
+      window.setTimeout(() => setNotice(''), 2200)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setTunnelPending((current) => {
+        const next = { ...current }
+        delete next[row.id]
+        return next
+      })
+    }
+  }
+
+  async function waitForTunnelState(name: string, targetState: string, timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs
+    let latest: manager.Status | undefined
+
+    while (Date.now() <= deadline) {
+      const nextTunnels = (await ListTunnels()) ?? []
+      setTunnels(nextTunnels)
+      latest = nextTunnels.find((item) => item.config.name === name)
+      if (!latest || latest.state === targetState) {
+        return latest
+      }
+      await delay(TUNNEL_POLL_INTERVAL_MS)
+    }
+
+    const nextTunnels = (await ListTunnels()) ?? []
+    setTunnels(nextTunnels)
+    return nextTunnels.find((item) => item.config.name === name)
   }
 
   function openSubscriptionForm(item?: store.SubscriptionSource) {
@@ -608,35 +916,75 @@ function App() {
       return
     }
     await runAction('连接 SSH 终端', async () => {
-      if (terminalSessionID) {
-        await CloseSSHSession(terminalSessionID).catch(() => undefined)
-        setTerminalConnected(false)
-      }
-      const sessionID = await CreateSSHSession({
-        addr: conn.addr,
-        user: conn.user,
-        identity_file: '',
-        passphrase: '',
-        password: conn.password,
-        rows: 24,
-        cols: 80,
-      })
-      setTerminalSessionID(sessionID)
-      setTerminalTitle(conn.name || `${conn.user}@${hostFromAddr(conn.addr)}`)
-      setTerminalHost(hostFromAddr(conn.addr))
-      setTerminalConnected(true)
+      const sessionID = await createSSHSession(conn)
+      const tab = terminalTabFromConnection(conn, sessionID)
+      setTerminalTabs((current) => [...current, tab])
+      setActiveTerminalTabID(tab.id)
       setActiveNav('terminal')
     })
   }
 
-  async function closeTerminal() {
-    if (terminalSessionID) {
-      await CloseSSHSession(terminalSessionID).catch(() => undefined)
+  async function reconnectTerminal(tabID = activeTerminalTab?.id ?? '') {
+    const tab = terminalTabs.find((item) => item.id === tabID)
+    if (!tab) {
+      return
     }
-    setTerminalSessionID('')
-    setTerminalTitle('')
-    setTerminalHost('')
-    setTerminalConnected(false)
+    setTerminalTabMenu(null)
+    await runAction('重连 SSH 终端', async () => {
+      if (tab.sessionID) {
+        await CloseSSHSession(tab.sessionID).catch(() => undefined)
+      }
+      const sessionID = await createSSHSession(tab)
+      setTerminalTabs((current) =>
+        current.map((item) => (item.id === tab.id ? { ...item, sessionID, connected: true } : item)),
+      )
+      setActiveTerminalTabID(tab.id)
+      setActiveNav('terminal')
+    })
+  }
+
+  async function openTerminalTab(tabID = activeTerminalTab?.id ?? '') {
+    const tab = terminalTabs.find((item) => item.id === tabID)
+    if (!tab) {
+      return
+    }
+    setTerminalTabMenu(null)
+    await runAction('新建 SSH 标签', async () => {
+      const sessionID = await createSSHSession(tab)
+      const nextTab: TerminalTab = {
+        ...tab,
+        id: newTerminalTabID(tab.connectionID || tab.sessionID),
+        sessionID,
+        connected: true,
+      }
+      setTerminalTabs((current) => [...current, nextTab])
+      setActiveTerminalTabID(nextTab.id)
+      setActiveNav('terminal')
+    })
+  }
+
+  async function closeTerminal(tabID = activeTerminalTab?.id ?? '') {
+    const tab = terminalTabs.find((item) => item.id === tabID)
+    if (!tab) {
+      return
+    }
+    setTerminalTabMenu(null)
+    if (tab.sessionID) {
+      await CloseSSHSession(tab.sessionID).catch(() => undefined)
+    }
+    const tabIndex = terminalTabs.findIndex((item) => item.id === tab.id)
+    const nextTabs = terminalTabs.filter((item) => item.id !== tab.id)
+    setTerminalTabs(nextTabs)
+    if (activeTerminalTabID === tab.id) {
+      setActiveTerminalTabID(nextTabs[Math.min(tabIndex, nextTabs.length - 1)]?.id ?? '')
+    }
+  }
+
+  function openTerminalTabMenu(event: ReactMouseEvent, tabID: string) {
+    event.preventDefault()
+    event.stopPropagation()
+    setActiveTerminalTabID(tabID)
+    setTerminalTabMenu({ tabID, x: event.clientX, y: event.clientY })
   }
 
   async function clearLogEntries() {
@@ -644,6 +992,26 @@ function App() {
       await ClearLogs()
       setLogs([])
     })
+  }
+
+  function exportLogEntries() {
+    if (filteredLogs.length === 0) {
+      setNotice('暂无可导出的日志')
+      window.setTimeout(() => setNotice(''), 1800)
+      return
+    }
+
+    const blob = new Blob(['\ufeff', toLogCsv(filteredLogs)], { type: 'text/csv;charset=utf-8' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `safelink-logs-${formatFileTimestamp(new Date())}.csv`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => window.URL.revokeObjectURL(url), 0)
+    setNotice(`已导出 ${filteredLogs.length} 条日志`)
+    window.setTimeout(() => setNotice(''), 1800)
   }
 
   return (
@@ -655,26 +1023,26 @@ function App() {
         </div>
 
         <nav className="nav-list">
-          {navItems.map((item, index) => (
+          {navItems.map((item) => (
             <button
-              className={`nav-item ${activeNav === item.key ? 'active' : ''} ${index === 5 ? 'with-divider' : ''}`}
+              className={`nav-item ${activeNav === item.key ? 'active' : ''} ${item.key === 'settings' ? 'with-divider' : ''}`}
               key={item.key}
               onClick={() => setActiveNav(item.key)}
               type="button"
             >
               <Icon name={item.icon} />
-              <span>{item.label}</span>
+              <span className="nav-label">{item.label}</span>
+              {item.badge && <span className="nav-badge">（{item.badge}）</span>}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-status">
           <div className="status-line">
-            <span className={`dot ${connected ? 'green' : 'gray'}`} />
-            <strong>{connected ? '已连接' : '未连接'}</strong>
+            <span className={`dot ${connectionDotClass}`} />
+            <strong>{connectionStateText}</strong>
           </div>
           <p>当前模式： 规则模式</p>
-          <p>本地端口： {proxyStatus?.socks_addr ? portFromAddr(proxyStatus.socks_addr) : '-'}</p>
         </div>
         <span className="version">v{version}</span>
       </aside>
@@ -685,7 +1053,7 @@ function App() {
         {activeNav === 'nodes' && renderNodesPage()}
         {activeNav === 'subscriptions' && renderSubscriptionsPage()}
         {activeNav === 'tunnels' && renderTunnelsPage()}
-        {activeNav === 'terminal' && renderTerminalPage()}
+        {SSH_TERMINAL_ENABLED && activeNav === 'terminal' && renderTerminalPage()}
         {activeNav === 'settings' && renderSettingsPage()}
         {activeNav === 'logs' && renderLogsPage()}
       </main>
@@ -701,7 +1069,7 @@ function App() {
             <div className="hero-content">
               <BrandLogo size="xl" />
               <div>
-                <div className="connection-state">{connected ? '已连接' : '未连接'}</div>
+                <div className="connection-state">{connectionStateText}</div>
                 <p className="muted">当前节点</p>
                 <div className="current-node">
                   {currentNode ? <Flag code={currentNode.flagCode} /> : <span className="flag-placeholder" />}
@@ -747,7 +1115,7 @@ function App() {
 
         <section className="bottom-grid">
           {renderTunnelCompactCard()}
-          {renderTerminalCompactCard()}
+          {SSH_TERMINAL_ENABLED && renderTerminalCompactCard()}
         </section>
       </div>
     )
@@ -765,9 +1133,10 @@ function App() {
         {previewNodes.map((node) => {
           const selected = selectedNode?.id === node.id
           const running = proxyStatus?.node_name === node.name && connected
+          const cardClass = ['home-node-card', selected ? 'selected' : '', running ? 'running' : ''].filter(Boolean).join(' ')
           return (
             <button
-              className={`home-node-card ${selected ? 'selected' : ''}`}
+              className={cardClass}
               key={node.id}
               onClick={() => connectNode(node)}
               type="button"
@@ -822,14 +1191,28 @@ function App() {
                   <span>类型</span>
                   <select value={tunnelForm.mode} onChange={(event) => setTunnelForm((current) => ({ ...current, mode: event.target.value as TunnelForm['mode'] }))}>
                     <option value="local">本地转发</option>
-                    <option value="remote">远程转发</option>
+                    <option value="remote">内网穿透</option>
                     <option value="dynamic">动态转发</option>
                   </select>
                 </label>
               </div>
               <div className="form-grid">
-                <FormField label="监听地址" value={tunnelForm.listen} onChange={(value) => setTunnelForm((current) => ({ ...current, listen: value }))} required />
-                <FormField label="目标地址" value={tunnelForm.forward} onChange={(value) => setTunnelForm((current) => ({ ...current, forward: value }))} disabled={tunnelForm.mode === 'dynamic'} />
+                <FormField
+                  helpText={tunnelModeGuides[tunnelForm.mode].listenHelp}
+                  label="监听地址"
+                  placeholder={tunnelModeGuides[tunnelForm.mode].listenPlaceholder}
+                  value={tunnelForm.listen}
+                  onChange={(value) => setTunnelForm((current) => ({ ...current, listen: value }))}
+                  required
+                />
+                <FormField
+                  disabled={tunnelForm.mode === 'dynamic'}
+                  helpText={tunnelModeGuides[tunnelForm.mode].forwardHelp}
+                  label="目标地址"
+                  placeholder={tunnelModeGuides[tunnelForm.mode].forwardPlaceholder}
+                  value={tunnelForm.forward}
+                  onChange={(value) => setTunnelForm((current) => ({ ...current, forward: value }))}
+                />
               </div>
               <div className="form-grid">
                 <FormField label="SSH 地址" value={tunnelForm.sshAddr} onChange={(value) => setTunnelForm((current) => ({ ...current, sshAddr: value }))} required />
@@ -872,7 +1255,7 @@ function App() {
                 <strong>{selectedNode ? <><Flag code={selectedNode.flagCode} />{selectedNode.name}</> : '未选择节点'}</strong>
               </div>
               <div className="node-page-actions">
-                <button className="primary-btn" disabled={Boolean(busy) || nodes.length === 0} onClick={testAllNodes} type="button">测试节点</button>
+                <button className="primary-btn" disabled={testingNodes || nodes.length === 0} onClick={testAllNodes} type="button">{testingNodes ? '测试中' : '测试节点'}</button>
               </div>
             </div>
             {renderNodeCardGrid()}
@@ -892,10 +1275,11 @@ function App() {
         {nodes.map((node) => {
           const selected = selectedNode?.id === node.id
           const running = connected && proxyStatus?.node_name === node.name
+          const cardClass = ['node-card-item', selected ? 'selected' : '', running ? 'running' : ''].filter(Boolean).join(' ')
           return (
             <button
               aria-pressed={selected}
-              className={`node-card-item ${selected ? 'selected' : ''}`}
+              className={cardClass}
               key={node.id}
               onClick={() => connectNode(node)}
               type="button"
@@ -958,6 +1342,7 @@ function App() {
   }
 
   function renderTunnelsPage() {
+    const selectedPendingAction = selectedTunnel ? tunnelPending[selectedTunnel.id] : undefined
     return (
       <section className="page-card tunnels-page">
         <PageHeader title="SSH 隧道" actions={<button className="small-outline" onClick={() => openTunnelForm()} type="button">＋ 新建隧道</button>} />
@@ -970,16 +1355,34 @@ function App() {
             <span>状态</span>
             <span>操作</span>
           </div>
-          {tunnelRows.map((row) => (
-            <button className={`tunnel-table-row ${row.id === selectedTunnel?.id ? 'selected' : ''}`} key={row.id} onClick={() => setSelectedTunnelID(row.id)} type="button">
-              <span><span className={`dot ${row.running ? 'green' : 'gray'}`} />{row.name}</span>
-              <span>{row.type}</span>
-              <span>{row.listen}</span>
-              <span>{row.forward}</span>
-              <span className={row.running ? 'mini-state running' : 'mini-state'}>{row.running ? '运行中' : '已停止'}</span>
-              <span className="row-actions"><span onClick={(event) => { event.stopPropagation(); toggleTunnel(row) }}>▶</span><span onClick={(event) => { event.stopPropagation(); openTunnelForm(row) }}>···</span></span>
-            </button>
-          ))}
+          {tunnelRows.map((row) => {
+            const pendingAction = tunnelPending[row.id]
+            const actionBusy = tunnelActionBusy(row, pendingAction, busy)
+            return (
+              <button className={`tunnel-table-row ${row.id === selectedTunnel?.id ? 'selected' : ''}`} key={row.id} onClick={() => setSelectedTunnelID(row.id)} type="button">
+                <span><span className={`dot ${tunnelDotClass(row, pendingAction)}`} />{row.name}</span>
+                <span>{row.type}</span>
+                <span>{row.listen}</span>
+                <span>{row.forward}</span>
+                <span className={tunnelStatusClass(row, pendingAction)}>{tunnelShouldSpin(row, pendingAction) && <Spinner small />}{tunnelStatusText(row, pendingAction)}</span>
+                <span className="row-actions">
+                  <span
+                    aria-disabled={actionBusy}
+                    className={`row-action-icon ${row.running ? 'running' : ''} ${actionBusy ? 'disabled' : ''}`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void toggleTunnel(row)
+                    }}
+                    role="button"
+                    title={tunnelControlText(row, pendingAction)}
+                  >
+                    {tunnelShouldSpin(row, pendingAction) ? <Spinner small /> : row.running ? '■' : '▶'}
+                  </span>
+                  <span onClick={(event) => { event.stopPropagation(); openTunnelForm(row) }}>···</span>
+                </span>
+              </button>
+            )
+          })}
           {tunnelRows.length === 0 && <EmptyTable text="暂无 SSH 隧道" />}
         </div>
         <div className="tunnel-detail-panel">
@@ -991,12 +1394,16 @@ function App() {
               <InfoPair label="本地地址" value={selectedTunnel.listen} />
               <InfoPair label="远程地址" value={selectedTunnel.forward} />
               <InfoPair label="SSH 服务器" value={selectedTunnel.endpoint} />
-              <InfoPair label="状态" value={selectedTunnel.running ? '运行中' : '已停止'} highlight={selectedTunnel.running} />
+              <InfoPair label="状态" value={tunnelStatusText(selectedTunnel, selectedPendingAction)} highlight={selectedTunnel.running || Boolean(selectedPendingAction)} />
+              {selectedTunnel.lastError && <InfoPair label="最近错误" value={selectedTunnel.lastError} danger />}
               <InfoPair label="更新时间" value={selectedTunnel.updatedAt} />
               <div className="detail-action-row">
                 <button className="outline-btn" onClick={() => openTunnelForm(selectedTunnel)} type="button">编辑</button>
-                <button className="danger-outline" disabled={Boolean(busy)} onClick={() => toggleTunnel(selectedTunnel)} type="button">{selectedTunnel.running ? '停止' : '启动'}</button>
-                <button className="danger-soft" disabled={Boolean(busy)} onClick={deleteSelectedTunnel} type="button">删除</button>
+                <button className="danger-outline tunnel-toggle-button" disabled={tunnelActionBusy(selectedTunnel, selectedPendingAction, busy)} onClick={() => toggleTunnel(selectedTunnel)} type="button">
+                  {tunnelShouldSpin(selectedTunnel, selectedPendingAction) && <Spinner small />}
+                  {tunnelControlText(selectedTunnel, selectedPendingAction)}
+                </button>
+                <button className="danger-soft" disabled={Boolean(busy) || Boolean(selectedPendingAction)} onClick={deleteSelectedTunnel} type="button">删除</button>
               </div>
             </>
           ) : (
@@ -1024,25 +1431,73 @@ function App() {
         </div>
         <div className="card terminal-window-card">
           <div className="terminal-toolbar">
-            <div className="terminal-tab-label">
-              <span className={`dot ${terminalConnected ? 'green' : 'red'}`} />
-              <span title={terminalLabel}>{terminalLabel}</span>
+            <div className="terminal-tabs" role="tablist" aria-label="SSH 终端标签">
+              {terminalTabs.length > 0 ? (
+                terminalTabs.map((tab) => {
+                  const label = formatSSHConnectionLabel(tab.title, tab.host)
+                  const active = tab.id === activeTerminalTab?.id
+                  return (
+                    <div
+                      aria-selected={active}
+                      className={`terminal-tab ${active ? 'active' : ''}`}
+                      key={tab.id}
+                      onClick={() => setActiveTerminalTabID(tab.id)}
+                      onContextMenu={(event) => openTerminalTabMenu(event, tab.id)}
+                      role="tab"
+                    >
+                      <span className={`dot ${tab.connected ? 'green' : 'red'}`} />
+                      <span title={label}>{label}</span>
+                      <button
+                        className="terminal-tab-delete"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          void closeTerminal(tab.id)
+                        }}
+                        title="关闭标签"
+                        aria-label={`关闭标签 ${label}`}
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )
+                })
+              ) : (
+                <div className="terminal-tab-label">
+                  <span className="dot gray" />
+                  <span title={terminalLabel}>{terminalLabel}</span>
+                </div>
+              )}
             </div>
             <div className="terminal-toolbar-actions">
               <button className="plain-star" onClick={() => openTerminal()} type="button">连接</button>
               <button className="plain-star" onClick={() => openSSHForm(selectedSSH)} type="button">编辑</button>
-              <button className="terminal-tab-delete" disabled={!terminalSessionID && !terminalTitle} onClick={closeTerminal} title="断开并删除标签" aria-label="断开并删除标签" type="button">×</button>
             </div>
           </div>
           <div className="terminal-screen">
-            {terminalSessionID ? (
-              <SSHTerminalPane sessionID={terminalSessionID} title={terminalTitle || selectedSSH?.name || 'SSH'} />
+            {terminalTabs.length > 0 ? (
+              terminalTabs.map((tab) => (
+                <div className={`terminal-pane-slot ${tab.id === activeTerminalTab?.id ? 'active' : ''}`} key={`${tab.id}-${tab.sessionID}`}>
+                  <SSHTerminalPane active={tab.id === activeTerminalTab?.id} sessionID={tab.sessionID} />
+                </div>
+              ))
             ) : selectedSSH ? (
               <pre>{`连接：${selectedSSH.detail}\n\n点击右上角“连接”打开终端会话。`}</pre>
             ) : (
-              <span>请选择一个 SSH 连接</span>
+              <span className="terminal-empty-hint">请选择一个 SSH 连接</span>
             )}
           </div>
+          {terminalTabMenu && (
+            <div
+              className="terminal-tab-menu"
+              style={{ left: terminalTabMenu.x, top: terminalTabMenu.y }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <button onClick={() => reconnectTerminal(terminalTabMenu.tabID)} type="button">重连</button>
+              <button onClick={() => openTerminalTab(terminalTabMenu.tabID)} type="button">新建标签</button>
+              <button className="danger" onClick={() => closeTerminal(terminalTabMenu.tabID)} type="button">关闭标签</button>
+            </div>
+          )}
         </div>
       </section>
     )
@@ -1052,38 +1507,86 @@ function App() {
     return (
       <section className="page-card settings-page">
         <div className="settings-tabs">
-          {settingsTabs.map((item, index) => <button className={index === 0 ? 'active' : ''} key={item}>{item}</button>)}
+          {settingsTabs.map((item) => (
+            <button className={activeSettingsTab === item.key ? 'active' : ''} key={item.key} onClick={() => setActiveSettingsTab(item.key)} type="button">{item.label}</button>
+          ))}
         </div>
-        <div className="settings-form">
-          <h3>启动设置</h3>
-          <div className="checkbox-row">
-            <CheckItem checked={clientSettings.auto_start} label="开机启动" />
-            <CheckItem checked label="启动后自动连接" />
-            <CheckItem checked label="最小化到托盘" />
-          </div>
-
-          <h3>网络设置</h3>
-          <div className="settings-grid">
-            <Field label="本地端口" value={proxyStatus?.socks_addr ? portFromAddr(proxyStatus.socks_addr) : '-'} />
-            <Field label="SOCKS5 端口" value={proxyStatus?.socks_addr ? portFromAddr(proxyStatus.socks_addr) : '-'} />
-            <Field label="HTTP 代理端口" value={proxyStatus?.http_addr ? portFromAddr(proxyStatus.http_addr) : '-'} />
-          </div>
-
-          <h3>系统代理</h3>
-          <div className="checkbox-row compact">
-            <CheckItem checked={clientSettings.system_proxy} label="启用系统代理" />
-            <ToggleRow label="绕过局域网和本地地址" />
-          </div>
-
-          <h3>TUN 模式</h3>
-          <div className="checkbox-row compact">
-            <CheckItem label="启用 TUN 模式（实验性功能）" />
-            <ToggleRow label="" />
-          </div>
-
-          <p className="settings-data-dir">数据目录：{dataDir || '-'}</p>
-        </div>
+        {activeSettingsTab === 'general' ? renderGeneralSettings() : renderRoutingSettings()}
       </section>
+    )
+  }
+
+  function renderGeneralSettings() {
+    return (
+      <div className="settings-form">
+        <h3>启动设置</h3>
+        <div className="settings-toggle-grid">
+          <ToggleRow checked={clientSettings.auto_start} disabled={Boolean(busy)} label="开机启动" onToggle={toggleAutoStart} />
+          <ToggleRow checked={clientSettings.system_proxy} disabled={Boolean(busy) || (!connected && !selectedNode)} label="系统代理" onToggle={toggleSystemProxy} title={clientSettings.system_proxy ? '关闭系统代理并断开连接' : '开启系统代理并连接当前节点'} />
+        </div>
+
+        <h3>代理模式</h3>
+        <div className="segment settings-segment">
+          {proxyModeOptions.map((item) => (
+            <button className={proxyMode === item.value ? 'selected' : ''} disabled={Boolean(busy)} key={item.value} onClick={() => changeProxyMode(item.value)} type="button">{item.label}</button>
+          ))}
+        </div>
+
+        <h3>本机信息</h3>
+        <div className="settings-info-grid">
+          <InfoPair label="主机名" value={machineInfo.hostname || '-'} />
+          <InfoPair label="当前用户" value={machineInfo.username || '-'} />
+          <InfoPair label="操作系统" value={formatMachineOS(machineInfo.os)} />
+          <InfoPair label="系统架构" value={machineInfo.arch || '-'} />
+          <InfoPair label="CPU 核心" value={machineInfo.cpu_cores || '-'} />
+          <InfoPair label="本机 IP" value={formatMachineIPs(machineInfo.ips)} />
+        </div>
+      </div>
+    )
+  }
+
+  function renderRoutingSettings() {
+    return (
+      <div className="settings-form route-settings">
+        <div className="settings-section-title">
+          <h3>转发规则</h3>
+          <div className="route-rule-actions">
+            <button className="small-outline" onClick={() => addRouteRule('direct')} type="button">＋ 白名单</button>
+            <button className="small-outline" onClick={() => addRouteRule('selected')} type="button">＋ 代理</button>
+            <button className="small-outline" onClick={() => addRouteRule('block')} type="button">＋ 阻断</button>
+            <button className="small-outline" disabled={Boolean(busy)} onClick={resetRouteRules} type="button">恢复默认</button>
+            <button className="primary-btn" disabled={Boolean(busy) || !routeRulesDirty} onClick={saveRouteRules} type="button">保存规则</button>
+          </div>
+        </div>
+        <div className="route-rule-table">
+          <div className="route-rule-head">
+            <span>启用</span>
+            <span>名称</span>
+            <span>类型</span>
+            <span>匹配内容</span>
+            <span>策略</span>
+            <span>操作</span>
+          </div>
+          {routeRules.map((rule) => (
+            <div className={`route-rule-row ${rule.enabled && !rule.value.trim() ? 'invalid' : ''}`} key={rule.id}>
+              <label className="route-enable">
+                <input checked={rule.enabled} onChange={(event) => updateRouteRule(rule.id, { enabled: event.target.checked })} type="checkbox" />
+                <span className={rule.enabled ? 'checkbox checked' : 'checkbox'} />
+              </label>
+              <input value={rule.name} onChange={(event) => updateRouteRule(rule.id, { name: event.target.value })} />
+              <select value={normalizeRuleType(rule.type)} onChange={(event) => updateRouteRule(rule.id, { type: event.target.value as ProxyRuleType })}>
+                {routeRuleTypeOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+              <input placeholder={routeRulePlaceholder(rule.type)} value={rule.value} onChange={(event) => updateRouteRule(rule.id, { value: event.target.value })} />
+              <select value={normalizeRuleOutbound(rule.outbound)} onChange={(event) => updateRouteRule(rule.id, { outbound: event.target.value as ProxyRuleOutbound })}>
+                {routeOutboundOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+              <button className="small-outline danger-action" onClick={() => deleteRouteRule(rule.id)} type="button">删除</button>
+            </div>
+          ))}
+          {routeRules.length === 0 && <EmptyTable text="暂无路由规则" />}
+        </div>
+      </div>
     )
   }
 
@@ -1091,10 +1594,10 @@ function App() {
     return (
       <section className="page-card logs-page">
         <div className="logs-toolbar">
-          <SelectLike label="日志级别" value="全部" />
-          <SelectLike label="时间范围" value="全部" />
-          <SearchBox placeholder="搜索日志内容" />
-          <button className="small-outline" type="button">导出日志</button>
+          <SelectLike label="日志级别" options={logLevelOptions} value={logLevelFilter} onChange={(value) => setLogLevelFilter(value as LogLevelFilter)} />
+          <SelectLike label="时间范围" options={logRangeOptions} value={logRangeFilter} onChange={(value) => setLogRangeFilter(value as LogRangeFilter)} />
+          <SearchBox placeholder="搜索日志内容" value={logSearch} onChange={setLogSearch} />
+          <button className="small-outline" onClick={exportLogEntries} type="button">导出日志</button>
           <button className="primary-btn" onClick={clearLogEntries} type="button">清空日志</button>
         </div>
         <div className="logs-table">
@@ -1104,7 +1607,7 @@ function App() {
             <span>模块</span>
             <span>内容</span>
           </div>
-          {logs.map((item, index) => (
+          {filteredLogs.map((item, index) => (
             <div className="logs-row" key={`${item.time}-${index}`}>
               <span>{formatOptionalDate(item.time)}</span>
               <span className={item.level === 'error' ? 'danger-text' : item.level === 'warn' ? 'warn-text' : 'good-text'}>{logLevelLabel(item.level)}</span>
@@ -1112,9 +1615,11 @@ function App() {
               <span>{item.message}</span>
             </div>
           ))}
-          {logs.length === 0 && <EmptyTable text="暂无日志数据" />}
         </div>
-        <PageFooter count={logs.length} />
+        <div className="logs-bottom">
+          {filteredLogs.length === 0 && <div className="logs-empty-bottom">{logs.length === 0 ? '暂无日志数据' : '暂无匹配日志'}</div>}
+          <PageFooter count={filteredLogs.length} />
+        </div>
       </section>
     )
   }
@@ -1124,14 +1629,19 @@ function App() {
       <div className="card compact-card">
         <PanelTitle title="SSH 隧道" action={<button className="small-outline" onClick={() => openTunnelForm()} type="button">＋ 新建隧道</button>} />
         <div className="compact-list">
-          {tunnelRows.map((row) => (
-            <div className="compact-row" key={row.id}>
-              <button className={`round-play ${row.running ? 'running' : ''}`} onClick={() => toggleTunnel(row)} type="button">▶</button>
-              <div><strong>{row.name}</strong><p>{row.detail}</p></div>
-              <span className={row.running ? 'mini-state running' : 'mini-state'}><span className={`dot ${row.running ? 'green' : 'gray'}`} />{row.running ? '运行中' : '已停止'}</span>
-              <button className="ellipsis" type="button">···</button>
-            </div>
-          ))}
+          {tunnelRows.map((row) => {
+            const pendingAction = tunnelPending[row.id]
+            return (
+              <div className="compact-row" key={row.id}>
+                <button className={`round-play ${row.running ? 'running' : ''}`} disabled={tunnelActionBusy(row, pendingAction, busy)} onClick={() => toggleTunnel(row)} title={tunnelControlText(row, pendingAction)} type="button">
+                  {tunnelShouldSpin(row, pendingAction) ? <Spinner small /> : row.running ? '■' : '▶'}
+                </button>
+                <div><strong>{row.name}</strong><p>{row.detail}</p></div>
+                <span className={tunnelStatusClass(row, pendingAction)}>{tunnelShouldSpin(row, pendingAction) ? <Spinner small /> : <span className={`dot ${tunnelDotClass(row, pendingAction)}`} />}{tunnelStatusText(row, pendingAction)}</span>
+                <button className="ellipsis" type="button">···</button>
+              </div>
+            )
+          })}
           {tunnelRows.length === 0 && <EmptyList text="暂无 SSH 隧道" />}
         </div>
         <button className="link-btn" onClick={() => setActiveNav('tunnels')} type="button">查看全部隧道 →</button>
@@ -1142,7 +1652,7 @@ function App() {
   function renderTerminalCompactCard() {
     return (
       <div className="card compact-card">
-        <PanelTitle title="SSH 终端连接" action={<button className="small-outline" onClick={() => openSSHForm()} type="button">＋ 新建连接</button>} />
+        <PanelTitle title="SSH 终端连接（开发中）" action={<button className="small-outline" onClick={() => openSSHForm()} type="button">＋ 新建连接</button>} />
         <div className="compact-list">
           {sshRows.map((row) => (
             <div className="compact-row terminal-row" key={row.id}>
@@ -1194,6 +1704,8 @@ function FormField({
   type = 'text',
   required = false,
   disabled = false,
+  placeholder = '',
+  helpText = '',
 }: {
   label: string
   value: string
@@ -1201,12 +1713,46 @@ function FormField({
   type?: string
   required?: boolean
   disabled?: boolean
+  placeholder?: string
+  helpText?: string
 }) {
+  const inputID = useId()
+  const [passwordVisible, setPasswordVisible] = useState(false)
+  const isPassword = type === 'password'
+  const inputType = isPassword && passwordVisible ? 'text' : type
+
   return (
-    <label className="form-field">
-      <span>{label}</span>
-      <input disabled={disabled} required={required} type={type} value={value} onChange={(event) => onChange(event.target.value)} />
-    </label>
+    <div className="form-field">
+      <label className="form-field-label" htmlFor={inputID}>
+        <span>{label}</span>
+        {helpText && (
+          <span
+            aria-label={`${label}说明：${helpText}`}
+            className="field-help"
+            data-tooltip={helpText}
+            tabIndex={0}
+          >
+            !
+          </span>
+        )}
+      </label>
+      <div className={isPassword ? 'password-field' : undefined}>
+        <input id={inputID} disabled={disabled} placeholder={placeholder} required={required} type={inputType} value={value} onChange={(event) => onChange(event.target.value)} />
+        {isPassword && (
+          <button
+            aria-label={passwordVisible ? '隐藏密码' : '显示密码'}
+            aria-pressed={passwordVisible}
+            className={`password-toggle ${passwordVisible ? 'visible' : ''}`}
+            disabled={disabled}
+            onClick={() => setPasswordVisible((current) => !current)}
+            title={passwordVisible ? '隐藏密码' : '显示密码'}
+            type="button"
+          >
+            <span className="eye-icon" aria-hidden="true" />
+          </button>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -1246,20 +1792,29 @@ function ToggleRow({ label, checked = false, disabled = false, title, onToggle }
   )
 }
 
-function CheckItem({ label, checked = false }: { label: string; checked?: boolean }) {
-  return <label className="check-item"><span className={checked ? 'checkbox checked' : 'checkbox'} />{label}</label>
+function SearchBox({ placeholder, value, onChange }: { placeholder: string; value: string; onChange: (value: string) => void }) {
+  return <label className="search-box"><span>⌕</span><input placeholder={placeholder} value={value} onChange={(event) => onChange(event.target.value)} /></label>
 }
 
-function Field({ label, value }: { label: string; value: string }) {
-  return <label className="field"><span>{label}</span><input readOnly value={value} /></label>
-}
-
-function SearchBox({ placeholder }: { placeholder: string }) {
-  return <label className="search-box"><span>⌕</span><input readOnly placeholder={placeholder} /></label>
-}
-
-function SelectLike({ label, value }: { label: string; value: string }) {
-  return <label className="select-like"><span>{label}</span><button>{value}⌄</button></label>
+function SelectLike({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string
+  value: string
+  options: Array<{ value: string; label: string }>
+  onChange: (value: string) => void
+}) {
+  return (
+    <label className="select-like">
+      <span>{label}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        {options.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+      </select>
+    </label>
+  )
 }
 
 function InfoPair({
@@ -1315,6 +1870,10 @@ function MetricIcon({ name }: { name: 'up' | 'down' | 'clock' }) {
   return <span className={`metric-icon ${name}`} aria-hidden="true" />
 }
 
+function Spinner({ small = false }: { small?: boolean }) {
+  return <span className={`spinner ${small ? 'small' : ''}`} aria-hidden="true" />
+}
+
 function toDashboardNode(node: proxysubscription.ProxyNode, index: number, result?: proxycore.TestResult, testing = false): DashboardNode {
   const location = inferLocation(node.name, node.server)
   const protocol = protocolLabel(node.protocol)
@@ -1365,7 +1924,7 @@ function toTunnelRow(item: manager.Status): TunnelRow {
   const mode = normalizeMode(item.config.mode)
   const listen = item.config.listen || '-'
   const forward = mode === 'dynamic' ? 'SOCKS5' : item.config.forward || '-'
-  const type = mode === 'remote' ? '远程转发' : mode === 'dynamic' ? '动态转发' : '本地转发'
+  const type = mode === 'remote' ? '内网穿透' : mode === 'dynamic' ? '动态转发' : '本地转发'
   return {
     id: item.config.name,
     name: item.config.name,
@@ -1374,10 +1933,68 @@ function toTunnelRow(item: manager.Status): TunnelRow {
     forward,
     detail: mode === 'dynamic' ? `${listen} (${forward})` : `${listen} → ${forward}`,
     endpoint: `${item.config.ssh?.user || '-'}@${item.config.ssh?.addr || '-'}`,
+    state: item.state || 'stopped',
+    lastError: item.last_error || '',
     running: item.state === 'running',
     updatedAt: item.started_at ? formatOptionalDate(item.started_at) : '-',
     source: item,
   }
+}
+
+function tunnelIsTransitioning(row: TunnelRow) {
+  return row.state === 'connecting' || row.state === 'reconnecting'
+}
+
+function tunnelShouldSpin(row: TunnelRow, pendingAction?: TunnelPendingAction) {
+  return Boolean(pendingAction) || tunnelIsTransitioning(row)
+}
+
+function tunnelActionBusy(row: TunnelRow, pendingAction: TunnelPendingAction | undefined, busy: string) {
+  return Boolean(busy) || Boolean(pendingAction) || (!row.running && tunnelIsTransitioning(row))
+}
+
+function tunnelStatusText(row: TunnelRow, pendingAction?: TunnelPendingAction) {
+  if (pendingAction === 'starting') {
+    return '启动中'
+  }
+  if (pendingAction === 'stopping') {
+    return '停止中'
+  }
+  if (row.state === 'connecting') {
+    return '连接中'
+  }
+  if (row.state === 'reconnecting') {
+    return '重连中'
+  }
+  return row.running ? '运行中' : '已停止'
+}
+
+function tunnelControlText(row: TunnelRow, pendingAction?: TunnelPendingAction) {
+  if (pendingAction === 'starting' || (!row.running && tunnelIsTransitioning(row))) {
+    return '启动中'
+  }
+  if (pendingAction === 'stopping') {
+    return '停止中'
+  }
+  return row.running ? '停止' : '启动'
+}
+
+function tunnelStatusClass(row: TunnelRow, pendingAction?: TunnelPendingAction) {
+  const classes = ['mini-state']
+  if (row.running) {
+    classes.push('running')
+  }
+  if (pendingAction || tunnelIsTransitioning(row)) {
+    classes.push('pending')
+  }
+  return classes.join(' ')
+}
+
+function tunnelDotClass(row: TunnelRow, pendingAction?: TunnelPendingAction) {
+  if (pendingAction || tunnelIsTransitioning(row)) {
+    return 'yellow'
+  }
+  return row.running ? 'green' : 'gray'
 }
 
 function toSSHRow(item: store.SSHConnection, index: number): SSHRow {
@@ -1416,6 +2033,91 @@ function buildTunnelConfig(form: TunnelForm): config.TunnelCfg {
   } as unknown as config.TunnelCfg
 }
 
+function mergeClientSettings(settings?: store.ClientSettings | null): store.ClientSettings {
+  const merged = { ...defaultClientSettings, ...(settings ?? {}) } as store.ClientSettings
+  merged.rule_mode_rules = normalizeRouteRuleDrafts(settings?.rule_mode_rules ?? defaultRouteRules)
+  return merged
+}
+
+function cloneRouteRules(rules: config.ProxyRule[]) {
+  return rules.map((rule) => ({ ...rule }))
+}
+
+function normalizeRouteRuleDrafts(rules?: config.ProxyRule[] | null): config.ProxyRule[] {
+  const source = rules ?? defaultRouteRules
+  return source.map((rule) => ({
+    id: rule.id || newRouteRuleID(),
+    name: rule.name || routeRuleName(normalizeRuleOutbound(rule.outbound)),
+    type: normalizeRuleType(rule.type),
+    value: rule.value || '',
+    outbound: normalizeRuleOutbound(rule.outbound),
+    enabled: rule.enabled !== false,
+  }))
+}
+
+function sanitizeRouteRules(rules: config.ProxyRule[]) {
+  return normalizeRouteRuleDrafts(rules).map((rule) => ({
+    ...rule,
+    name: rule.name.trim() || routeRuleName(normalizeRuleOutbound(rule.outbound)),
+    value: rule.value.trim(),
+  }))
+}
+
+function createRouteRule(outbound: ProxyRuleOutbound): config.ProxyRule {
+  const type: ProxyRuleType = outbound === 'selected' ? 'domain_suffix' : 'ip_cidr'
+  return {
+    id: newRouteRuleID(),
+    name: routeRuleName(outbound),
+    type,
+    value: '',
+    outbound,
+    enabled: true,
+  }
+}
+
+function normalizeRuleType(value?: string): ProxyRuleType {
+  if (value === 'domain' || value === 'domain_suffix' || value === 'domain_keyword' || value === 'ip_cidr' || value === 'rule_set') {
+    return value
+  }
+  return 'domain_suffix'
+}
+
+function normalizeRuleOutbound(value?: string): ProxyRuleOutbound {
+  if (value === 'selected' || value === 'direct' || value === 'block') {
+    return value
+  }
+  return 'direct'
+}
+
+function routeRulePlaceholder(type?: string) {
+  switch (normalizeRuleType(type)) {
+    case 'domain':
+      return 'example.com'
+    case 'domain_keyword':
+      return 'example'
+    case 'ip_cidr':
+      return '192.168.0.0/16'
+    case 'rule_set':
+      return 'geosite-geolocation-cn'
+    default:
+      return 'example.com'
+  }
+}
+
+function routeRuleName(outbound: ProxyRuleOutbound) {
+  if (outbound === 'selected') {
+    return '代理规则'
+  }
+  if (outbound === 'block') {
+    return '阻断规则'
+  }
+  return '白名单'
+}
+
+function newRouteRuleID() {
+  return `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
 function sshRowLabel(row: SSHRow) {
   return formatSSHConnectionLabel(row.name, hostFromAddr(row.source?.addr || ''))
 }
@@ -1442,7 +2144,40 @@ function hostFromAddr(addr: string) {
   return value
 }
 
-function SSHTerminalPane({ sessionID, title }: { sessionID: string; title: string }) {
+type SSHSessionTarget = Pick<store.SSHConnection, 'addr' | 'user' | 'password'>
+
+function createSSHSession(target: SSHSessionTarget) {
+  return CreateSSHSession({
+    addr: target.addr,
+    user: target.user,
+    identity_file: '',
+    passphrase: '',
+    password: target.password,
+    rows: 24,
+    cols: 80,
+  })
+}
+
+function terminalTabFromConnection(conn: store.SSHConnection, sessionID: string): TerminalTab {
+  const host = hostFromAddr(conn.addr)
+  return {
+    id: newTerminalTabID(conn.id || sessionID),
+    sessionID,
+    connectionID: conn.id,
+    title: conn.name || `${conn.user}@${host}`,
+    host,
+    addr: conn.addr,
+    user: conn.user,
+    password: conn.password,
+    connected: true,
+  }
+}
+
+function newTerminalTabID(seed: string) {
+  return `${seed || 'ssh'}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function SSHTerminalPane({ active = true, sessionID }: { active?: boolean; sessionID: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const fitAddonRef = useRef<FitAddon | null>(null)
@@ -1454,8 +2189,13 @@ function SSHTerminalPane({ sessionID, title }: { sessionID: string; title: strin
     const container = containerRef.current
     const term = new Terminal({
       cursorBlink: true,
+      cursorStyle: 'block',
       fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
       fontSize: 13,
+      ignoreBracketedPasteMode: false,
+      macOptionIsMeta: true,
+      rightClickSelectsWord: true,
+      scrollOnUserInput: true,
       scrollback: 5000,
       theme: {
         background: '#050505',
@@ -1467,9 +2207,10 @@ function SSHTerminalPane({ sessionID, title }: { sessionID: string; title: strin
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
+    fit.fit()
     terminalRef.current = term
     fitAddonRef.current = fit
-    term.writeln(`SafeLink SSH Terminal - ${title}`)
+    ResizeSSHSession(sessionID, term.rows, term.cols).catch(() => undefined)
 
     const writeClipboard = async (text: string) => {
       if (!text) {
@@ -1504,7 +2245,7 @@ function SSHTerminalPane({ sessionID, title }: { sessionID: string; title: strin
     }
     const pasteText = (text: string) => {
       if (text) {
-        SendSSHInput(sessionID, text).catch((err) => term.writeln(`\r\n[错误] ${errorMessage(err)}`))
+        term.paste(text)
       }
     }
     const pasteClipboard = () => {
@@ -1520,16 +2261,20 @@ function SSHTerminalPane({ sessionID, title }: { sessionID: string; title: strin
       }
       const key = event.key.toLowerCase()
       const copyShortcut = (event.ctrlKey || event.metaKey) && key === 'c'
-      const pasteShortcut = (event.ctrlKey || event.metaKey) && key === 'v'
+      const pasteShortcut = ((event.ctrlKey || event.metaKey) && event.shiftKey && key === 'v')
+      const pasteInsertShortcut = event.shiftKey && key === 'insert'
       if (copyShortcut && term.hasSelection()) {
         event.preventDefault()
         copySelection()
         return false
       }
-      if (pasteShortcut) {
+      if (pasteShortcut || pasteInsertShortcut) {
         event.preventDefault()
         pasteClipboard()
         return false
+      }
+      if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+        event.preventDefault()
       }
       return true
     })
@@ -1572,12 +2317,22 @@ function SSHTerminalPane({ sessionID, title }: { sessionID: string; title: strin
         term.writeln(`\r\n[连接已关闭${event.message ? `：${event.message}` : ''}]`)
       }
     })
+    let resizeFrame = 0
     const resize = () => {
+      if (!container.isConnected || container.clientWidth <= 0 || container.clientHeight <= 0) {
+        return
+      }
       fit.fit()
       ResizeSSHSession(sessionID, term.rows, term.cols).catch(() => undefined)
     }
-    window.addEventListener('resize', resize)
-    window.setTimeout(resize, 0)
+    const scheduleResize = () => {
+      window.cancelAnimationFrame(resizeFrame)
+      resizeFrame = window.requestAnimationFrame(resize)
+    }
+    const resizeObserver = new ResizeObserver(scheduleResize)
+    resizeObserver.observe(container)
+    window.addEventListener('resize', scheduleResize)
+    window.setTimeout(scheduleResize, 0)
 
     return () => {
       dataDisposable.dispose()
@@ -1586,12 +2341,29 @@ function SSHTerminalPane({ sessionID, title }: { sessionID: string; title: strin
       container.removeEventListener('contextmenu', handleContextMenu)
       offOutput()
       offClosed()
-      window.removeEventListener('resize', resize)
+      resizeObserver.disconnect()
+      window.cancelAnimationFrame(resizeFrame)
+      window.removeEventListener('resize', scheduleResize)
       term.dispose()
       terminalRef.current = null
       fitAddonRef.current = null
     }
-  }, [sessionID, title])
+  }, [sessionID])
+
+  useEffect(() => {
+    if (!active || !terminalRef.current || !fitAddonRef.current) {
+      return
+    }
+    window.setTimeout(() => {
+      fitAddonRef.current?.fit()
+      const term = terminalRef.current
+      if (!term) {
+        return
+      }
+      ResizeSSHSession(sessionID, term.rows, term.cols).catch(() => undefined)
+      term.focus()
+    }, 0)
+  }, [active, sessionID])
 
   return <div className="terminal-xterm" ref={containerRef} tabIndex={0} onPointerDown={() => terminalRef.current?.focus()} />
 }
@@ -1656,7 +2428,7 @@ function formatLatency(node?: DashboardNode) {
     return '-'
   }
   if (node.latencyState === 'failed') {
-    return '不可用'
+    return '未测得'
   }
   if (node.latencyState === 'testing') {
     return '测试中'
@@ -1685,7 +2457,7 @@ function nodeStatusText(node: DashboardNode) {
     return '可用'
   }
   if (node.latencyState === 'failed') {
-    return '失败'
+    return '测速失败'
   }
   if (node.latencyState === 'testing') {
     return '测试中'
@@ -1731,6 +2503,54 @@ function formatClockDuration(startedAt: string) {
   return [hours, minutes, rest].map((part) => String(part).padStart(2, '0')).join(':')
 }
 
+function browserMachineInfo(): MachineInfo {
+  if (typeof navigator === 'undefined') {
+    return {}
+  }
+  return {
+    hostname: '浏览器预览',
+    os: inferBrowserOS(navigator.userAgent),
+    arch: navigator.platform || '-',
+    cpu_cores: navigator.hardwareConcurrency || 0,
+    ips: [],
+  }
+}
+
+function inferBrowserOS(userAgent: string) {
+  const text = userAgent.toLowerCase()
+  if (text.includes('windows')) {
+    return 'windows'
+  }
+  if (text.includes('mac os') || text.includes('macintosh')) {
+    return 'darwin'
+  }
+  if (text.includes('linux')) {
+    return 'linux'
+  }
+  return ''
+}
+
+function formatMachineOS(value?: string) {
+  const normalized = (value || '').toLowerCase()
+  if (normalized === 'windows') {
+    return 'Windows'
+  }
+  if (normalized === 'darwin') {
+    return 'macOS'
+  }
+  if (normalized === 'linux') {
+    return 'Linux'
+  }
+  return value || '-'
+}
+
+function formatMachineIPs(values?: string[]) {
+  if (!values || values.length === 0) {
+    return '-'
+  }
+  return values.join('、')
+}
+
 function formatDateTime(value: string) {
   const date = new Date(value)
   if (!Number.isFinite(date.getTime())) {
@@ -1744,18 +2564,81 @@ function formatOptionalDate(value?: string) {
   return value ? formatDateTime(value) : '-'
 }
 
+function filterLogs(entries: main.LogEntry[], level: LogLevelFilter, range: LogRangeFilter, search: string) {
+  const startedAt = logRangeStart(range)
+  const query = search.trim().toLowerCase()
+
+  return entries.filter((item) => {
+    if (level !== 'all' && normalizeLogLevel(item.level) !== level) {
+      return false
+    }
+    if (startedAt !== null) {
+      const time = new Date(item.time).getTime()
+      if (!Number.isFinite(time) || time < startedAt) {
+        return false
+      }
+    }
+    if (query) {
+      const haystack = [formatOptionalDate(item.time), logLevelLabel(item.level), item.module, item.message].join(' ').toLowerCase()
+      if (!haystack.includes(query)) {
+        return false
+      }
+    }
+    return true
+  })
+}
+
+function logRangeStart(range: LogRangeFilter) {
+  const now = Date.now()
+  if (range === '1h') {
+    return now - 60 * 60 * 1000
+  }
+  if (range === '24h') {
+    return now - 24 * 60 * 60 * 1000
+  }
+  if (range === '7d') {
+    return now - 7 * 24 * 60 * 60 * 1000
+  }
+  return null
+}
+
+function toLogCsv(entries: main.LogEntry[]) {
+  const rows = [
+    ['时间', '级别', '模块', '内容'],
+    ...entries.map((item) => [formatOptionalDate(item.time), logLevelLabel(item.level), item.module || '', item.message || '']),
+  ]
+  return `${rows.map((row) => row.map(csvCell).join(',')).join('\r\n')}\r\n`
+}
+
+function csvCell(value: string) {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
+}
+
+function formatFileTimestamp(date: Date) {
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+}
+
+function normalizeLogLevel(level: string): Exclude<LogLevelFilter, 'all'> {
+  const lower = level.toLowerCase()
+  if (lower === 'error') {
+    return 'error'
+  }
+  if (lower === 'warn' || lower === 'warning') {
+    return 'warn'
+  }
+  return 'info'
+}
+
 function logLevelLabel(level: string) {
-  if (level === 'error') {
+  const normalized = normalizeLogLevel(level)
+  if (normalized === 'error') {
     return '错误'
   }
-  if (level === 'warn') {
+  if (normalized === 'warn') {
     return '警告'
   }
   return '信息'
-}
-
-function portFromAddr(addr: string) {
-  return addr.split(':').pop() || '-'
 }
 
 function isBackendReady() {
@@ -1764,6 +2647,10 @@ function isBackendReady() {
 
 function errorMessage(err: unknown) {
   return err instanceof Error ? err.message : String(err)
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
 export default App

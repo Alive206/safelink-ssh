@@ -6,8 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,20 +24,29 @@ import (
 	"github.com/example/safelink/client/internal/tunnel"
 	"github.com/example/safelink/pkg/config"
 	"github.com/example/safelink/pkg/proxysubscription"
+	"github.com/getlantern/systray"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App struct holds the application state exposed to the Wails frontend.
 type App struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	manager *manager.Manager
-	store   *store.Store
-	sshTerm *sshsession.Manager
-	proxy   *proxycore.Runner
-	log     *slog.Logger
-	logMu   sync.Mutex
-	logs    []LogEntry
+	ctx            context.Context
+	cancel         context.CancelFunc
+	manager        *manager.Manager
+	store          *store.Store
+	sshTerm        *sshsession.Manager
+	proxy          *proxycore.Runner
+	launch         LaunchOptions
+	log            *slog.Logger
+	proxyCleanupMu sync.Mutex
+	shutdownOnce   sync.Once
+	logMu          sync.Mutex
+	logs           []LogEntry
+}
+
+// LaunchOptions captures one-shot UI startup actions requested by a new window.
+type LaunchOptions struct {
+	SSHConnectionID string `json:"ssh_connection_id"`
 }
 
 // LogEntry is a lightweight UI-visible event log.
@@ -44,11 +57,73 @@ type LogEntry struct {
 	Message string `json:"message"`
 }
 
+// MachineInfo contains basic local machine facts shown in Settings.
+type MachineInfo struct {
+	Hostname string   `json:"hostname"`
+	Username string   `json:"username"`
+	OS       string   `json:"os"`
+	Arch     string   `json:"arch"`
+	CPUCores int      `json:"cpu_cores"`
+	IPs      []string `json:"ips"`
+}
+
 // NewApp creates a new App application struct.
 func NewApp() *App {
 	return &App{
-		log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		launch: parseLaunchOptions(os.Args[1:]),
+		log:    slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
 	}
+}
+
+func (a *App) registerTray() {
+	systray.Register(func() {
+		systray.SetIcon(trayIcon)
+		systray.SetTitle("SafeLink")
+		systray.SetTooltip("SafeLink")
+
+		openItem := systray.AddMenuItem("打开", "显示 SafeLink 主窗口")
+		closeProxyItem := systray.AddMenuItem("关闭代理", "断开当前代理并关闭系统代理")
+		systray.AddSeparator()
+		quitItem := systray.AddMenuItem("退出 SafeLink", "退出 SafeLink")
+
+		go a.handleTrayMenu(openItem, closeProxyItem, quitItem)
+	}, nil)
+}
+
+func (a *App) handleTrayMenu(openItem, closeProxyItem, quitItem *systray.MenuItem) {
+	for {
+		select {
+		case <-openItem.ClickedCh:
+			a.showMainWindow()
+		case <-closeProxyItem.ClickedCh:
+			if a.proxy == nil || a.store == nil {
+				continue
+			}
+			if err := a.StopProxy(); err != nil {
+				a.recordLog("error", "托盘", "关闭代理", err)
+			}
+		case <-quitItem.ClickedCh:
+			a.quitFromTray()
+			return
+		}
+	}
+}
+
+func (a *App) showMainWindow() {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.WindowShow(a.ctx)
+	wailsruntime.WindowUnminimise(a.ctx)
+}
+
+func (a *App) quitFromTray() {
+	a.closeProxyForExit()
+	if a.ctx == nil {
+		systray.Quit()
+		return
+	}
+	wailsruntime.Quit(a.ctx)
 }
 
 // startup is called when the app starts. The context is saved so we can call
@@ -65,9 +140,10 @@ func (a *App) startup(ctx context.Context) {
 	a.store = store.New(dataDir)
 	settings, _ := a.store.LoadSettings()
 	a.proxy = proxycore.New(proxycore.Options{
-		CorePath: proxycore.FindCorePath(filepath.Dir(os.Args[0])),
-		WorkDir:  filepath.Join(dataDir, "proxy"),
-		Mode:     settings.ProxyMode,
+		CorePath:      proxycore.FindCorePath(filepath.Dir(os.Args[0])),
+		WorkDir:       filepath.Join(dataDir, "proxy"),
+		Mode:          settings.ProxyMode,
+		RuleModeRules: settings.RuleModeRules,
 	})
 	tunnels, _ := a.store.LoadTunnels()
 	defaults := config.ConnDefaults{
@@ -94,27 +170,61 @@ func (a *App) startup(ctx context.Context) {
 
 // shutdown is called when the app is closing.
 func (a *App) shutdown(_ context.Context) {
-	if a.manager != nil {
-		if ok := a.manager.StopAllTimeout(5 * time.Second); !ok {
-			a.log.Warn("timed out waiting for tunnels to stop during shutdown")
+	a.shutdownOnce.Do(func() {
+		a.closeProxyForExit()
+		if a.manager != nil {
+			if ok := a.manager.StopAllTimeout(5 * time.Second); !ok {
+				a.log.Warn("timed out waiting for tunnels to stop during shutdown")
+			}
+		}
+		if a.sshTerm != nil {
+			a.sshTerm.CloseAll()
+		}
+		systray.Quit()
+		if a.cancel != nil {
+			a.cancel()
+		}
+	})
+}
+
+func (a *App) closeProxyForExit() {
+	if a == nil {
+		return
+	}
+	a.proxyCleanupMu.Lock()
+	defer a.proxyCleanupMu.Unlock()
+
+	var settings store.ClientSettings
+	settingsLoaded := false
+	if a.store != nil {
+		var err error
+		settings, err = a.store.LoadSettings()
+		if err != nil {
+			a.log.Warn("load settings before proxy cleanup", "err", err)
+		} else {
+			settingsLoaded = true
 		}
 	}
-	if a.sshTerm != nil {
-		a.sshTerm.CloseAll()
+
+	disableSystemProxy := settingsLoaded && settings.SystemProxy
+	if !settingsLoaded && a.proxy != nil && a.proxy.Status().State == proxycore.StateRunning {
+		disableSystemProxy = true
 	}
-	if a.store != nil {
-		if settings, err := a.store.LoadSettings(); err == nil && settings.SystemProxy {
-			if err := sysproxy.SetSystemProxy(false, "", ""); err == nil {
-				settings.SystemProxy = false
-				_ = a.store.SaveSettings(settings)
+	if disableSystemProxy {
+		if err := sysproxy.SetSystemProxy(false, "", ""); err != nil {
+			a.log.Warn("disable system proxy during proxy cleanup", "err", err)
+		} else if settingsLoaded && settings.SystemProxy {
+			settings.SystemProxy = false
+			if err := a.store.SaveSettings(settings); err != nil {
+				a.log.Warn("save settings after proxy cleanup", "err", err)
 			}
 		}
 	}
+
 	if a.proxy != nil {
-		_ = a.proxy.Stop()
-	}
-	if a.cancel != nil {
-		a.cancel()
+		if err := a.proxy.Stop(); err != nil {
+			a.log.Warn("stop proxy core during proxy cleanup", "err", err)
+		}
 	}
 }
 
@@ -197,6 +307,45 @@ func (a *App) ResizeSSHSession(sessionID string, rows, cols int) error {
 // CloseSSHSession closes an interactive SSH session.
 func (a *App) CloseSSHSession(sessionID string) error {
 	return a.sshTerm.Close(sessionID)
+}
+
+// GetLaunchOptions returns startup options passed to this app window.
+func (a *App) GetLaunchOptions() LaunchOptions {
+	return a.launch
+}
+
+// OpenSSHConnectionWindow launches a new app window focused on one SSH connection.
+func (a *App) OpenSSHConnectionWindow(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("ssh connection id is required")
+	}
+	conns, err := a.store.LoadSSHConnections()
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, conn := range conns {
+		if conn.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("ssh connection %q not found", id)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, "--ssh-connection-id="+id)
+	cmd.Dir = filepath.Dir(exe)
+	if err := cmd.Start(); err != nil {
+		a.recordLog("error", "SSH 终端", fmt.Sprintf("新建窗口：%s", id), err)
+		return err
+	}
+	a.recordLog("info", "SSH 终端", fmt.Sprintf("新建窗口：%s", id), nil)
+	return nil
 }
 
 // ListSSHConnections returns saved SSH terminal connection profiles.
@@ -300,7 +449,14 @@ func (a *App) ListProxyNodes() ([]proxysubscription.ProxyNode, error) {
 
 // GetClientSettings returns locally persisted proxy and startup settings.
 func (a *App) GetClientSettings() (store.ClientSettings, error) {
-	return a.store.LoadSettings()
+	settings, err := a.store.LoadSettings()
+	if err != nil {
+		return store.ClientSettings{}, err
+	}
+	if a.proxy != nil {
+		settings = a.reconcileSystemProxySetting(settings, a.proxy.Status())
+	}
+	return settings, nil
 }
 
 // SetProxyMode changes the sing-box routing mode and restarts the running node if needed.
@@ -315,6 +471,7 @@ func (a *App) SetProxyMode(mode string) error {
 		return err
 	}
 	a.proxy.SetMode(mode)
+	a.proxy.SetRuleModeRules(settings.RuleModeRules)
 
 	status := a.proxy.Status()
 	if status.State == proxycore.StateRunning && status.NodeName != "" {
@@ -324,6 +481,33 @@ func (a *App) SetProxyMode(mode string) error {
 		}
 	}
 	a.recordLog("info", "代理模式", fmt.Sprintf("切换模式：%s", proxyModeLabel(mode)), nil)
+	return nil
+}
+
+// SetProxyRules replaces editable route rules used by rule-mode proxy routing.
+func (a *App) SetProxyRules(rules []config.ProxyRule) error {
+	rules = config.NormalizeProxyRules(rules)
+	if err := config.ValidateProxyRules(rules); err != nil {
+		return err
+	}
+	settings, err := a.store.LoadSettings()
+	if err != nil {
+		return err
+	}
+	settings.RuleModeRules = rules
+	if err := a.store.SaveSettings(settings); err != nil {
+		return err
+	}
+	a.proxy.SetRuleModeRules(rules)
+
+	status := a.proxy.Status()
+	if status.State == proxycore.StateRunning && status.NodeName != "" && proxycore.NormalizeMode(settings.ProxyMode) == proxycore.ProxyModeRule {
+		if err := a.restartProxyNode(status.NodeName, settings); err != nil {
+			a.recordLog("error", "路由规则", "保存路由规则", err)
+			return err
+		}
+	}
+	a.recordLog("info", "路由规则", fmt.Sprintf("保存路由规则：%d 条", len(rules)), nil)
 	return nil
 }
 
@@ -386,6 +570,7 @@ func (a *App) StartProxyNode(nodeName string) error {
 		return err
 	}
 	a.proxy.SetMode(settings.ProxyMode)
+	a.proxy.SetRuleModeRules(settings.RuleModeRules)
 	for _, node := range nodes {
 		if node.Name == nodeName {
 			if status := a.proxy.Status(); status.State == proxycore.StateRunning {
@@ -454,7 +639,13 @@ func (a *App) StopProxy() error {
 
 // ProxyStatus returns the current sing-box runner status.
 func (a *App) ProxyStatus() proxycore.Status {
-	return a.proxy.Status()
+	status := a.proxy.Status()
+	if a.store != nil {
+		if settings, err := a.store.LoadSettings(); err == nil {
+			a.reconcileSystemProxySetting(settings, status)
+		}
+	}
+	return status
 }
 
 func (a *App) restartProxyNode(nodeName string, settings store.ClientSettings) error {
@@ -476,6 +667,7 @@ func (a *App) restartProxyNode(nodeName string, settings store.ClientSettings) e
 		return err
 	}
 	a.proxy.SetMode(settings.ProxyMode)
+	a.proxy.SetRuleModeRules(settings.RuleModeRules)
 	if err := a.proxy.Start(a.ctx, *selected); err != nil {
 		return err
 	}
@@ -499,11 +691,30 @@ func (a *App) enableSystemProxy(settings *store.ClientSettings) error {
 	if !settings.SystemProxy {
 		settings.SystemProxy = true
 		if err := a.store.SaveSettings(*settings); err != nil {
+			_ = sysproxy.SetSystemProxy(false, "", "")
+			settings.SystemProxy = false
 			return err
 		}
 	}
 	a.recordLog("info", "系统代理", "开启系统代理", nil)
 	return nil
+}
+
+func (a *App) reconcileSystemProxySetting(settings store.ClientSettings, status proxycore.Status) store.ClientSettings {
+	if !settings.SystemProxy || status.State == proxycore.StateRunning {
+		return settings
+	}
+	if err := sysproxy.SetSystemProxy(false, "", ""); err != nil {
+		a.recordLog("error", "系统代理", "代理核心未运行，关闭系统代理", err)
+		return settings
+	}
+	settings.SystemProxy = false
+	if err := a.store.SaveSettings(settings); err != nil {
+		a.recordLog("error", "系统代理", "同步系统代理状态", err)
+		return settings
+	}
+	a.recordLog("warn", "系统代理", "代理核心未运行，已关闭系统代理", nil)
+	return settings
 }
 
 func proxyModeLabel(mode string) string {
@@ -559,6 +770,7 @@ func (a *App) RequestAdminRestart() error {
 
 	go func() {
 		time.Sleep(300 * time.Millisecond)
+		a.closeProxyForExit()
 		if a.manager != nil {
 			if ok := a.manager.StopAllTimeout(2 * time.Second); !ok {
 				a.log.Warn("timed out waiting for tunnels to stop before admin restart")
@@ -586,6 +798,25 @@ func defaultDataDir() string {
 	return filepath.Join(appData, "SafeLink")
 }
 
+func parseLaunchOptions(args []string) LaunchOptions {
+	var opts LaunchOptions
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+		if strings.HasPrefix(arg, "--ssh-connection-id=") {
+			opts.SSHConnectionID = strings.TrimSpace(strings.TrimPrefix(arg, "--ssh-connection-id="))
+			continue
+		}
+		if arg == "--ssh-connection-id" && i+1 < len(args) {
+			i++
+			opts.SSHConnectionID = strings.TrimSpace(args[i])
+		}
+	}
+	return opts
+}
+
 // GetVersion returns the application version.
 func (a *App) GetVersion() string {
 	return "1.0.0"
@@ -594,6 +825,19 @@ func (a *App) GetVersion() string {
 // GetDataDir returns the data directory path.
 func (a *App) GetDataDir() string {
 	return defaultDataDir()
+}
+
+// GetMachineInfo returns basic local machine information for the settings page.
+func (a *App) GetMachineInfo() MachineInfo {
+	hostname, _ := os.Hostname()
+	return MachineInfo{
+		Hostname: hostname,
+		Username: currentUsername(),
+		OS:       runtime.GOOS,
+		Arch:     runtime.GOARCH,
+		CPUCores: runtime.NumCPU(),
+		IPs:      localIPAddresses(),
+	}
 }
 
 // GetLogs returns recent UI-visible event logs.
@@ -620,6 +864,54 @@ func (a *App) BulkImportTunnels(tunnels []config.TunnelCfg, prefix string) (int,
 // Greet is a simple test binding.
 func (a *App) Greet(name string) string {
 	return fmt.Sprintf("Hello %s, SafeLink is running!", name)
+}
+
+func currentUsername() string {
+	user := strings.TrimSpace(os.Getenv("USERNAME"))
+	if user == "" {
+		user = strings.TrimSpace(os.Getenv("USER"))
+	}
+	if domain := strings.TrimSpace(os.Getenv("USERDOMAIN")); domain != "" && user != "" {
+		return domain + `\` + user
+	}
+	return user
+}
+
+func localIPAddresses() []string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	ips := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch value := addr.(type) {
+			case *net.IPNet:
+				ip = value.IP
+			case *net.IPAddr:
+				ip = value.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				continue
+			}
+			text := ip.String()
+			if _, ok := seen[text]; ok {
+				continue
+			}
+			seen[text] = struct{}{}
+			ips = append(ips, text)
+		}
+	}
+	return ips
 }
 
 func (a *App) recordLog(level, module, message string, err error) {

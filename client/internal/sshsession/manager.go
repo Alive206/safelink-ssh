@@ -262,11 +262,13 @@ func OpenSSH(ctx context.Context, cfg Config) (PTY, io.Reader, error) {
 		_ = sshClient.Close()
 		return nil, nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	if err := sess.RequestPty("xterm-256color", rows, cols, ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}); err != nil {
+	stderr, err := sess.StderrPipe()
+	if err != nil {
+		_ = sess.Close()
+		_ = sshClient.Close()
+		return nil, nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+	if err := sess.RequestPty("xterm", rows, cols, defaultTerminalModes()); err != nil {
 		_ = sess.Close()
 		_ = sshClient.Close()
 		return nil, nil, fmt.Errorf("request pty: %w", err)
@@ -276,7 +278,65 @@ func OpenSSH(ctx context.Context, cfg Config) (PTY, io.Reader, error) {
 		_ = sshClient.Close()
 		return nil, nil, fmt.Errorf("start shell: %w", err)
 	}
-	return &sshPTY{client: sshClient, session: sess, stdin: stdin}, stdout, nil
+	return &sshPTY{client: sshClient, session: sess, stdin: stdin}, mergeReaders(stdout, stderr), nil
+}
+
+func defaultTerminalModes() ssh.TerminalModes {
+	return ssh.TerminalModes{
+		ssh.VINTR:         3,   // Ctrl+C
+		ssh.VQUIT:         28,  // Ctrl+\
+		ssh.VERASE:        127, // Backspace/Delete
+		ssh.VKILL:         21,  // Ctrl+U
+		ssh.VEOF:          4,   // Ctrl+D
+		ssh.VSTART:        17,  // Ctrl+Q
+		ssh.VSTOP:         19,  // Ctrl+S
+		ssh.VSUSP:         26,  // Ctrl+Z
+		ssh.VREPRINT:      18,  // Ctrl+R
+		ssh.VWERASE:       23,  // Ctrl+W
+		ssh.VLNEXT:        22,  // Ctrl+V
+		ssh.VDISCARD:      15,  // Ctrl+O
+		ssh.ICRNL:         1,
+		ssh.IXON:          0,
+		ssh.IXANY:         0,
+		ssh.IXOFF:         0,
+		ssh.IMAXBEL:       1,
+		ssh.IUTF8:         1,
+		ssh.ISIG:          1,
+		ssh.ICANON:        1,
+		ssh.ECHO:          1,
+		ssh.ECHOE:         1,
+		ssh.ECHOK:         1,
+		ssh.ECHOCTL:       1,
+		ssh.ECHOKE:        1,
+		ssh.IEXTEN:        1,
+		ssh.OPOST:         1,
+		ssh.ONLCR:         1,
+		ssh.CS8:           1,
+		ssh.PARENB:        0,
+		ssh.PARODD:        0,
+		ssh.TTY_OP_ISPEED: 38400,
+		ssh.TTY_OP_OSPEED: 38400,
+	}
+}
+
+func mergeReaders(readers ...io.Reader) io.Reader {
+	pr, pw := io.Pipe()
+	var wg sync.WaitGroup
+	for _, reader := range readers {
+		if reader == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(r io.Reader) {
+			defer wg.Done()
+			_, _ = io.Copy(pw, r)
+		}(reader)
+	}
+	go func() {
+		wg.Wait()
+		_ = pw.Close()
+	}()
+	return pr
 }
 
 type sshPTY struct {

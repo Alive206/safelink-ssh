@@ -61,6 +61,37 @@ func TestStatusReportsProxyTraffic(t *testing.T) {
 	}
 }
 
+func TestStartReturnsErrorWhenCoreExitsBeforeReady(t *testing.T) {
+	runner := New(Options{
+		CorePath:  writeExitingCore(t),
+		WorkDir:   t.TempDir(),
+		HTTPAddr:  freeTestAddr(t),
+		SOCKSAddr: freeTestAddr(t),
+	})
+
+	err := runner.Start(t.Context(), proxysubscription.ProxyNode{
+		Name:     "ss-hk",
+		Protocol: proxysubscription.ProtocolShadowsocks,
+		Server:   "198.51.100.10",
+		Port:     8388,
+		Method:   "aes-128-gcm",
+		Password: "secret",
+	})
+	if err == nil {
+		t.Fatal("Start returned nil, want startup readiness error")
+	}
+	if !strings.Contains(err.Error(), "proxy listener exited before") {
+		t.Fatalf("Start error = %q, want proxy listener readiness error", err)
+	}
+	status := runner.Status()
+	if status.State != StateError {
+		t.Fatalf("Status.State = %q, want %q", status.State, StateError)
+	}
+	if status.LastError == "" {
+		t.Fatalf("Status.LastError should describe the startup failure: %+v", status)
+	}
+}
+
 func TestCoreDelayReturnsFirstHealthyProbe(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/proxies/selected/delay" {
@@ -131,6 +162,26 @@ func TestNodeDoesNotUseTCPConnectFallbackForProxyDelay(t *testing.T) {
 	}
 }
 
+func TestNodeFallsBackToHTTPProxyWhenCoreDelayFails(t *testing.T) {
+	result := TestNode(t.Context(), proxysubscription.ProxyNode{
+		Name:     "http-proxy-fallback",
+		Protocol: proxysubscription.ProtocolShadowsocks,
+		Server:   "198.51.100.10",
+		Port:     8388,
+		Method:   "aes-128-gcm",
+		Password: "secret",
+	}, Options{
+		CorePath: writeDelayFailingHTTPProxyCore(t),
+		WorkDir:  t.TempDir(),
+	}, 2*time.Second)
+	if !result.OK {
+		t.Fatalf("TestNode failed: %+v", result)
+	}
+	if result.LatencyMS <= 0 {
+		t.Fatalf("LatencyMS = %d, want > 0", result.LatencyMS)
+	}
+}
+
 func writeFailingDelayCore(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -192,6 +243,153 @@ func main() {
 		}),
 	}
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+}
+`
+	if err := os.WriteFile(source, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "build", "-o", bin, source)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build helper core: %v\n%s", err, out)
+	}
+	return bin
+}
+
+func writeExitingCore(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "main.go")
+	bin := filepath.Join(dir, "sing-box-exiting"+executableSuffix())
+	content := `package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "check" {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "startup failed")
+	os.Exit(2)
+}
+`
+	if err := os.WriteFile(source, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "build", "-o", bin, source)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build exiting core: %v\n%s", err, out)
+	}
+	return bin
+}
+
+func freeTestAddr(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	return listener.Addr().String()
+}
+
+func writeDelayFailingHTTPProxyCore(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "main.go")
+	bin := filepath.Join(dir, "sing-box-helper"+executableSuffix())
+	content := `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+)
+
+func main() {
+	configPath := ""
+	for i, arg := range os.Args {
+		if arg == "-c" && i+1 < len(os.Args) {
+			configPath = os.Args[i+1]
+			break
+		}
+	}
+	if configPath == "" {
+		fmt.Fprintln(os.Stderr, "missing -c")
+		os.Exit(2)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "check" {
+		return
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	var cfg struct {
+		Inbounds []struct {
+			Type       string ` + "`json:\"type\"`" + `
+			Listen     string ` + "`json:\"listen\"`" + `
+			ListenPort int    ` + "`json:\"listen_port\"`" + `
+		} ` + "`json:\"inbounds\"`" + `
+		Experimental struct {
+			ClashAPI struct {
+				ExternalController string ` + "`json:\"external_controller\"`" + `
+			} ` + "`json:\"clash_api\"`" + `
+		} ` + "`json:\"experimental\"`" + `
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	httpAddr := ""
+	for _, inbound := range cfg.Inbounds {
+		if inbound.Type == "http" {
+			httpAddr = net.JoinHostPort(inbound.Listen, strconv.Itoa(inbound.ListenPort))
+			break
+		}
+	}
+	if httpAddr == "" {
+		fmt.Fprintln(os.Stderr, "http inbound not found")
+		os.Exit(2)
+	}
+	go func() {
+		server := &http.Server{
+			Addr: httpAddr,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}),
+		}
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	}()
+	controllerAddr := cfg.Experimental.ClashAPI.ExternalController
+	if controllerAddr == "" {
+		fmt.Fprintln(os.Stderr, "clash api controller not found")
+		os.Exit(2)
+	}
+	controller := &http.Server{
+		Addr: controllerAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/proxies/selected/delay" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(` + "`{\"error\":\"probe failed\"}`" + `))
+		}),
+	}
+	if err := controller.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}

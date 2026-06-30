@@ -14,6 +14,10 @@ export function CheckDriver() {
   return window['go']['main']['App']['CheckDriver']();
 }
 
+export function ClearLogs() {
+  return window['go']['main']['App']['ClearLogs']();
+}
+
 export function CloseSSHSession(arg1) {
   return window['go']['main']['App']['CloseSSHSession'](arg1);
 }
@@ -34,20 +38,24 @@ export function DeleteTunnel(arg1) {
   return window['go']['main']['App']['DeleteTunnel'](arg1);
 }
 
-export function ClearLogs() {
-  return window['go']['main']['App']['ClearLogs']();
+export function GetClientSettings() {
+  return window['go']['main']['App']['GetClientSettings']();
 }
 
 export function GetDataDir() {
   return window['go']['main']['App']['GetDataDir']();
 }
 
-export function GetClientSettings() {
-  return window['go']['main']['App']['GetClientSettings']();
+export function GetLaunchOptions() {
+  return window['go']['main']['App']['GetLaunchOptions']();
 }
 
 export function GetLogs() {
   return window['go']['main']['App']['GetLogs']();
+}
+
+export function GetMachineInfo() {
+  return window['go']['main']['App']['GetMachineInfo']();
 }
 
 export function GetStats() {
@@ -94,12 +102,12 @@ export function ListTunnels() {
   return window['go']['main']['App']['ListTunnels']();
 }
 
-export function ProxyStatus() {
-  return window['go']['main']['App']['ProxyStatus']();
+export function OpenSSHConnectionWindow(arg1) {
+  return window['go']['main']['App']['OpenSSHConnectionWindow'](arg1);
 }
 
-export function RequestAdminRestart() {
-  return window['go']['main']['App']['RequestAdminRestart']();
+export function ProxyStatus() {
+  return window['go']['main']['App']['ProxyStatus']();
 }
 
 export function RefreshAllSubscriptions() {
@@ -108,6 +116,10 @@ export function RefreshAllSubscriptions() {
 
 export function RefreshSubscription(arg1) {
   return window['go']['main']['App']['RefreshSubscription'](arg1);
+}
+
+export function RequestAdminRestart() {
+  return window['go']['main']['App']['RequestAdminRestart']();
 }
 
 export function ResizeSSHSession(arg1, arg2, arg3) {
@@ -132,6 +144,10 @@ export function SetAutoStartEnabled(arg1) {
 
 export function SetProxyMode(arg1) {
   return window['go']['main']['App']['SetProxyMode'](arg1);
+}
+
+export function SetProxyRules(arg1) {
+  return window['go']['main']['App']['SetProxyRules'](arg1);
 }
 
 export function SetSystemProxyEnabled(arg1) {

@@ -7,6 +7,9 @@
 *.dylib
 /server/safelink-server
 /client/build/bin/
+/client/rsrc_windows_*.syso
+/client/cmd/installer/payload/
+/dist/
 
 # Go test / coverage output.
 *.test

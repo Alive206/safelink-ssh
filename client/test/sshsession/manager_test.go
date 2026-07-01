@@ -52,6 +52,14 @@ func TestManagerStreamsOutputAndControlsSession(t *testing.T) {
 		t.Fatalf("written input = %q, want pwd\\r", got)
 	}
 
+	fake.stdin.Reset()
+	if err := mgr.WriteChunks(id, [][]byte{[]byte{0x1b, '['}, []byte("A")}); err != nil {
+		t.Fatalf("WriteChunks returned error: %v", err)
+	}
+	if got := fake.stdin.String(); got != "\x1b[A" {
+		t.Fatalf("written chunks = %q, want escape up sequence", got)
+	}
+
 	if err := mgr.Resize(id, 40, 120); err != nil {
 		t.Fatalf("Resize returned error: %v", err)
 	}

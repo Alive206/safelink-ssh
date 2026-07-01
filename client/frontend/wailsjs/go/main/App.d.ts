@@ -71,11 +71,15 @@ export function RequestAdminRestart():Promise<void>;
 
 export function ResizeSSHSession(arg1:string,arg2:number,arg3:number):Promise<void>;
 
+export function RecordSSHDebug(arg1:string,arg2:string,arg3:string):Promise<void>;
+
 export function RestartTunnel(arg1:string):Promise<void>;
 
 export function SaveSSHConnection(arg1:store.SSHConnection):Promise<store.SSHConnection>;
 
 export function SendSSHInput(arg1:string,arg2:string):Promise<void>;
+
+export function SendSSHInputBase64Batch(arg1:string,arg2:Array<string>):Promise<void>;
 
 export function SetAutoStartEnabled(arg1:boolean):Promise<void>;
 
@@ -94,6 +98,8 @@ export function StopProxy():Promise<void>;
 export function StopTunnel(arg1:string):Promise<void>;
 
 export function TestProxyNode(arg1:string):Promise<proxycore.TestResult>;
+
+export function TestProxyNodes(arg1:Array<string>,arg2:string):Promise<Array<proxycore.TestResult>>;
 
 export function ToggleRoute(arg1:string,arg2:boolean):Promise<void>;
 

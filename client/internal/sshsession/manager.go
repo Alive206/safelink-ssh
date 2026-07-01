@@ -4,6 +4,7 @@ package sshsession
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -28,8 +29,9 @@ type Config struct {
 }
 
 type OutputEvent struct {
-	SessionID string `json:"session_id"`
-	Data      string `json:"data"`
+	SessionID  string `json:"session_id"`
+	Data       string `json:"data"`
+	DataBase64 string `json:"data_base64,omitempty"`
 }
 
 type ClosedEvent struct {
@@ -67,7 +69,8 @@ type Manager struct {
 }
 
 type sessionRef struct {
-	pty PTY
+	pty     PTY
+	writeMu sync.Mutex
 }
 
 func NewManager(opts Options) *Manager {
@@ -107,12 +110,32 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (string, error) {
 }
 
 func (m *Manager) Write(id, data string) error {
+	return m.WriteBytes(id, []byte(data))
+}
+
+func (m *Manager) WriteBytes(id string, data []byte) error {
 	ref, err := m.get(id)
 	if err != nil {
 		return err
 	}
-	_, err = io.WriteString(ref.pty, data)
-	return err
+	ref.writeMu.Lock()
+	defer ref.writeMu.Unlock()
+	return writeAll(ref.pty, data)
+}
+
+func (m *Manager) WriteChunks(id string, chunks [][]byte) error {
+	ref, err := m.get(id)
+	if err != nil {
+		return err
+	}
+	ref.writeMu.Lock()
+	defer ref.writeMu.Unlock()
+	for _, chunk := range chunks {
+		if err := writeAll(ref.pty, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *Manager) Resize(id string, rows, cols int) error {
@@ -171,7 +194,12 @@ func (m *Manager) copyOutput(id string, output io.Reader) {
 	for {
 		n, err := output.Read(buf)
 		if n > 0 && m.onOutput != nil {
-			m.onOutput(OutputEvent{SessionID: id, Data: string(buf[:n])})
+			data := buf[:n]
+			m.onOutput(OutputEvent{
+				SessionID:  id,
+				Data:       string(data),
+				DataBase64: base64.StdEncoding.EncodeToString(data),
+			})
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) && m.onError != nil {
@@ -337,6 +365,20 @@ func mergeReaders(readers ...io.Reader) io.Reader {
 		_ = pw.Close()
 	}()
 	return pr
+}
+
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 type sshPTY struct {

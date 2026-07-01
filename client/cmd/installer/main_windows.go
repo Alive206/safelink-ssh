@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 	"unicode/utf16"
 	"unsafe"
 
@@ -28,7 +27,7 @@ const (
 	installStamp = ".safelink-install"
 )
 
-var appVersion = "1.0.0"
+var appVersion = "2.0.0"
 
 //go:embed payload/SafeLink.exe payload/sing-box.exe payload/wintun.dll
 var payload embed.FS
@@ -41,7 +40,6 @@ type bundledFile struct {
 type installOptions struct {
 	InstallDir            string
 	CreateDesktopShortcut bool
-	ResetUserData         bool
 	Quiet                 bool
 }
 
@@ -87,14 +85,6 @@ func install(args []string) error {
 	if err := os.MkdirAll(opts.InstallDir, 0o755); err != nil {
 		return fmt.Errorf("create install directory: %w", err)
 	}
-	backupDir := ""
-	if opts.ResetUserData {
-		var err error
-		backupDir, err = backupAndClearUserData()
-		if err != nil {
-			return err
-		}
-	}
 	for _, file := range bundledFiles {
 		if err := writeBundledFile(file, opts.InstallDir); err != nil {
 			return err
@@ -121,11 +111,7 @@ func install(args []string) error {
 	}
 
 	if !opts.Quiet {
-		message := "SafeLink 已安装完成。"
-		if backupDir != "" {
-			message += "\n\n旧用户数据已备份到：\n" + backupDir
-		}
-		messageBox("SafeLink 安装完成", message, 0x40)
+		messageBox("SafeLink 安装完成", "SafeLink 已安装完成。", 0x40)
 	}
 	return nil
 }
@@ -361,42 +347,6 @@ func defaultInstallDir() string {
 	return filepath.Join(base, "Programs", appName)
 }
 
-func userDataDir() string {
-	appData := os.Getenv("APPDATA")
-	if appData == "" {
-		home, _ := os.UserHomeDir()
-		appData = filepath.Join(home, "AppData", "Roaming")
-	}
-	return filepath.Join(appData, appName)
-}
-
-func backupAndClearUserData() (string, error) {
-	dataDir := userDataDir()
-	if _, err := os.Stat(dataDir); errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	} else if err != nil {
-		return "", fmt.Errorf("inspect existing user data: %w", err)
-	}
-
-	backupRoot := filepath.Join(filepath.Dir(dataDir), appName+"-backups")
-	if err := os.MkdirAll(backupRoot, 0o755); err != nil {
-		return "", fmt.Errorf("create user data backup directory: %w", err)
-	}
-
-	stamp := time.Now().Format("20060102-150405")
-	backupDir := filepath.Join(backupRoot, appName+"-"+stamp)
-	for i := 1; ; i++ {
-		if _, err := os.Stat(backupDir); errors.Is(err, os.ErrNotExist) {
-			break
-		}
-		backupDir = filepath.Join(backupRoot, fmt.Sprintf("%s-%s-%d", appName, stamp, i))
-	}
-	if err := os.Rename(dataDir, backupDir); err != nil {
-		return "", fmt.Errorf("backup existing user data from %s: %w. 请先退出正在运行的 SafeLink 后重试", dataDir, err)
-	}
-	return backupDir, nil
-}
-
 func isSafeInstallDir(dir string) bool {
 	stamp, err := os.ReadFile(filepath.Join(dir, installStamp))
 	if err != nil {
@@ -410,7 +360,6 @@ func parseInstallOptions(args []string) installOptions {
 	opts := installOptions{
 		InstallDir:            defaultInstallDir(),
 		CreateDesktopShortcut: true,
-		ResetUserData:         !quiet,
 		Quiet:                 quiet,
 	}
 	if installDir := argValue(args, "/dir="); installDir != "" {
@@ -419,17 +368,8 @@ func parseInstallOptions(args []string) installOptions {
 	if hasArg(args, "/no-desktop-shortcut") || hasArg(args, "--no-desktop-shortcut") {
 		opts.CreateDesktopShortcut = false
 	}
-	if hasArg(args, "/reset-user-data") || hasArg(args, "--reset-user-data") {
-		opts.ResetUserData = true
-	}
-	if hasArg(args, "/keep-user-data") || hasArg(args, "--keep-user-data") {
-		opts.ResetUserData = false
-	}
 	if value := argValue(args, "/desktop-shortcut="); value != "" {
 		opts.CreateDesktopShortcut = parseBool(value, true)
-	}
-	if value := argValue(args, "/reset-user-data="); value != "" {
-		opts.ResetUserData = parseBool(value, opts.ResetUserData)
 	}
 	return opts
 }

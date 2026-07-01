@@ -126,6 +126,10 @@ export function ResizeSSHSession(arg1, arg2, arg3) {
   return window['go']['main']['App']['ResizeSSHSession'](arg1, arg2, arg3);
 }
 
+export function RecordSSHDebug(arg1, arg2, arg3) {
+  return window['go']['main']['App']['RecordSSHDebug'](arg1, arg2, arg3);
+}
+
 export function RestartTunnel(arg1) {
   return window['go']['main']['App']['RestartTunnel'](arg1);
 }
@@ -136,6 +140,10 @@ export function SaveSSHConnection(arg1) {
 
 export function SendSSHInput(arg1, arg2) {
   return window['go']['main']['App']['SendSSHInput'](arg1, arg2);
+}
+
+export function SendSSHInputBase64Batch(arg1, arg2) {
+  return window['go']['main']['App']['SendSSHInputBase64Batch'](arg1, arg2);
 }
 
 export function SetAutoStartEnabled(arg1) {
@@ -172,6 +180,10 @@ export function StopTunnel(arg1) {
 
 export function TestProxyNode(arg1) {
   return window['go']['main']['App']['TestProxyNode'](arg1);
+}
+
+export function TestProxyNodes(arg1, arg2) {
+  return window['go']['main']['App']['TestProxyNodes'](arg1, arg2);
 }
 
 export function ToggleRoute(arg1, arg2) {

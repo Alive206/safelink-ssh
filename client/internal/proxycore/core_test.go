@@ -1,6 +1,7 @@
 package proxycore
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -182,6 +183,71 @@ func TestNodeFallsBackToHTTPProxyWhenCoreDelayFails(t *testing.T) {
 	}
 }
 
+func TestNodesMeasureDelayThroughOneBatchCore(t *testing.T) {
+	nodes := []proxysubscription.ProxyNode{
+		{
+			Name:     "ss-hk",
+			Protocol: proxysubscription.ProtocolShadowsocks,
+			Server:   "198.51.100.10",
+			Port:     8388,
+			Method:   "aes-128-gcm",
+			Password: "secret",
+		},
+		{
+			Name:     "ss-sg",
+			Protocol: proxysubscription.ProtocolShadowsocks,
+			Server:   "198.51.100.11",
+			Port:     8389,
+			Method:   "aes-128-gcm",
+			Password: "secret",
+		},
+	}
+	var reported []string
+	results := TestNodes(t.Context(), nodes, Options{
+		CorePath: writeBatchDelayCore(t),
+		WorkDir:  t.TempDir(),
+	}, time.Second, func(result TestResult) {
+		reported = append(reported, result.NodeName)
+	})
+	if len(results) != len(nodes) {
+		t.Fatalf("len(results) = %d, want %d", len(results), len(nodes))
+	}
+	for i, result := range results {
+		if !result.OK {
+			t.Fatalf("result[%d] failed: %+v", i, result)
+		}
+		if result.LatencyMS <= 0 {
+			t.Fatalf("result[%d].LatencyMS = %d, want > 0", i, result.LatencyMS)
+		}
+	}
+	if len(reported) != len(nodes) {
+		t.Fatalf("reported %d results, want %d", len(reported), len(nodes))
+	}
+}
+
+func TestRunnerTestHonorsContextWhenTestSlotsAreBusy(t *testing.T) {
+	runner := New(Options{})
+	for i := 0; i < defaultNodeTestConcurrency; i++ {
+		runner.testSlots <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < defaultNodeTestConcurrency; i++ {
+			<-runner.testSlots
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	result := runner.Test(ctx, proxysubscription.ProxyNode{Name: "queued-node"}, time.Second)
+	if result.OK {
+		t.Fatalf("Test returned OK while all test slots were busy: %+v", result)
+	}
+	if !strings.Contains(result.Error, context.DeadlineExceeded.Error()) {
+		t.Fatalf("Error = %q, want context deadline exceeded", result.Error)
+	}
+}
+
 func writeFailingDelayCore(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -296,6 +362,97 @@ func freeTestAddr(t *testing.T) string {
 	}
 	defer listener.Close()
 	return listener.Addr().String()
+}
+
+func writeBatchDelayCore(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "main.go")
+	bin := filepath.Join(dir, "sing-box-batch"+executableSuffix())
+	content := `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+)
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "check" {
+		return
+	}
+	configPath := ""
+	for i, arg := range os.Args {
+		if arg == "-c" && i+1 < len(os.Args) {
+			configPath = os.Args[i+1]
+			break
+		}
+	}
+	if configPath == "" {
+		fmt.Fprintln(os.Stderr, "missing -c")
+		os.Exit(2)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	var cfg struct {
+		Outbounds []struct {
+			Tag string ` + "`json:\"tag\"`" + `
+		} ` + "`json:\"outbounds\"`" + `
+		Experimental struct {
+			ClashAPI struct {
+				ExternalController string ` + "`json:\"external_controller\"`" + `
+			} ` + "`json:\"clash_api\"`" + `
+		} ` + "`json:\"experimental\"`" + `
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	tags := map[string]bool{}
+	for _, outbound := range cfg.Outbounds {
+		tags[outbound.Tag] = true
+	}
+	controllerAddr := cfg.Experimental.ClashAPI.ExternalController
+	if controllerAddr == "" {
+		fmt.Fprintln(os.Stderr, "clash api controller not found")
+		os.Exit(2)
+	}
+	server := &http.Server{
+		Addr: controllerAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			if len(parts) != 3 || parts[0] != "proxies" || parts[2] != "delay" {
+				http.NotFound(w, r)
+				return
+			}
+			tag := parts[1]
+			if !tags[tag] {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, ` + "`{\"delay\":%d}`" + `, 20+len(tag))
+		}),
+	}
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+}
+`
+	if err := os.WriteFile(source, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "build", "-o", bin, source)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build batch core: %v\n%s", err, out)
+	}
+	return bin
 }
 
 func writeDelayFailingHTTPProxyCore(t *testing.T) string {

@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	colorWindow = 5
+	whiteBrush = 0
 
 	wsOverlapped  = 0x00000000
 	wsCaption     = 0x00C00000
@@ -26,6 +26,7 @@ const (
 	wsTabStop     = 0x00010000
 
 	ssLeft           = 0x00000000
+	ssEtchedHorz     = 0x00000010
 	esAutoHScroll    = 0x00000080
 	bsPushButton     = 0x00000000
 	bsDefPushButton  = 0x00000001
@@ -33,23 +34,30 @@ const (
 	bstChecked       = 1
 	bstUnchecked     = 0
 	defaultGUIFont   = 17
+	fwRegular        = 400
+	fwSemiBold       = 600
+	defaultCharset   = 1
+	clearTypeQuality = 5
 	idcArrow         = 32512
 	idInstallDirEdit = 1001
 	idBrowseButton   = 1002
 	idDesktopCheck   = 1003
-	idResetDataCheck = 1004
 	idInstallButton  = 1005
 	idCancelButton   = 1006
 
-	wmCreate        = 0x0001
-	wmCommand       = 0x0111
-	wmClose         = 0x0010
-	wmDestroy       = 0x0002
-	wmSetFont       = 0x0030
-	wmGetText       = 0x000D
-	wmGetTextLength = 0x000E
-	bmGetCheck      = 0x00F0
-	bmSetCheck      = 0x00F1
+	wmCreate         = 0x0001
+	wmCommand        = 0x0111
+	wmClose          = 0x0010
+	wmDestroy        = 0x0002
+	wmSetFont        = 0x0030
+	wmGetText        = 0x000D
+	wmGetTextLength  = 0x000E
+	wmCtlColorBtn    = 0x0135
+	wmCtlColorStatic = 0x0138
+	bmGetCheck       = 0x00F0
+	bmSetCheck       = 0x00F1
+
+	transparent = 1
 
 	swShow = 5
 
@@ -116,8 +124,10 @@ type installDialogState struct {
 	hwnd         uintptr
 	installEdit  uintptr
 	desktopCheck uintptr
-	resetCheck   uintptr
-	font         uintptr
+	bodyFont     uintptr
+	titleFont    uintptr
+	headingFont  uintptr
+	captionFont  uintptr
 }
 
 var (
@@ -134,7 +144,9 @@ var (
 	procDispatchMessageW  = user32.NewProc("DispatchMessageW")
 	procGetDlgItem        = user32.NewProc("GetDlgItem")
 	procGetMessageW       = user32.NewProc("GetMessageW")
+	procCreateFontW       = gdi32.NewProc("CreateFontW")
 	procGetStockObject    = gdi32.NewProc("GetStockObject")
+	procSetBkMode         = gdi32.NewProc("SetBkMode")
 	procGetSystemMetrics  = user32.NewProc("GetSystemMetrics")
 	procGetWindowTextW    = user32.NewProc("GetWindowTextW")
 	procGetWindowTextLenW = user32.NewProc("GetWindowTextLengthW")
@@ -182,8 +194,8 @@ func showInstallOptions(defaults installOptions) (installOptions, bool, error) {
 		return defaults, false, err
 	}
 
-	width := int32(600)
-	height := int32(350)
+	width := int32(680)
+	height := int32(420)
 	x := (int32(systemMetric(smCXScreen)) - width) / 2
 	y := (int32(systemMetric(smCYScreen)) - height) / 2
 	if x < 0 {
@@ -240,7 +252,7 @@ func registerInstallWindowClass(instance uintptr, className string) error {
 		lpfnWndProc:   installWndProcCallback,
 		hInstance:     instance,
 		hCursor:       cursor,
-		hbrBackground: uintptr(colorWindow + 1),
+		hbrBackground: stockObject(whiteBrush),
 		lpszClassName: syscall.StringToUTF16Ptr(className),
 	}
 	ret, _, err := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&cls)))
@@ -276,38 +288,45 @@ func installWindowProc(hwnd uintptr, message uint32, wParam uintptr, lParam uint
 	case wmDestroy:
 		procPostQuitMessage.Call(0)
 		return 0
+	case wmCtlColorStatic, wmCtlColorBtn:
+		procSetBkMode.Call(wParam, transparent)
+		return stockObject(whiteBrush)
 	}
 	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
 	return ret
 }
 
 func (s *installDialogState) createControls(hwnd uintptr) {
-	s.font = stockObject(defaultGUIFont)
+	s.bodyFont = createUIFont(-16, fwRegular)
+	s.titleFont = createUIFont(-30, fwSemiBold)
+	s.headingFont = createUIFont(-18, fwSemiBold)
+	s.captionFont = createUIFont(-14, fwRegular)
 
-	createLabel(hwnd, "安装 SafeLink", 24, 18, 530, 26, true)
-	createLabel(hwnd, "请选择安装目录。需要代理订阅功能时，sing-box 会随 SafeLink 一起安装。", 24, 50, 540, 22, false)
-	createLabel(hwnd, "安装目录", 24, 88, 120, 22, false)
+	createLabel(hwnd, appName, 36, 26, 240, 38, s.titleFont)
+	createLabel(hwnd, "安装向导", 38, 66, 180, 22, s.captionFont)
+	createSeparator(hwnd, 0, 104, 664)
 
-	s.installEdit = createControl("EDIT", s.defaults.InstallDir, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, 24, 110, 430, 26, hwnd, idInstallDirEdit)
-	createControl("BUTTON", "浏览...", wsChild|wsVisible|wsTabStop|bsPushButton, 466, 109, 88, 28, hwnd, idBrowseButton)
+	createLabel(hwnd, "安装位置", 40, 134, 160, 24, s.headingFont)
+	createLabel(hwnd, "选择 SafeLink 的安装目录", 40, 162, 260, 20, s.captionFont)
 
-	s.desktopCheck = createControl("BUTTON", "创建桌面快捷方式", wsChild|wsVisible|wsTabStop|bsAutoCheckBox, 24, 152, 220, 24, hwnd, idDesktopCheck)
+	s.installEdit = createControl("EDIT", s.defaults.InstallDir, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, 40, 194, 480, 30, hwnd, idInstallDirEdit)
+	setControlFont(s.installEdit, s.bodyFont)
+	browseButton := createControl("BUTTON", "浏览...", wsChild|wsVisible|wsTabStop|bsPushButton, 536, 193, 96, 32, hwnd, idBrowseButton)
+	setControlFont(browseButton, s.bodyFont)
+
+	s.desktopCheck = createControl("BUTTON", "创建桌面快捷方式", wsChild|wsVisible|wsTabStop|bsAutoCheckBox, 40, 244, 220, 24, hwnd, idDesktopCheck)
+	setControlFont(s.desktopCheck, s.bodyFont)
 	if s.defaults.CreateDesktopShortcut {
 		sendMessage(s.desktopCheck, bmSetCheck, bstChecked, 0)
 	} else {
 		sendMessage(s.desktopCheck, bmSetCheck, bstUnchecked, 0)
 	}
 
-	s.resetCheck = createControl("BUTTON", "全新安装（备份并清空本机已有用户数据）", wsChild|wsVisible|wsTabStop|bsAutoCheckBox, 24, 184, 360, 24, hwnd, idResetDataCheck)
-	if s.defaults.ResetUserData {
-		sendMessage(s.resetCheck, bmSetCheck, bstChecked, 0)
-	} else {
-		sendMessage(s.resetCheck, bmSetCheck, bstUnchecked, 0)
-	}
-
-	createLabel(hwnd, "旧数据会备份到 AppData\\Roaming\\SafeLink-backups；安装包不会包含源码配置或测试数据。", 24, 220, 540, 22, false)
-	createControl("BUTTON", "安装", wsChild|wsVisible|wsTabStop|bsDefPushButton, 362, 276, 92, 30, hwnd, idInstallButton)
-	createControl("BUTTON", "取消", wsChild|wsVisible|wsTabStop|bsPushButton, 466, 276, 88, 30, hwnd, idCancelButton)
+	createSeparator(hwnd, 0, 300, 664)
+	installButton := createControl("BUTTON", "立即安装", wsChild|wsVisible|wsTabStop|bsDefPushButton, 424, 330, 104, 34, hwnd, idInstallButton)
+	cancelButton := createControl("BUTTON", "取消", wsChild|wsVisible|wsTabStop|bsPushButton, 540, 330, 92, 34, hwnd, idCancelButton)
+	setControlFont(installButton, s.bodyFont)
+	setControlFont(cancelButton, s.bodyFont)
 	procSetFocus.Call(s.installEdit)
 }
 
@@ -332,7 +351,6 @@ func (s *installDialogState) handleCommand(hwnd uintptr, id int) bool {
 		}
 		s.result.InstallDir = installDir
 		s.result.CreateDesktopShortcut = sendMessage(s.desktopCheck, bmGetCheck, 0, 0) == bstChecked
-		s.result.ResetUserData = sendMessage(s.resetCheck, bmGetCheck, 0, 0) == bstChecked
 		s.result.Quiet = false
 		s.accepted = true
 		s.done = true
@@ -420,13 +438,15 @@ func shellFolderPath(csidl int) (string, error) {
 	return syscall.UTF16ToString(buf), nil
 }
 
-func createLabel(parent uintptr, text string, x, y, width, height int32, title bool) uintptr {
+func createLabel(parent uintptr, text string, x, y, width, height int32, font uintptr) uintptr {
 	style := uint32(wsChild | wsVisible | ssLeft)
 	label := createControl("STATIC", text, style, x, y, width, height, parent, 0)
-	if title {
-		sendMessage(label, wmSetFont, stockObject(defaultGUIFont), 1)
-	}
+	setControlFont(label, font)
 	return label
+}
+
+func createSeparator(parent uintptr, x, y, width int32) uintptr {
+	return createControl("STATIC", "", wsChild|wsVisible|ssEtchedHorz, x, y, width, 1, parent, 0)
 }
 
 func createControl(className, text string, style uint32, x, y, width, height int32, parent uintptr, id int) uintptr {
@@ -448,6 +468,35 @@ func createControl(className, text string, style uint32, x, y, width, height int
 		sendMessage(hwnd, wmSetFont, stockObject(defaultGUIFont), 1)
 	}
 	return hwnd
+}
+
+func createUIFont(height, weight int32) uintptr {
+	font, _, _ := procCreateFontW.Call(
+		uintptr(height),
+		0,
+		0,
+		0,
+		uintptr(weight),
+		0,
+		0,
+		0,
+		defaultCharset,
+		0,
+		0,
+		clearTypeQuality,
+		0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Segoe UI"))),
+	)
+	if font == 0 {
+		return stockObject(defaultGUIFont)
+	}
+	return font
+}
+
+func setControlFont(hwnd, font uintptr) {
+	if hwnd != 0 && font != 0 {
+		sendMessage(hwnd, wmSetFont, font, 1)
+	}
 }
 
 func createWindowEx(exStyle uint32, className, title string, style uint32, x, y, width, height int32, parent, menu, instance, param uintptr) (uintptr, error) {

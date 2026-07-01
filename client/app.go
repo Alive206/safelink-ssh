@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -41,6 +43,7 @@ type App struct {
 	proxyCleanupMu sync.Mutex
 	shutdownOnce   sync.Once
 	logMu          sync.Mutex
+	sshDebugMu     sync.Mutex
 	logs           []LogEntry
 }
 
@@ -55,6 +58,13 @@ type LogEntry struct {
 	Level   string `json:"level"`
 	Module  string `json:"module"`
 	Message string `json:"message"`
+}
+
+type ProxyTestProgressEvent struct {
+	BatchID   string               `json:"batch_id"`
+	Result    proxycore.TestResult `json:"result"`
+	Completed int                  `json:"completed"`
+	Total     int                  `json:"total"`
 }
 
 // MachineInfo contains basic local machine facts shown in Settings.
@@ -80,6 +90,7 @@ func (a *App) registerTray() {
 		systray.SetIcon(trayIcon)
 		systray.SetTitle("SafeLink")
 		systray.SetTooltip("SafeLink")
+		registerTrayIconDoubleClick(a.showMainWindow)
 
 		openItem := systray.AddMenuItem("打开", "显示 SafeLink 主窗口")
 		closeProxyItem := systray.AddMenuItem("关闭代理", "断开当前代理并关闭系统代理")
@@ -132,6 +143,7 @@ func (a *App) startup(ctx context.Context) {
 	rootCtx, cancel := context.WithCancel(ctx)
 	a.ctx = rootCtx
 	a.cancel = cancel
+	a.appendSSHDebug("", "app-start", fmt.Sprintf("exe=%s pid=%d", executablePath(), os.Getpid()))
 
 	// Determine data directory.
 	dataDir := defaultDataDir()
@@ -156,6 +168,11 @@ func (a *App) startup(ctx context.Context) {
 	a.manager = manager.New(tunnels, defaults, a.log, a.store)
 	a.sshTerm = sshsession.NewManager(sshsession.Options{
 		OnOutput: func(event sshsession.OutputEvent) {
+			if event.DataBase64 != "" {
+				if data, err := base64.StdEncoding.DecodeString(event.DataBase64); err == nil {
+					a.appendSSHDebug(event.SessionID, "backend-output", describeBytes(data))
+				}
+			}
 			wailsruntime.EventsEmit(rootCtx, "ssh:output", event)
 		},
 		OnClosed: func(event sshsession.ClosedEvent) {
@@ -291,12 +308,52 @@ func (a *App) GetStats() map[string]tunnel.Snapshot {
 
 // CreateSSHSession opens an interactive SSH PTY session and returns its ID.
 func (a *App) CreateSSHSession(cfg sshsession.Config) (string, error) {
-	return a.sshTerm.Create(a.ctx, cfg)
+	id, err := a.sshTerm.Create(a.ctx, cfg)
+	if err != nil {
+		a.appendSSHDebug("", "create-error", fmt.Sprintf("addr=%s user=%s err=%v", cfg.Addr, cfg.User, err))
+		return "", err
+	}
+	a.appendSSHDebug(id, "create", fmt.Sprintf("addr=%s user=%s rows=%d cols=%d", cfg.Addr, cfg.User, cfg.Rows, cfg.Cols))
+	return id, nil
 }
 
 // SendSSHInput writes raw terminal input to an interactive SSH session.
 func (a *App) SendSSHInput(sessionID, data string) error {
-	return a.sshTerm.Write(sessionID, data)
+	a.appendSSHDebug(sessionID, "input-string", describeBytes([]byte(data)))
+	err := a.sshTerm.Write(sessionID, data)
+	if err != nil {
+		a.appendSSHDebug(sessionID, "input-string-error", err.Error())
+	}
+	return err
+}
+
+// SendSSHInputBase64Batch writes raw base64-encoded terminal input chunks in order.
+func (a *App) SendSSHInputBase64Batch(sessionID string, chunks []string) error {
+	decoded := make([][]byte, 0, len(chunks))
+	total := 0
+	for _, chunk := range chunks {
+		if chunk == "" {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(chunk)
+		if err != nil {
+			a.appendSSHDebug(sessionID, "input-b64-decode-error", err.Error())
+			return fmt.Errorf("decode ssh input: %w", err)
+		}
+		total += len(data)
+		decoded = append(decoded, data)
+	}
+	a.appendSSHDebug(sessionID, "input-b64-batch", fmt.Sprintf("chunks=%d total=%d first=%s", len(decoded), total, describeFirstChunk(decoded)))
+	err := a.sshTerm.WriteChunks(sessionID, decoded)
+	if err != nil {
+		a.appendSSHDebug(sessionID, "input-b64-write-error", err.Error())
+	}
+	return err
+}
+
+// RecordSSHDebug appends a frontend terminal diagnostic line to the local debug log.
+func (a *App) RecordSSHDebug(sessionID, source, detail string) {
+	a.appendSSHDebug(sessionID, source, detail)
 }
 
 // ResizeSSHSession updates the remote PTY dimensions.
@@ -598,25 +655,135 @@ func (a *App) StartProxyNode(nodeName string) error {
 }
 
 // TestProxyNode measures HTTP latency through a selected proxy node.
-func (a *App) TestProxyNode(nodeName string) proxycore.TestResult {
+func (a *App) TestProxyNode(nodeName string) (result proxycore.TestResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("proxy node test failed unexpectedly: %v", recovered)
+			result = proxyTestFailure(nodeName, err)
+			a.recordLog("error", "节点", fmt.Sprintf("测试节点：%s", nodeName), err)
+		}
+	}()
+	if a.store == nil || a.proxy == nil {
+		err := errors.New("application is still starting")
+		a.recordLog("error", "节点", fmt.Sprintf("测试节点：%s", nodeName), err)
+		return proxyTestFailure(nodeName, err)
+	}
 	nodes, err := a.store.LoadActiveProxyNodes()
 	if err != nil {
-		return proxycore.TestResult{NodeName: nodeName, OK: false, Error: err.Error(), TestedAt: time.Now().Format(time.RFC3339)}
+		return proxyTestFailure(nodeName, err)
 	}
 	for _, node := range nodes {
 		if node.Name == nodeName {
 			result := a.proxy.Test(a.ctx, node, 8*time.Second)
-			if result.OK {
-				a.recordLog("info", "节点", fmt.Sprintf("测试节点：%s，延迟 %d ms", node.Name, result.LatencyMS), nil)
-			} else {
-				a.recordLog("error", "节点", fmt.Sprintf("测试节点：%s", node.Name), errors.New(result.Error))
-			}
+			a.recordProxyTestResult(result)
 			return result
 		}
 	}
 	err = fmt.Errorf("proxy node %q not found", nodeName)
 	a.recordLog("error", "节点", fmt.Sprintf("测试节点：%s", nodeName), err)
-	return proxycore.TestResult{NodeName: nodeName, OK: false, Error: err.Error(), TestedAt: time.Now().Format(time.RFC3339)}
+	return proxyTestFailure(nodeName, err)
+}
+
+func (a *App) TestProxyNodes(nodeNames []string, batchID string) (results []proxycore.TestResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("proxy node batch test failed unexpectedly: %v", recovered)
+			results = a.proxyTestBatchFailure(nodeNames, batchID, err)
+			a.recordLog("error", "节点", "批量测试节点", err)
+		}
+	}()
+	if a.store == nil || a.proxy == nil {
+		err := errors.New("application is still starting")
+		a.recordLog("error", "节点", "批量测试节点", err)
+		return a.proxyTestBatchFailure(nodeNames, batchID, err)
+	}
+
+	activeNodes, err := a.store.LoadActiveProxyNodes()
+	if err != nil {
+		return a.proxyTestBatchFailure(nodeNames, batchID, err)
+	}
+	activeByName := make(map[string]proxysubscription.ProxyNode, len(activeNodes))
+	for _, node := range activeNodes {
+		if _, exists := activeByName[node.Name]; !exists {
+			activeByName[node.Name] = node
+		}
+	}
+
+	total := len(nodeNames)
+	completed := 0
+	var progressMu sync.Mutex
+	onResult := func(result proxycore.TestResult) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		completed++
+		a.recordProxyTestResult(result)
+		a.emitProxyTestProgress(batchID, result, completed, total)
+	}
+
+	results = make([]proxycore.TestResult, len(nodeNames))
+	selectedNodes := make([]proxysubscription.ProxyNode, 0, len(nodeNames))
+	selectedIndexes := make([]int, 0, len(nodeNames))
+	for i, nodeName := range nodeNames {
+		nodeName = strings.TrimSpace(nodeName)
+		node, ok := activeByName[nodeName]
+		if !ok {
+			err := fmt.Errorf("proxy node %q not found", nodeName)
+			results[i] = proxyTestFailure(nodeName, err)
+			onResult(results[i])
+			continue
+		}
+		selectedNodes = append(selectedNodes, node)
+		selectedIndexes = append(selectedIndexes, i)
+	}
+
+	batchResults := a.proxy.TestNodes(a.ctx, selectedNodes, 5*time.Second, onResult)
+	for i, result := range batchResults {
+		if i < len(selectedIndexes) {
+			results[selectedIndexes[i]] = result
+		}
+	}
+	return results
+}
+
+func proxyTestFailure(nodeName string, err error) proxycore.TestResult {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	return proxycore.TestResult{NodeName: nodeName, OK: false, Error: message, TestedAt: time.Now().Format(time.RFC3339)}
+}
+
+func (a *App) proxyTestBatchFailure(nodeNames []string, batchID string, err error) []proxycore.TestResult {
+	results := make([]proxycore.TestResult, len(nodeNames))
+	for i, nodeName := range nodeNames {
+		results[i] = proxyTestFailure(nodeName, err)
+		a.emitProxyTestProgress(batchID, results[i], i+1, len(nodeNames))
+	}
+	return results
+}
+
+func (a *App) recordProxyTestResult(result proxycore.TestResult) {
+	if result.OK {
+		a.recordLog("info", "节点", fmt.Sprintf("测试节点：%s，延迟 %d ms", result.NodeName, result.LatencyMS), nil)
+		return
+	}
+	message := strings.TrimSpace(result.Error)
+	if message == "" {
+		message = "测试失败"
+	}
+	a.recordLog("error", "节点", fmt.Sprintf("测试节点：%s", result.NodeName), errors.New(message))
+}
+
+func (a *App) emitProxyTestProgress(batchID string, result proxycore.TestResult, completed, total int) {
+	if a.ctx == nil || batchID == "" {
+		return
+	}
+	wailsruntime.EventsEmit(a.ctx, "proxy:test-result", ProxyTestProgressEvent{
+		BatchID:   batchID,
+		Result:    result,
+		Completed: completed,
+		Total:     total,
+	})
 }
 
 // StopProxy stops the running sing-box process.
@@ -819,7 +986,7 @@ func parseLaunchOptions(args []string) LaunchOptions {
 
 // GetVersion returns the application version.
 func (a *App) GetVersion() string {
-	return "1.0.0"
+	return "2.0.0"
 }
 
 // GetDataDir returns the data directory path.
@@ -931,4 +1098,66 @@ func (a *App) recordLog(level, module, message string, err error) {
 	if len(a.logs) > 500 {
 		a.logs = append([]LogEntry(nil), a.logs[len(a.logs)-500:]...)
 	}
+}
+
+func (a *App) appendSSHDebug(sessionID, source, detail string) {
+	if len(detail) > 2000 {
+		detail = detail[:2000] + "...(truncated)"
+	}
+	line := fmt.Sprintf("%s pid=%d session=%s source=%s %s\n",
+		time.Now().Format(time.RFC3339Nano),
+		os.Getpid(),
+		sessionID,
+		source,
+		detail,
+	)
+	path := filepath.Join(defaultDataDir(), "ssh-terminal-debug.log")
+	a.sshDebugMu.Lock()
+	defer a.sshDebugMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	_, _ = file.WriteString(line)
+}
+
+func describeFirstChunk(chunks [][]byte) string {
+	for _, chunk := range chunks {
+		if len(chunk) > 0 {
+			return describeBytes(chunk)
+		}
+	}
+	return "len=0"
+}
+
+func describeBytes(data []byte) string {
+	limit := len(data)
+	if limit > 64 {
+		limit = 64
+	}
+	return fmt.Sprintf("len=%d hex=%s ascii=%q", len(data), hex.EncodeToString(data[:limit]), printableASCII(data[:limit]))
+}
+
+func printableASCII(data []byte) string {
+	var builder strings.Builder
+	for _, b := range data {
+		if b >= 32 && b <= 126 {
+			builder.WriteByte(b)
+			continue
+		}
+		builder.WriteByte('.')
+	}
+	return builder.String()
+}
+
+func executablePath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
 }

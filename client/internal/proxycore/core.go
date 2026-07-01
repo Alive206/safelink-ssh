@@ -29,6 +29,8 @@ const (
 
 	DefaultTestURL = "http://www.gstatic.com/generate_204"
 
+	defaultNodeTestConcurrency = 8
+
 	ProxyModeRule   = "rule"
 	ProxyModeGlobal = "global"
 	ProxyModeDirect = "direct"
@@ -48,6 +50,12 @@ var testURLs = []string{
 	"http://www.gstatic.com/generate_204",
 	"http://connectivitycheck.gstatic.com/generate_204",
 	"http://connectivitycheck.platform.hicloud.com/generate_204",
+	"http://www.msftconnecttest.com/connecttest.txt",
+}
+
+var fastTestURLs = []string{
+	"http://cp.cloudflare.com/generate_204",
+	"http://www.gstatic.com/generate_204",
 	"http://www.msftconnecttest.com/connecttest.txt",
 }
 
@@ -99,11 +107,12 @@ type Runner struct {
 	lastTraffic     connectionTraffic
 	lastTrafficAt   time.Time
 	lastTrafficNode string
+	testSlots       chan struct{}
 }
 
 func New(opts Options) *Runner {
 	opts = normalizeOptions(opts)
-	return &Runner{opts: opts, state: StateStopped}
+	return &Runner{opts: opts, state: StateStopped, testSlots: make(chan struct{}, defaultNodeTestConcurrency)}
 }
 
 func (r *Runner) SetMode(mode string) {
@@ -307,13 +316,70 @@ func (r *Runner) applyTraffic(status *Status, traffic connectionTraffic, now tim
 }
 
 func (r *Runner) Test(ctx context.Context, node proxysubscription.ProxyNode, timeout time.Duration) TestResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	testedAt := time.Now().Format(time.RFC3339)
+	slot, err := r.acquireTestSlot(ctx)
+	if err != nil {
+		return TestResult{NodeName: node.Name, OK: false, Error: err.Error(), TestedAt: testedAt}
+	}
+	defer func() { <-slot }()
+
 	r.mu.Lock()
 	opts := normalizeOptions(r.opts)
 	r.mu.Unlock()
 	return TestNode(ctx, node, opts, timeout)
 }
 
+func (r *Runner) TestNodes(ctx context.Context, nodes []proxysubscription.ProxyNode, timeout time.Duration, onResult func(TestResult)) []TestResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	slot, err := r.acquireTestSlot(ctx)
+	if err != nil {
+		results := make([]TestResult, len(nodes))
+		testedAt := time.Now().Format(time.RFC3339)
+		for i, node := range nodes {
+			results[i] = TestResult{NodeName: node.Name, OK: false, Error: err.Error(), TestedAt: testedAt}
+			emitTestResult(onResult, results[i])
+		}
+		return results
+	}
+	defer func() { <-slot }()
+
+	r.mu.Lock()
+	opts := normalizeOptions(r.opts)
+	r.mu.Unlock()
+	return TestNodes(ctx, nodes, opts, timeout, onResult)
+}
+
+func (r *Runner) acquireTestSlot(ctx context.Context) (chan struct{}, error) {
+	r.mu.Lock()
+	if r.testSlots == nil {
+		r.testSlots = make(chan struct{}, defaultNodeTestConcurrency)
+	}
+	slots := r.testSlots
+	r.mu.Unlock()
+
+	select {
+	case slots <- struct{}{}:
+		return slots, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func emitTestResult(onResult func(TestResult), result TestResult) {
+	if onResult != nil {
+		onResult(result)
+	}
+}
+
 func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Options, timeout time.Duration) TestResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	result := TestResult{
 		NodeName: node.Name,
 		TestedAt: time.Now().Format(time.RFC3339),
@@ -397,7 +463,11 @@ func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Option
 		return result
 	}
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	readyDone := make(chan struct{})
+	go func() {
+		done <- cmd.Wait()
+		close(readyDone)
+	}()
 	defer func() {
 		stopCore()
 		select {
@@ -410,7 +480,7 @@ func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Option
 		}
 	}()
 
-	if err := waitForLocalTCP(testCtx, clashAPIAddr); err != nil {
+	if err := waitForLocalTCPWithDone(testCtx, clashAPIAddr, readyDone, "sing-box test inbound"); err != nil {
 		output := strings.TrimSpace(coreOutput.String())
 		if output != "" {
 			result.Error = fmt.Sprintf("%v: %s", err, output)
@@ -432,6 +502,206 @@ func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Option
 	result.OK = true
 	result.LatencyMS = latency
 	return result
+}
+
+type batchTestOutbound struct {
+	index    int
+	tag      string
+	node     proxysubscription.ProxyNode
+	outbound map[string]any
+}
+
+type batchTestAttempt struct {
+	index  int
+	result TestResult
+}
+
+func TestNodes(ctx context.Context, nodes []proxysubscription.ProxyNode, opts Options, timeout time.Duration, onResult func(TestResult)) []TestResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	testedAt := time.Now().Format(time.RFC3339)
+	results := make([]TestResult, len(nodes))
+	for i, node := range nodes {
+		results[i] = TestResult{
+			NodeName: node.Name,
+			TestedAt: testedAt,
+		}
+	}
+	if len(nodes) == 0 {
+		return results
+	}
+
+	opts = normalizeOptions(opts)
+	if opts.CorePath == "" {
+		opts.CorePath = FindCorePath("")
+	}
+	if opts.CorePath == "" {
+		return finishPendingTestResults(results, errors.New("sing-box executable not found"), onResult)
+	}
+	if err := os.MkdirAll(opts.WorkDir, 0o755); err != nil {
+		return finishPendingTestResults(results, fmt.Errorf("create proxy work dir: %v", err), onResult)
+	}
+
+	outbounds := make([]batchTestOutbound, 0, len(nodes))
+	for i, node := range nodes {
+		if node.Server == "" || node.Port <= 0 {
+			results[i].Error = "proxy node has invalid server or port"
+			emitTestResult(onResult, results[i])
+			continue
+		}
+		outbound, err := buildOutbound(node)
+		if err != nil {
+			results[i].Error = err.Error()
+			emitTestResult(onResult, results[i])
+			continue
+		}
+		tag := fmt.Sprintf("test-%d", i)
+		outbound["tag"] = tag
+		outbounds = append(outbounds, batchTestOutbound{
+			index:    i,
+			tag:      tag,
+			node:     node,
+			outbound: outbound,
+		})
+	}
+	if len(outbounds) == 0 {
+		return results
+	}
+
+	workerCount := min(defaultNodeTestConcurrency, len(outbounds))
+	batchTimeout := 5*time.Second + timeout*time.Duration((len(outbounds)+workerCount-1)/workerCount)
+	testCtx, cancel := context.WithTimeout(ctx, batchTimeout)
+	defer cancel()
+
+	httpAddr, err := freeLoopbackAddr()
+	if err != nil {
+		return finishPendingTestResults(results, err, onResult)
+	}
+	socksAddr, err := freeLoopbackAddr()
+	if err != nil {
+		return finishPendingTestResults(results, err, onResult)
+	}
+	clashAPIAddr, err := freeLoopbackAddr()
+	if err != nil {
+		return finishPendingTestResults(results, err, onResult)
+	}
+	testDir, err := os.MkdirTemp(opts.WorkDir, "batch-test-*")
+	if err != nil {
+		return finishPendingTestResults(results, fmt.Errorf("create test work dir: %v", err), onResult)
+	}
+	defer func() { _ = os.RemoveAll(testDir) }()
+
+	cfg, err := buildBatchTestConfig(outbounds, Options{
+		CorePath:     opts.CorePath,
+		WorkDir:      testDir,
+		SOCKSAddr:    socksAddr,
+		HTTPAddr:     httpAddr,
+		ClashAPIAddr: clashAPIAddr,
+	})
+	if err != nil {
+		return finishPendingTestResults(results, err, onResult)
+	}
+	configPath := filepath.Join(testDir, "sing-box-batch-test.json")
+	if err := os.WriteFile(configPath, cfg, 0o600); err != nil {
+		return finishPendingTestResults(results, fmt.Errorf("write test config: %v", err), onResult)
+	}
+	if err := checkCoreConfig(testCtx, opts.CorePath, configPath, testDir); err != nil {
+		return finishPendingTestResults(results, err, onResult)
+	}
+
+	runCtx, stopCore := context.WithCancel(testCtx)
+	defer stopCore()
+	var coreOutput bytes.Buffer
+	cmd := exec.CommandContext(runCtx, opts.CorePath, "run", "-c", configPath)
+	cmd.Dir = testDir
+	cmd.Stdout = &coreOutput
+	cmd.Stderr = &coreOutput
+	hideCommandWindow(cmd)
+	if err := cmd.Start(); err != nil {
+		return finishPendingTestResults(results, fmt.Errorf("start sing-box: %v", err), onResult)
+	}
+	done := make(chan error, 1)
+	readyDone := make(chan struct{})
+	go func() {
+		done <- cmd.Wait()
+		close(readyDone)
+	}()
+	defer func() {
+		stopCore()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-done
+		}
+	}()
+
+	if err := waitForLocalTCPWithDone(testCtx, clashAPIAddr, readyDone, "sing-box batch test inbound"); err != nil {
+		output := strings.TrimSpace(coreOutput.String())
+		if output != "" {
+			err = fmt.Errorf("%v: %s", err, output)
+		}
+		return finishPendingTestResults(results, err, onResult)
+	}
+
+	jobs := make(chan batchTestOutbound)
+	attempts := make(chan batchTestAttempt, len(outbounds))
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for outbound := range jobs {
+				result := TestResult{
+					NodeName: outbound.node.Name,
+					TestedAt: time.Now().Format(time.RFC3339),
+				}
+				latency, err := testCoreDelayForTag(testCtx, clashAPIAddr, outbound.tag, timeout, fastTestURLs)
+				if err != nil {
+					result.Error = err.Error()
+				} else {
+					result.OK = true
+					result.LatencyMS = latency
+				}
+				attempts <- batchTestAttempt{index: outbound.index, result: result}
+			}
+		}()
+	}
+	go func() {
+		for _, outbound := range outbounds {
+			jobs <- outbound
+		}
+		close(jobs)
+		wg.Wait()
+		close(attempts)
+	}()
+
+	for attempt := range attempts {
+		results[attempt.index] = attempt.result
+		emitTestResult(onResult, attempt.result)
+	}
+	return finishPendingTestResults(results, testCtx.Err(), onResult)
+}
+
+func finishPendingTestResults(results []TestResult, err error, onResult func(TestResult)) []TestResult {
+	if err == nil {
+		return results
+	}
+	for i := range results {
+		if results[i].OK || results[i].Error != "" {
+			continue
+		}
+		results[i].Error = err.Error()
+		emitTestResult(onResult, results[i])
+	}
+	return results
 }
 
 func checkCoreConfig(ctx context.Context, corePath, configPath, workDir string) error {
@@ -507,16 +777,20 @@ type clashDelayResponse struct {
 }
 
 func testCoreDelay(ctx context.Context, clashAPIAddr string, timeout time.Duration) (int64, error) {
-	if len(testURLs) == 0 {
+	return testCoreDelayForTag(ctx, clashAPIAddr, "selected", timeout, testURLs)
+}
+
+func testCoreDelayForTag(ctx context.Context, clashAPIAddr, proxyTag string, timeout time.Duration, urls []string) (int64, error) {
+	if len(urls) == 0 {
 		return 0, errors.New("no delay test URL available")
 	}
 	testCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	client := &http.Client{Timeout: timeout}
-	results := make(chan delayAttemptResult, len(testURLs))
-	for _, testURL := range testURLs {
+	results := make(chan delayAttemptResult, len(urls))
+	for _, testURL := range urls {
 		go func(testURL string) {
-			delay, err := testCoreDelayURL(testCtx, client, clashAPIAddr, timeout, testURL)
+			delay, err := testCoreDelayURL(testCtx, client, clashAPIAddr, proxyTag, timeout, testURL)
 			if err != nil {
 				results <- delayAttemptResult{attempt: fmt.Sprintf("%s: %v", testURL, err)}
 				return
@@ -526,7 +800,7 @@ func testCoreDelay(ctx context.Context, clashAPIAddr string, timeout time.Durati
 	}
 
 	var attempts []string
-	for range testURLs {
+	for range urls {
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
@@ -577,11 +851,11 @@ func queryConnectionTraffic(ctx context.Context, clashAPIAddr string) (connectio
 	return payload, nil
 }
 
-func testCoreDelayURL(ctx context.Context, client *http.Client, clashAPIAddr string, timeout time.Duration, testURL string) (int64, error) {
+func testCoreDelayURL(ctx context.Context, client *http.Client, clashAPIAddr string, proxyTag string, timeout time.Duration, testURL string) (int64, error) {
 	endpoint := url.URL{
 		Scheme: "http",
 		Host:   clashAPIAddr,
-		Path:   "/proxies/selected/delay",
+		Path:   "/proxies/" + proxyTag + "/delay",
 	}
 	q := endpoint.Query()
 	q.Set("timeout", fmt.Sprintf("%d", timeout.Milliseconds()))
@@ -753,6 +1027,41 @@ func BuildConfig(node proxysubscription.ProxyNode, opts Options) ([]byte, error)
 	}
 	if len(experimental) > 0 {
 		cfg["experimental"] = experimental
+	}
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+func buildBatchTestConfig(nodes []batchTestOutbound, opts Options) ([]byte, error) {
+	opts = normalizeOptions(opts)
+	if len(nodes) == 0 {
+		return nil, errors.New("no proxy nodes to test")
+	}
+	outbounds := make([]map[string]any, 0, len(nodes)+2)
+	for _, node := range nodes {
+		outbounds = append(outbounds, node.outbound)
+	}
+	outbounds = append(outbounds,
+		map[string]any{"type": "direct", "tag": "direct"},
+		map[string]any{"type": "block", "tag": "block"},
+	)
+	cfg := map[string]any{
+		"log": map[string]any{
+			"level": "warn",
+		},
+		"inbounds": []map[string]any{
+			buildInbound("socks-in", "socks", opts.SOCKSAddr),
+			buildInbound("http-in", "http", opts.HTTPAddr),
+		},
+		"outbounds": outbounds,
+		"route": map[string]any{
+			"final": nodes[0].tag,
+		},
+		"experimental": map[string]any{
+			"clash_api": map[string]any{
+				"external_controller": opts.ClashAPIAddr,
+				"secret":              "",
+			},
+		},
 	}
 	return json.MarshalIndent(cfg, "", "  ")
 }

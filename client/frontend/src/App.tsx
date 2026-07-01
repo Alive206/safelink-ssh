@@ -25,8 +25,9 @@ import {
   RefreshAllSubscriptions,
   RefreshSubscription,
   ResizeSSHSession,
+  RecordSSHDebug,
   SaveSSHConnection,
-  SendSSHInput,
+  SendSSHInputBase64Batch,
   SetAutoStartEnabled,
   SetProxyMode,
   SetProxyRules,
@@ -35,7 +36,7 @@ import {
   StartTunnel,
   StopProxy,
   StopTunnel,
-  TestProxyNode,
+  TestProxyNodes,
   ToggleSubscription,
   UpdateSubscription,
   UpdateTunnel,
@@ -97,11 +98,17 @@ type MachineInfo = {
   ips?: string[]
 }
 
-const NODE_TEST_CONCURRENCY = 12
 const TUNNEL_POLL_INTERVAL_MS = 350
 const TUNNEL_START_TIMEOUT_MS = 20000
 const TUNNEL_STOP_TIMEOUT_MS = 8000
 const SSH_TERMINAL_ENABLED = true
+
+type ProxyTestProgressEvent = {
+  batch_id?: string
+  result?: proxycore.TestResult
+  completed?: number
+  total?: number
+}
 
 type ModalKind = 'subscription' | 'tunnel' | 'ssh' | null
 
@@ -143,6 +150,7 @@ type SSHForm = {
 type SSHOutputEvent = {
   session_id: string
   data: string
+  data_base64?: string
 }
 
 type SSHClosedEvent = {
@@ -173,7 +181,7 @@ const navItems: Array<{ key: NavKey; label: string; icon: string; badge?: string
   { key: 'nodes', label: '节点', icon: 'node' },
   { key: 'subscriptions', label: '订阅', icon: 'sub' },
   { key: 'tunnels', label: 'SSH 隧道', icon: 'tunnel' },
-  ...(SSH_TERMINAL_ENABLED ? [{ key: 'terminal' as const, label: 'SSH 终端', icon: 'term', badge: '开发中' }] : []),
+  ...(SSH_TERMINAL_ENABLED ? [{ key: 'terminal' as const, label: 'SSH 终端', icon: 'term' }] : []),
   { key: 'settings', label: '设置', icon: 'gear' },
   { key: 'logs', label: '日志', icon: 'log' },
 ]
@@ -300,9 +308,11 @@ const emptySSHForm: SSHForm = {
   password: '',
 }
 
+const sshAddrPlaceholder = '例如：159.75.35.104:22'
+
 function App() {
   const [activeNav, setActiveNav] = useState<NavKey>('home')
-  const [version, setVersion] = useState('1.0.0')
+  const [version, setVersion] = useState('2.0.0')
   const [machineInfo, setMachineInfo] = useState<MachineInfo>(() => browserMachineInfo())
   const [tunnels, setTunnels] = useState<manager.Status[]>([])
   const [subscriptions, setSubscriptions] = useState<store.SubscriptionSource[]>([])
@@ -327,6 +337,8 @@ function App() {
   const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([])
   const [activeTerminalTabID, setActiveTerminalTabID] = useState('')
   const [terminalTabMenu, setTerminalTabMenu] = useState<TerminalTabMenu | null>(null)
+  const [terminalConnectionPickerOpen, setTerminalConnectionPickerOpen] = useState(false)
+  const [terminalConnectionSearch, setTerminalConnectionSearch] = useState('')
   const [launchSSHConnectionID, setLaunchSSHConnectionID] = useState('')
   const [handledLaunchSSHConnectionID, setHandledLaunchSSHConnectionID] = useState('')
   const [logLevelFilter, setLogLevelFilter] = useState<LogLevelFilter>('all')
@@ -356,7 +368,7 @@ function App() {
         GetMachineInfo(),
         GetLogs(),
       ])
-      setVersion(nextVersion || '1.0.0')
+      setVersion(nextVersion || '2.0.0')
       setTunnels(nextTunnels ?? [])
       setSubscriptions(nextSubscriptions ?? [])
       setProxyNodes(nextProxyNodes ?? [])
@@ -431,6 +443,26 @@ function App() {
     }
   }, [terminalTabMenu])
 
+  useEffect(() => {
+    if (!terminalConnectionPickerOpen) {
+      return
+    }
+    const closePicker = () => setTerminalConnectionPickerOpen(false)
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closePicker()
+      }
+    }
+    window.addEventListener('click', closePicker)
+    window.addEventListener('resize', closePicker)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('click', closePicker)
+      window.removeEventListener('resize', closePicker)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [terminalConnectionPickerOpen])
+
   const nodes = useMemo(() => {
     return proxyNodes.map((node, index) => toDashboardNode(node, index, proxyTestResults[node.name], testingNodeNames.has(node.name)))
   }, [proxyNodes, proxyTestResults, testingNodeNames])
@@ -438,6 +470,7 @@ function App() {
   const sshTunnels = useMemo(() => tunnels.filter((item) => normalizeMode(item.config.mode) !== 'vpn'), [tunnels])
   const tunnelRows = useMemo(() => sshTunnels.map(toTunnelRow), [sshTunnels])
   const sshRows = useMemo(() => sshConnections.map(toSSHRow), [sshConnections])
+  const filteredSSHRows = useMemo(() => filterSSHRows(sshRows, terminalConnectionSearch), [sshRows, terminalConnectionSearch])
   const activeTerminalTab = useMemo(() => {
     if (!activeTerminalTabID) {
       return terminalTabs[0]
@@ -523,7 +556,6 @@ function App() {
   const uploadSpeedBps = proxyStatus?.upload_speed_bps ?? 0
   const downloadSpeedBps = proxyStatus?.download_speed_bps ?? 0
   const connectedSince = proxyStatus?.started_at ? formatClockDuration(proxyStatus.started_at) : '00:00:00'
-  const terminalLabel = activeTerminalTab ? formatSSHConnectionLabel(activeTerminalTab.title, activeTerminalTab.host) : selectedSSH ? sshRowLabel(selectedSSH) : '未选择连接'
   const testingNodes = testingNodeNames.size > 0
   const filteredLogs = useMemo(() => filterLogs(logs, logLevelFilter, logRangeFilter, logSearch), [logs, logLevelFilter, logRangeFilter, logSearch])
 
@@ -580,9 +612,8 @@ function App() {
       return
     }
 
-    const total = testableNodes.length
     const testNames = new Set(testableNodes.map((node) => node.source.name))
-    setNotice(`节点测试中：0/${total}`)
+    setNotice('')
     setError('')
     setTestingNodeNames(testNames)
     setProxyTestResults((current) => {
@@ -592,49 +623,45 @@ function App() {
       })
       return next
     })
-    let okCount = 0
-    let completedCount = 0
-    try {
-      const runNodeTest = async (node: DashboardNode & { source: proxysubscription.ProxyNode }) => {
-        let result: proxycore.TestResult
-        try {
-          result = await TestProxyNode(node.source.name)
-        } catch (err) {
-          result = {
-            node_name: node.source.name,
-            ok: false,
-            latency_ms: 0,
-            error: errorMessage(err),
-            tested_at: new Date().toISOString(),
-          } as proxycore.TestResult
-        }
-        if (result.ok) {
-          okCount += 1
-        }
-        completedCount += 1
-        setProxyTestResults((current) => ({ ...current, [result.node_name]: result }))
-        setTestingNodeNames((current) => {
-          const next = new Set(current)
-          next.delete(result.node_name)
-          return next
-        })
-        setNotice(`节点测试中：${completedCount}/${total}，${okCount} 可用`)
+    const batchID = createProxyTestBatchID()
+    const completedNames = new Set<string>()
+    const applyTestResult = (result?: proxycore.TestResult) => {
+      if (!result?.node_name || !testNames.has(result.node_name) || completedNames.has(result.node_name)) {
+        return
       }
-
-      const workerCount = Math.min(NODE_TEST_CONCURRENCY, testableNodes.length)
-      const workers = Array.from({ length: workerCount }, async (_, workerIndex) => {
-        for (let index = workerIndex; index < testableNodes.length; index += workerCount) {
-          await runNodeTest(testableNodes[index])
-        }
+      completedNames.add(result.node_name)
+      setProxyTestResults((current) => ({ ...current, [result.node_name]: result }))
+      setTestingNodeNames((current) => {
+        const next = new Set(current)
+        next.delete(result.node_name)
+        return next
       })
-      await Promise.all(workers)
+    }
+    const offProgress = EventsOn('proxy:test-result', (event: ProxyTestProgressEvent) => {
+      if (event?.batch_id !== batchID) {
+        return
+      }
+      applyTestResult(event.result)
+    })
+    try {
+      const results = await TestProxyNodes(testableNodes.map((node) => node.source.name), batchID)
+      results.forEach(applyTestResult)
       setTestingNodeNames(new Set())
       await refresh()
-      setNotice(`节点测试完成：${okCount}/${total} 可用`)
-      window.setTimeout(() => setNotice(''), 2200)
     } catch (err) {
-      setError(errorMessage(err))
+      const message = errorMessage(err)
+      testableNodes.forEach((node) => {
+        applyTestResult({
+          node_name: node.source.name,
+          ok: false,
+          latency_ms: 0,
+          error: message,
+          tested_at: new Date().toISOString(),
+        } as proxycore.TestResult)
+      })
+      setError(message)
     } finally {
+      offProgress()
       setTestingNodeNames(new Set())
     }
   }
@@ -987,6 +1014,34 @@ function App() {
     setTerminalTabMenu({ tabID, x: event.clientX, y: event.clientY })
   }
 
+  function editTerminalTabConnection(tabID = activeTerminalTab?.id ?? '') {
+    const tab = terminalTabs.find((item) => item.id === tabID)
+    if (!tab) {
+      return
+    }
+    const row =
+      sshRows.find((item) => item.source?.id && item.source.id === tab.connectionID) ??
+      sshRows.find((item) => item.source?.addr === tab.addr && item.source?.user === tab.user)
+    setTerminalTabMenu(null)
+    if (row) {
+      setSelectedSSHID(row.id)
+      openSSHForm(row)
+      return
+    }
+    setSSHForm({
+      id: tab.connectionID,
+      name: tab.title,
+      addr: tab.addr,
+      user: tab.user,
+      password: tab.password,
+    })
+    setModal('ssh')
+  }
+
+  function selectSSHConnection(row: SSHRow) {
+    setSelectedSSHID(row.id)
+  }
+
   async function clearLogEntries() {
     await runAction('清空日志', async () => {
       await ClearLogs()
@@ -1215,7 +1270,7 @@ function App() {
                 />
               </div>
               <div className="form-grid">
-                <FormField label="SSH 地址" value={tunnelForm.sshAddr} onChange={(value) => setTunnelForm((current) => ({ ...current, sshAddr: value }))} required />
+                <FormField label="SSH 地址" placeholder={sshAddrPlaceholder} value={tunnelForm.sshAddr} onChange={(value) => setTunnelForm((current) => ({ ...current, sshAddr: value }))} required />
                 <FormField label="SSH 用户" value={tunnelForm.sshUser} onChange={(value) => setTunnelForm((current) => ({ ...current, sshUser: value }))} required />
               </div>
               <FormField label="SSH 密码" type="password" value={tunnelForm.password} onChange={(value) => setTunnelForm((current) => ({ ...current, password: value }))} />
@@ -1228,7 +1283,7 @@ function App() {
               <ModalHeader title={sshForm.id ? '编辑 SSH 连接' : '新建 SSH 连接'} onClose={() => setModal(null)} />
               <FormField label="连接名称" value={sshForm.name} onChange={(value) => setSSHForm((current) => ({ ...current, name: value }))} required />
               <div className="form-grid">
-                <FormField label="SSH 地址" value={sshForm.addr} onChange={(value) => setSSHForm((current) => ({ ...current, addr: value }))} required />
+                <FormField label="SSH 地址" placeholder={sshAddrPlaceholder} value={sshForm.addr} onChange={(value) => setSSHForm((current) => ({ ...current, addr: value }))} required />
                 <FormField label="用户名" value={sshForm.user} onChange={(value) => setSSHForm((current) => ({ ...current, user: value }))} required />
               </div>
               <FormField label="密码" type="password" value={sshForm.password} onChange={(value) => setSSHForm((current) => ({ ...current, password: value }))} required />
@@ -1417,63 +1472,155 @@ function App() {
   function renderTerminalPage() {
     return (
       <section className="terminal-page">
-        <div className="card terminal-sidebar">
-          <PageHeader title="连接管理" actions={<button className="small-outline" onClick={() => openSSHForm()} type="button">＋ 新建连接</button>} />
-          <div className="terminal-connection-list">
-            {sshRows.map((row) => (
-              <button className={`terminal-connection ${row.id === selectedSSH?.id ? 'selected' : ''}`} key={row.id} onDoubleClick={() => openTerminal(row)} onClick={() => setSelectedSSHID(row.id)} type="button">
-                <span className="terminal-icon">&gt;_</span>
-                <span><strong>{row.name}</strong><small>{row.detail}</small></span>
-              </button>
-            ))}
-            {sshRows.length === 0 && <EmptyList text="暂无 SSH 终端连接" />}
-          </div>
-        </div>
-        <div className="card terminal-window-card">
+        <div className="card terminal-workbench">
           <div className="terminal-toolbar">
-            <div className="terminal-tabs" role="tablist" aria-label="SSH 终端标签">
-              {terminalTabs.length > 0 ? (
-                terminalTabs.map((tab) => {
-                  const label = formatSSHConnectionLabel(tab.title, tab.host)
-                  const active = tab.id === activeTerminalTab?.id
-                  return (
-                    <div
-                      aria-selected={active}
-                      className={`terminal-tab ${active ? 'active' : ''}`}
-                      key={tab.id}
-                      onClick={() => setActiveTerminalTabID(tab.id)}
-                      onContextMenu={(event) => openTerminalTabMenu(event, tab.id)}
-                      role="tab"
-                    >
-                      <span className={`dot ${tab.connected ? 'green' : 'red'}`} />
-                      <span title={label}>{label}</span>
+            <div className="terminal-toolbar-left">
+              <button
+                className="terminal-connection-trigger"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setTerminalConnectionPickerOpen((open) => !open)
+                }}
+                type="button"
+              >
+                <span className="terminal-icon">&gt;_</span>
+                <span>连接管理</span>
+              </button>
+              <div className="terminal-tabs" role="tablist" aria-label="SSH 终端标签">
+                {terminalTabs.map((tab) => {
+                    const label = formatSSHConnectionLabel(tab.title, tab.host)
+                    const active = tab.id === activeTerminalTab?.id
+                    return (
+                      <div
+                        aria-selected={active}
+                        className={`terminal-tab ${active ? 'active' : ''}`}
+                        key={tab.id}
+                        onClick={() => setActiveTerminalTabID(tab.id)}
+                        onContextMenu={(event) => openTerminalTabMenu(event, tab.id)}
+                        role="tab"
+                      >
+                        <span className={`dot ${tab.connected ? 'green' : 'red'}`} />
+                        <span title={label}>{label}</span>
+                        <button
+                          className="terminal-tab-delete"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            void closeTerminal(tab.id)
+                          }}
+                          title="关闭标签"
+                          aria-label={`关闭标签 ${label}`}
+                          type="button"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    )
+                  })}
+              </div>
+            </div>
+          </div>
+          {terminalConnectionPickerOpen && (
+            <div className="terminal-connection-popover" onClick={(event) => event.stopPropagation()}>
+              <div className="terminal-picker-head">
+                <div className="terminal-manager-tools" aria-label="连接管理器工具">
+                  <button
+                    className="terminal-tool-button add"
+                    onClick={() => {
+                      setTerminalConnectionPickerOpen(false)
+                      openSSHForm()
+                    }}
+                    title="新建连接"
+                    type="button"
+                  >
+                    ＋
+                  </button>
+                  <button
+                    className="terminal-tool-button"
+                    disabled={!selectedSSH}
+                    onClick={() => {
+                      setTerminalConnectionPickerOpen(false)
+                      openSSHForm(selectedSSH)
+                    }}
+                    title="编辑连接"
+                    type="button"
+                  >
+                    ✎
+                  </button>
+                  <button
+                    className="terminal-tool-button"
+                    disabled={!selectedSSH}
+                    onClick={() => {
+                      setTerminalConnectionPickerOpen(false)
+                      void openTerminal()
+                    }}
+                    title="打开终端"
+                    type="button"
+                  >
+                    ▶
+                  </button>
+                  <button
+                    className="terminal-tool-button danger"
+                    disabled={!selectedSSH}
+                    onClick={() => {
+                      setTerminalConnectionPickerOpen(false)
+                      void deleteSelectedSSH()
+                    }}
+                    title="删除连接"
+                    type="button"
+                  >
+                    −
+                  </button>
+                </div>
+                <div className="terminal-manager-filters">
+                  <label className="terminal-manager-search">
+                    <span>⌕</span>
+                    <input
+                      aria-label="搜索连接"
+                      placeholder="搜索连接"
+                      value={terminalConnectionSearch}
+                      onChange={(event) => setTerminalConnectionSearch(event.target.value)}
+                    />
+                  </label>
+                  <select aria-label="连接筛选" value="all" onChange={() => undefined}>
+                    <option value="all">全部</option>
+                  </select>
+                </div>
+              </div>
+              <div className="terminal-manager-path"><span className="terminal-folder-icon" />连接</div>
+              <div className="terminal-connection-table">
+                <div className="terminal-connection-head" role="row">
+                  <span>名称</span>
+                  <span>主机</span>
+                  <span>端口</span>
+                  <span>用户</span>
+                </div>
+                <div className="terminal-connection-list">
+                  {filteredSSHRows.map((row) => {
+                    const target = sshRowTarget(row)
+                    return (
                       <button
-                        className="terminal-tab-delete"
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          void closeTerminal(tab.id)
+                        className={`terminal-connection ${row.id === selectedSSH?.id ? 'selected' : ''}`}
+                        key={row.id}
+                        onClick={() => selectSSHConnection(row)}
+                        onDoubleClick={() => {
+                          selectSSHConnection(row)
+                          setTerminalConnectionPickerOpen(false)
+                          void openTerminal(row)
                         }}
-                        title="关闭标签"
-                        aria-label={`关闭标签 ${label}`}
                         type="button"
                       >
-                        ×
+                        <span><span className="terminal-row-icon" />{row.name}</span>
+                        <span title={target.host}>{target.host}</span>
+                        <span>{target.port}</span>
+                        <span title={target.user}>{target.user}</span>
                       </button>
-                    </div>
-                  )
-                })
-              ) : (
-                <div className="terminal-tab-label">
-                  <span className="dot gray" />
-                  <span title={terminalLabel}>{terminalLabel}</span>
+                    )
+                  })}
+                  {filteredSSHRows.length === 0 && <EmptyList text={sshRows.length === 0 ? '暂无 SSH 终端连接' : '没有匹配的连接'} />}
                 </div>
-              )}
+              </div>
             </div>
-            <div className="terminal-toolbar-actions">
-              <button className="plain-star" onClick={() => openTerminal()} type="button">连接</button>
-              <button className="plain-star" onClick={() => openSSHForm(selectedSSH)} type="button">编辑</button>
-            </div>
-          </div>
+          )}
           <div className="terminal-screen">
             {terminalTabs.length > 0 ? (
               terminalTabs.map((tab) => (
@@ -1481,11 +1628,7 @@ function App() {
                   <SSHTerminalPane active={tab.id === activeTerminalTab?.id} sessionID={tab.sessionID} />
                 </div>
               ))
-            ) : selectedSSH ? (
-              <pre>{`连接：${selectedSSH.detail}\n\n点击右上角“连接”打开终端会话。`}</pre>
-            ) : (
-              <span className="terminal-empty-hint">请选择一个 SSH 连接</span>
-            )}
+            ) : null}
           </div>
           {terminalTabMenu && (
             <div
@@ -1493,6 +1636,7 @@ function App() {
               style={{ left: terminalTabMenu.x, top: terminalTabMenu.y }}
               onClick={(event) => event.stopPropagation()}
             >
+              <button onClick={() => editTerminalTabConnection(terminalTabMenu.tabID)} type="button">编辑连接</button>
               <button onClick={() => reconnectTerminal(terminalTabMenu.tabID)} type="button">重连</button>
               <button onClick={() => openTerminalTab(terminalTabMenu.tabID)} type="button">新建标签</button>
               <button className="danger" onClick={() => closeTerminal(terminalTabMenu.tabID)} type="button">关闭标签</button>
@@ -1652,7 +1796,7 @@ function App() {
   function renderTerminalCompactCard() {
     return (
       <div className="card compact-card">
-        <PanelTitle title="SSH 终端连接（开发中）" action={<button className="small-outline" onClick={() => openSSHForm()} type="button">＋ 新建连接</button>} />
+        <PanelTitle title="SSH 终端连接" action={<button className="small-outline" onClick={() => openSSHForm()} type="button">＋ 新建连接</button>} />
         <div className="compact-list">
           {sshRows.map((row) => (
             <div className="compact-row terminal-row" key={row.id}>
@@ -2007,6 +2151,25 @@ function toSSHRow(item: store.SSHConnection, index: number): SSHRow {
   }
 }
 
+function filterSSHRows(rows: SSHRow[], keyword: string) {
+  const query = keyword.trim().toLowerCase()
+  if (!query) {
+    return rows
+  }
+  return rows.filter((row) => {
+    const target = sshRowTarget(row)
+    return [row.name, row.detail, target.host, target.port, target.user].some((value) => value.toLowerCase().includes(query))
+  })
+}
+
+function sshRowTarget(row: SSHRow) {
+  return {
+    host: hostFromAddr(row.source?.addr || '-') || '-',
+    port: portFromAddr(row.source?.addr || '') || '22',
+    user: row.source?.user || '-',
+  }
+}
+
 function buildTunnelConfig(form: TunnelForm): config.TunnelCfg {
   return {
     name: form.name.trim(),
@@ -2118,10 +2281,6 @@ function newRouteRuleID() {
   return `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-function sshRowLabel(row: SSHRow) {
-  return formatSSHConnectionLabel(row.name, hostFromAddr(row.source?.addr || ''))
-}
-
 function formatSSHConnectionLabel(name: string, host: string) {
   const label = name || '未命名连接'
   const displayHost = host || '-'
@@ -2142,6 +2301,22 @@ function hostFromAddr(addr: string) {
     return parts[0] || value
   }
   return value
+}
+
+function portFromAddr(addr: string) {
+  const value = (addr || '').trim()
+  if (!value) {
+    return ''
+  }
+  if (value.startsWith('[')) {
+    const end = value.indexOf(']')
+    if (end > 0 && value[end + 1] === ':') {
+      return value.slice(end + 2) || ''
+    }
+    return ''
+  }
+  const parts = value.split(':')
+  return parts.length === 2 ? parts[1] || '' : ''
 }
 
 type SSHSessionTarget = Pick<store.SSHConnection, 'addr' | 'user' | 'password'>
@@ -2175,6 +2350,81 @@ function terminalTabFromConnection(conn: store.SSHConnection, sessionID: string)
 
 function newTerminalTabID(seed: string) {
   return `${seed || 'ssh'}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+const terminalInputEncoder = new TextEncoder()
+
+function base64FromBytes(bytes: Uint8Array) {
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize))
+  }
+  return btoa(binary)
+}
+
+function bytesFromBase64(data: string) {
+  const binary = atob(data)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index) & 0xff
+  }
+  return bytes
+}
+
+function encodeTerminalText(data: string) {
+  return base64FromBytes(terminalInputEncoder.encode(data))
+}
+
+function encodeTerminalBinary(data: string) {
+  const bytes = new Uint8Array(data.length)
+  for (let index = 0; index < data.length; index += 1) {
+    bytes[index] = data.charCodeAt(index) & 0xff
+  }
+  return base64FromBytes(bytes)
+}
+
+function describeTerminalText(data: string) {
+  const codes = Array.from(data.slice(0, 32), (char) => char.charCodeAt(0).toString(16).padStart(2, '0')).join('')
+  return `len=${data.length} hex=${codes} text=${JSON.stringify(data.slice(0, 32))}`
+}
+
+function describeTerminalGeometry(container: HTMLElement, term: Terminal) {
+  const xterm = container.querySelector<HTMLElement>('.xterm')
+  const viewport = container.querySelector<HTMLElement>('.xterm-viewport')
+  const screen = container.querySelector<HTMLElement>('.xterm-screen')
+  const canvas = container.querySelector<HTMLCanvasElement>('.xterm-screen canvas')
+  const part = (name: string, element: HTMLElement | null) => {
+    if (!element) {
+      return `${name}=missing`
+    }
+    const rect = element.getBoundingClientRect()
+    return `${name}=${element.clientWidth}x${element.clientHeight}/${Math.round(rect.width)}x${Math.round(rect.height)}`
+  }
+  return [
+    `rows=${term.rows}`,
+    `cols=${term.cols}`,
+    part('container', container),
+    part('xterm', xterm),
+    part('viewport', viewport),
+    part('screen', screen),
+    canvas ? `canvas=${canvas.width}x${canvas.height}/${canvas.clientWidth}x${canvas.clientHeight}` : 'canvas=missing',
+    viewport ? `scroll=${viewport.scrollTop}/${viewport.scrollHeight}` : 'scroll=missing',
+  ].join(' ')
+}
+
+function describeTerminalKey(event: KeyboardEvent) {
+  return [
+    `type=${event.type}`,
+    `key=${JSON.stringify(event.key)}`,
+    `code=${event.code}`,
+    `ctrl=${event.ctrlKey ? 1 : 0}`,
+    `shift=${event.shiftKey ? 1 : 0}`,
+    `alt=${event.altKey ? 1 : 0}`,
+    `meta=${event.metaKey ? 1 : 0}`,
+    `repeat=${event.repeat ? 1 : 0}`,
+    `target=${event.target instanceof HTMLElement ? event.target.className || event.target.tagName : ''}`,
+  ].join(' ')
 }
 
 function SSHTerminalPane({ active = true, sessionID }: { active?: boolean; sessionID: string }) {
@@ -2252,13 +2502,59 @@ function SSHTerminalPane({ active = true, sessionID }: { active?: boolean; sessi
       readClipboard().then(pasteText).catch(() => undefined)
     }
 
+    const recordDebug = (source: string, detail: string) => {
+      RecordSSHDebug(sessionID, source, detail).catch(() => undefined)
+    }
+    recordDebug('frontend-open', describeTerminalGeometry(container, term))
+
+    let disposed = false
+    let inputQueue: string[] = []
+    let flushingInput = false
+    const flushInputQueue = () => {
+      if (flushingInput || disposed) {
+        return
+      }
+      flushingInput = true
+      void (async () => {
+        while (!disposed && inputQueue.length > 0) {
+          const batch = inputQueue.splice(0)
+          try {
+            await SendSSHInputBase64Batch(sessionID, batch)
+          } catch (err) {
+            inputQueue = []
+            if (!disposed) {
+              term.writeln(`\r\n[错误] ${errorMessage(err)}`)
+            }
+            break
+          }
+        }
+      })().finally(() => {
+        flushingInput = false
+        if (!disposed && inputQueue.length > 0) {
+          flushInputQueue()
+        }
+      })
+    }
+    const queueTerminalInput = (payload: string) => {
+      if (!payload || disposed) {
+        return
+      }
+      inputQueue.push(payload)
+      flushInputQueue()
+    }
     const dataDisposable = term.onData((data) => {
-      SendSSHInput(sessionID, data).catch((err) => term.writeln(`\r\n[错误] ${errorMessage(err)}`))
+      recordDebug('frontend-data', describeTerminalText(data))
+      queueTerminalInput(encodeTerminalText(data))
+    })
+    const binaryDisposable = term.onBinary((data) => {
+      recordDebug('frontend-binary', describeTerminalText(data))
+      queueTerminalInput(encodeTerminalBinary(data))
     })
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') {
         return true
       }
+      recordDebug('frontend-keydown', describeTerminalKey(event))
       const key = event.key.toLowerCase()
       const copyShortcut = (event.ctrlKey || event.metaKey) && key === 'c'
       const pasteShortcut = ((event.ctrlKey || event.metaKey) && event.shiftKey && key === 'v')
@@ -2273,11 +2569,20 @@ function SSHTerminalPane({ active = true, sessionID }: { active?: boolean; sessi
         pasteClipboard()
         return false
       }
-      if ((event.ctrlKey || event.metaKey) && !event.altKey) {
-        event.preventDefault()
-      }
       return true
     })
+    const writeTerminalOutput = (output: string | Uint8Array) => {
+      if (disposed) {
+        return
+      }
+      if (typeof output === 'string' && output.length === 0) {
+        return
+      }
+      if (output instanceof Uint8Array && output.length === 0) {
+        return
+      }
+      term.write(output)
+    }
     const handleCopy = (event: ClipboardEvent) => {
       const selection = term.getSelection()
       if (!selection) {
@@ -2307,9 +2612,21 @@ function SSHTerminalPane({ active = true, sessionID }: { active?: boolean; sessi
     container.addEventListener('copy', handleCopy)
     container.addEventListener('paste', handlePaste)
     container.addEventListener('contextmenu', handleContextMenu)
+    const textarea = container.querySelector('.xterm-helper-textarea')
+    const handleFocus = () => recordDebug('frontend-focus', 'term-focus')
+    const handleBlur = () => recordDebug('frontend-blur', 'term-blur')
+    textarea?.addEventListener('focus', handleFocus)
+    textarea?.addEventListener('blur', handleBlur)
     const offOutput = EventsOn('ssh:output', (event: SSHOutputEvent) => {
       if (event?.session_id === sessionID) {
-        term.write(event.data)
+        if (event.data_base64) {
+          const output = bytesFromBase64(event.data_base64)
+          recordDebug('frontend-output', `bytes=${output.length}`)
+          writeTerminalOutput(output)
+          return
+        }
+        recordDebug('frontend-output', `text=${event.data?.length ?? 0}`)
+        writeTerminalOutput(event.data)
       }
     })
     const offClosed = EventsOn('ssh:closed', (event: SSHClosedEvent) => {
@@ -2317,13 +2634,16 @@ function SSHTerminalPane({ active = true, sessionID }: { active?: boolean; sessi
         term.writeln(`\r\n[连接已关闭${event.message ? `：${event.message}` : ''}]`)
       }
     })
+    const resizeDisposable = term.onResize(({ rows, cols }) => {
+      ResizeSSHSession(sessionID, rows, cols).catch(() => undefined)
+    })
     let resizeFrame = 0
     const resize = () => {
       if (!container.isConnected || container.clientWidth <= 0 || container.clientHeight <= 0) {
         return
       }
       fit.fit()
-      ResizeSSHSession(sessionID, term.rows, term.cols).catch(() => undefined)
+      recordDebug('frontend-resize', describeTerminalGeometry(container, term))
     }
     const scheduleResize = () => {
       window.cancelAnimationFrame(resizeFrame)
@@ -2335,7 +2655,13 @@ function SSHTerminalPane({ active = true, sessionID }: { active?: boolean; sessi
     window.setTimeout(scheduleResize, 0)
 
     return () => {
+      disposed = true
+      inputQueue = []
       dataDisposable.dispose()
+      binaryDisposable.dispose()
+      resizeDisposable.dispose()
+      textarea?.removeEventListener('focus', handleFocus)
+      textarea?.removeEventListener('blur', handleBlur)
       container.removeEventListener('copy', handleCopy)
       container.removeEventListener('paste', handlePaste)
       container.removeEventListener('contextmenu', handleContextMenu)
@@ -2612,6 +2938,10 @@ function toLogCsv(entries: main.LogEntry[]) {
 
 function csvCell(value: string) {
   return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
+}
+
+function createProxyTestBatchID() {
+  return `proxy-test-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 }
 
 function formatFileTimestamp(date: Date) {

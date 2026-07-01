@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.0"
+    [string]$Version = "2.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +10,9 @@ $ClientDir = Join-Path $RepoRoot "client"
 $FrontendDir = Join-Path $ClientDir "frontend"
 $BuildBin = Join-Path $ClientDir "build\bin"
 $PayloadDir = Join-Path $ClientDir "cmd\installer\payload"
+$InstallerManifest = Join-Path $ClientDir "cmd\installer\installer.exe.manifest"
+$InstallerIcon = Join-Path $ClientDir "build\windows\icon.ico"
+$InstallerSyso = Join-Path $ClientDir "cmd\installer\rsrc_windows_amd64.syso"
 $DistDir = Join-Path $RepoRoot "dist"
 $InstallerName = "SafeLink-Setup-$Version-windows-amd64.exe"
 $InstallerPath = Join-Path $DistDir $InstallerName
@@ -93,8 +96,10 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 Write-Host "Building Windows installer..."
 Push-Location $ClientDir
 try {
+    go run github.com/akavel/rsrc@v0.10.2 -manifest $InstallerManifest -ico $InstallerIcon -o $InstallerSyso
     go build -tags installer -ldflags "-w -s -H windowsgui -X main.appVersion=$Version" -o $InstallerPath .\cmd\installer
 } finally {
+    Remove-Item -LiteralPath $InstallerSyso -Force -ErrorAction SilentlyContinue
     Pop-Location
 }
 

@@ -1145,12 +1145,16 @@ func buildRemoteRuleSetDefinitions(ruleSets []string) []map[string]any {
 
 func buildInbound(tag, inboundType, addr string) map[string]any {
 	host, port := splitListenAddr(addr)
-	return map[string]any{
+	inbound := map[string]any{
 		"type":        inboundType,
 		"tag":         tag,
 		"listen":      host,
 		"listen_port": port,
 	}
+	if inboundType == "socks" {
+		inbound["udp"] = true
+	}
+	return inbound
 }
 
 func buildOutbound(node proxysubscription.ProxyNode) (map[string]any, error) {

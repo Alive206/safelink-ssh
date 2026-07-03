@@ -1,21 +1,23 @@
 module github.com/example/safelink/client
 
-go 1.23.0
+go 1.25.0
 
 require (
+	github.com/Jigsaw-Code/outline-go-tun2socks v1.1.0
 	github.com/example/safelink/pkg v0.0.0
 	github.com/getlantern/systray v1.2.2
 	github.com/quic-go/quic-go v0.48.2
 	github.com/things-go/go-socks5 v0.1.1
 	github.com/wailsapp/wails/v2 v2.9.1
-	golang.org/x/crypto v0.33.0
-	golang.org/x/sys v0.30.0
+	golang.org/x/crypto v0.53.0
+	golang.org/x/sys v0.46.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
 	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173
 )
 
 require (
 	github.com/bep/debounce v1.2.1 // indirect
+	github.com/eycorsican/go-tun2socks v1.14.2 // indirect
 	github.com/getlantern/context v0.0.0-20190109183933-c447772a6520 // indirect
 	github.com/getlantern/errors v0.0.0-20190325191628-abdb3e3e36f7 // indirect
 	github.com/getlantern/golog v0.0.0-20190830074920-4ef2e798c2d7 // indirect
@@ -50,11 +52,15 @@ require (
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	go.uber.org/mock v0.4.0 // indirect
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842 // indirect
-	golang.org/x/mod v0.17.0 // indirect
-	golang.org/x/net v0.35.0 // indirect
-	golang.org/x/text v0.22.0 // indirect
-	golang.org/x/tools v0.21.1-0.20240508182429-e35e4ccd0d2d // indirect
+	golang.org/x/mobile v0.0.0-20260611195102-4dd8f1dbf5d2 // indirect
+	golang.org/x/mod v0.37.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/sync v0.21.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/tools v0.46.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 replace github.com/example/safelink/pkg => ../pkg
+
+tool golang.org/x/mobile/cmd/gobind

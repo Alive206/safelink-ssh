@@ -1,9 +1,9 @@
 # SafeLink
 
-SafeLink is split into a Docker-friendly VPN server and a Windows desktop
-client. The server exposes a QUIC VPN gateway and subscription endpoint. The
-client imports VPN subscriptions, manages VPN connections, and also provides
-SSH tunnel forwarding as a separate feature area.
+SafeLink is split into a Docker-friendly VPN server, a Windows desktop client,
+and an Android client. The server exposes a QUIC VPN gateway and subscription
+endpoint. The clients import VPN/proxy subscriptions, manage VPN and proxy
+connections, and provide SSH tunnel forwarding as a separate feature area.
 
 ## Features
 
@@ -17,6 +17,10 @@ SSH tunnel forwarding as a separate feature area.
   (`-D`) forwarding are configured from a dedicated SSH tunnel page.
 - **Client SSH terminal**: open an interactive SSH PTY terminal, type commands
   in real time, and view remote output directly in the desktop client.
+- **Android client**: Flutter UI with encrypted local storage, subscription
+  import, proxy nodes, rule/global/direct proxy modes, local sing-box proxy,
+  Android `VpnService` global proxy through tun2socks, SafeLink VPN, SSH
+  tunnels, SSH terminal, logs, and settings.
 - **Shared protocol package**: `pkg/` contains tunnel config validation,
   QUIC/frame helpers, and subscription parsing/encoding.
 
@@ -25,6 +29,7 @@ SSH tunnel forwarding as a separate feature area.
 ```text
 server/              VPN server, web API, Docker deployment
 client/              Wails desktop client, frontend, SSH/VPN runtime
+android/             Flutter Android client and Android native services
 pkg/                 shared config, protocol, transport and subscription code
 scripts/             build helpers
 go.work              multi-module workspace
@@ -73,6 +78,43 @@ Build the Windows client:
 ```powershell
 .\scripts\build-client.bat
 ```
+
+Build the Android client APK:
+
+```powershell
+.\scripts\build-android.bat
+```
+
+The Android build creates a Flutter client under `android/`, compiles the Go
+mobile core as an arm64 AAR, and writes the internal test APK to
+`android\build\app\outputs\flutter-apk\app-release.apk`. By default the script
+expects Flutter at `D:\env\flutter` and the Android SDK at
+`D:\env\android-sdk`; pass `-FlutterRoot`, `-AndroidSdk`, or `-AndroidNdk` to
+`scripts\build-android.ps1` if your local paths differ.
+
+The Android APK is arm64-first. It bundles:
+
+- `mobilecore.aar`: gomobile bridge for subscription parsing, SSH sessions,
+  SSH tunnels, SafeLink VPN, and Android TUN-to-SOCKS control.
+- `libsing-box.so`: Android arm64 sing-box runtime used by local proxy and
+  proxy VPN modes.
+
+Use `-RebuildSingBox` on `scripts\build-android.ps1` to rebuild the bundled
+sing-box binary from source:
+
+```powershell
+.\scripts\build-android.ps1 -RebuildSingBox
+```
+
+Android proxy modes:
+
+- **本地代理** starts sing-box inside a foreground service and listens on
+  `127.0.0.1:10808` SOCKS and `127.0.0.1:10809` HTTP.
+- **全局 VPN** starts the same sing-box config, creates an Android
+  `VpnService` TUN, excludes SafeLink's own UID to avoid routing loops, and
+  forwards TUN packets to the local SOCKS listener through tun2socks.
+- **SafeLink VPN** passes the Android TUN fd into the Go QUIC VPN runtime and
+  uses the existing SafeLink server protocol.
 
 In the desktop UI:
 
@@ -128,6 +170,9 @@ cd pkg && go test ./...
 cd server && go test ./...
 cd client && go test ./...
 cd client/frontend && npm run build
+cd android && flutter analyze
+cd android && flutter test
+.\scripts\build-android.bat
 ```
 
 ## License

@@ -2,17 +2,26 @@ package com.safelink.ssh
 
 import android.content.Context
 import java.io.File
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.URL
 import java.util.concurrent.TimeUnit
+import org.json.JSONObject
 
 object SingBoxRuntime {
     private val lock = Any()
     private var process: Process? = null
     private var nodeName: String = ""
     private var mode: String = ""
+    private var clashAPIAddr: String = ""
     private var startedAt: Long = 0L
     private var lastError: String = ""
+    private var lastTrafficAt: Long = 0L
+    private var lastUploadTotal: Long = 0L
+    private var lastDownloadTotal: Long = 0L
+    private var uploadSpeed: Long = 0L
+    private var downloadSpeed: Long = 0L
 
     fun start(
         context: Context,
@@ -20,6 +29,7 @@ object SingBoxRuntime {
         node: String,
         proxyMode: String,
         socksAddr: String,
+        clashAddr: String,
     ): Map<String, Any?> {
         synchronized(lock) {
             stopLocked(emitEvent = false)
@@ -45,8 +55,14 @@ object SingBoxRuntime {
                 process = next
                 nodeName = node
                 mode = proxyMode
+                clashAPIAddr = clashAddr
                 startedAt = System.currentTimeMillis()
                 lastError = ""
+                lastTrafficAt = 0L
+                lastUploadTotal = 0L
+                lastDownloadTotal = 0L
+                uploadSpeed = 0L
+                downloadSpeed = 0L
 
                 pumpLogs(next)
                 monitor(next)
@@ -96,19 +112,58 @@ object SingBoxRuntime {
         }
         nodeName = ""
         mode = ""
+        clashAPIAddr = ""
         startedAt = 0L
+        lastTrafficAt = 0L
+        lastUploadTotal = 0L
+        lastDownloadTotal = 0L
+        uploadSpeed = 0L
+        downloadSpeed = 0L
         if (emitEvent) {
             EventBus.emit("proxy.status", statusLocked("stopped"))
         }
     }
 
-    private fun statusLocked(state: String): Map<String, Any?> = mapOf(
-        "state" to state,
-        "node" to nodeName,
-        "mode" to mode,
-        "started_at" to startedAt,
-        "last_error" to lastError,
-    )
+    private fun statusLocked(state: String): Map<String, Any?> {
+        val traffic = if (state == "running") queryTraffic() else null
+        return mapOf(
+            "state" to state,
+            "node" to nodeName,
+            "mode" to mode,
+            "started_at" to startedAt,
+            "last_error" to lastError,
+            "upload_total_bytes" to (traffic?.first ?: lastUploadTotal),
+            "download_total_bytes" to (traffic?.second ?: lastDownloadTotal),
+            "upload_speed_bps" to uploadSpeed,
+            "download_speed_bps" to downloadSpeed,
+        )
+    }
+
+    private fun queryTraffic(): Pair<Long, Long>? {
+        val addr = clashAPIAddr
+        if (addr.isBlank()) return null
+        return runCatching {
+            val conn = URL("http://$addr/connections").openConnection() as HttpURLConnection
+            conn.connectTimeout = 700
+            conn.readTimeout = 700
+            conn.requestMethod = "GET"
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            conn.disconnect()
+            val json = JSONObject(body)
+            val upload = json.optLong("uploadTotal", lastUploadTotal)
+            val download = json.optLong("downloadTotal", lastDownloadTotal)
+            val now = System.currentTimeMillis()
+            if (lastTrafficAt > 0L && now > lastTrafficAt) {
+                val elapsed = (now - lastTrafficAt).coerceAtLeast(1L) / 1000.0
+                uploadSpeed = ((upload - lastUploadTotal).coerceAtLeast(0L) / elapsed).toLong()
+                downloadSpeed = ((download - lastDownloadTotal).coerceAtLeast(0L) / elapsed).toLong()
+            }
+            lastTrafficAt = now
+            lastUploadTotal = upload
+            lastDownloadTotal = download
+            upload to download
+        }.getOrNull()
+    }
 
     private fun runCheck(binary: File, configFile: File, workDir: File) {
         val check = ProcessBuilder(binary.absolutePath, "check", "-c", configFile.absolutePath)

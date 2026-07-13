@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -118,6 +119,12 @@ func (c *Core) Call(method, payload string) string {
 		return c.buildProxyConfig(data)
 	case "defaultProxyRules":
 		return ok(map[string]any{"rules": config.DefaultProxyRules()})
+	case "testProxyNode":
+		return c.testProxyNode(data)
+	case "testProxyNodes":
+		return c.testProxyNodes(data)
+	case "speedTestProxyNode":
+		return c.speedTestProxyNode(data)
 	case "validateTunnel":
 		return c.validateTunnel(data)
 	case "createSSHSession":
@@ -209,6 +216,61 @@ func (c *Core) buildProxyConfig(data map[string]any) string {
 		return fail("build_proxy_config", err)
 	}
 	return ok(map[string]any{"config": string(cfg)})
+}
+
+func (c *Core) testProxyNode(data map[string]any) string {
+	var node proxysubscription.ProxyNode
+	if err := decodeField(data, "node", &node); err != nil {
+		return fail("bad_node", err)
+	}
+	result := proxycore.TestNode(context.Background(), node, c.proxyOptions(data), timeoutFromPayload(data, 8*time.Second))
+	return ok(map[string]any{"result": result})
+}
+
+func (c *Core) testProxyNodes(data map[string]any) string {
+	var nodes []proxysubscription.ProxyNode
+	if err := decodeField(data, "nodes", &nodes); err != nil {
+		return fail("bad_nodes", err)
+	}
+	results := proxycore.TestNodes(context.Background(), nodes, c.proxyOptions(data), timeoutFromPayload(data, 5*time.Second), nil)
+	return ok(map[string]any{"results": results})
+}
+
+func (c *Core) speedTestProxyNode(data map[string]any) string {
+	var node proxysubscription.ProxyNode
+	if err := decodeField(data, "node", &node); err != nil {
+		return fail("bad_node", err)
+	}
+	result := proxycore.SpeedTestNode(context.Background(), node, c.proxyOptions(data), timeoutFromPayload(data, 15*time.Second))
+	return ok(map[string]any{"result": result})
+}
+
+func (c *Core) proxyOptions(data map[string]any) proxycore.Options {
+	var rules []config.ProxyRule
+	if raw, ok := data["rules"]; ok {
+		_ = decodeValue(raw, &rules)
+	}
+	workDir := asString(data, "work_dir")
+	if workDir == "" {
+		workDir = filepath.Join(c.dataDir, "proxy-tests")
+	}
+	return proxycore.Options{
+		CorePath:      asString(data, "core_path"),
+		WorkDir:       workDir,
+		Mode:          asStringDefault(data, "mode", proxycore.ProxyModeRule),
+		SOCKSAddr:     asStringDefault(data, "socks_addr", "127.0.0.1:10808"),
+		HTTPAddr:      asStringDefault(data, "http_addr", "127.0.0.1:10809"),
+		ClashAPIAddr:  asString(data, "clash_api_addr"),
+		RuleModeRules: rules,
+	}
+}
+
+func timeoutFromPayload(data map[string]any, fallback time.Duration) time.Duration {
+	ms := asIntDefault(data, "timeout_ms", 0)
+	if ms <= 0 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func (c *Core) validateTunnel(data map[string]any) string {

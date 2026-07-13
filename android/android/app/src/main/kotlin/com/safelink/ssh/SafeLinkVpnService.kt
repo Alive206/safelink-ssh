@@ -34,6 +34,7 @@ class SafeLinkVpnService : VpnService() {
         val tunnelJson = intent?.getStringExtra(EXTRA_TUNNEL_JSON)
         val configJson = intent?.getStringExtra(EXTRA_CONFIG_JSON)
         val socksAddr = intent?.getStringExtra(EXTRA_SOCKS_ADDR) ?: DEFAULT_SOCKS_ADDR
+        val clashAPIAddr = intent?.getStringExtra(EXTRA_CLASH_API_ADDR) ?: DEFAULT_CLASH_API_ADDR
         currentKind = kind
 
         val notification = NotificationHelper.runtimeNotification(
@@ -66,7 +67,7 @@ class SafeLinkVpnService : VpnService() {
                 return
             }
             try {
-                SingBoxRuntime.start(this, configJson, sessionName, "vpn", socksAddr)
+                SingBoxRuntime.start(this, configJson, sessionName, "vpn", socksAddr, clashAPIAddr)
             } catch (error: Throwable) {
                 EventBus.emit(
                     "vpn.status",
@@ -172,7 +173,9 @@ class SafeLinkVpnService : VpnService() {
         private const val EXTRA_TUNNEL_JSON = "tunnel_json"
         private const val EXTRA_CONFIG_JSON = "config_json"
         private const val EXTRA_SOCKS_ADDR = "socks_addr"
+        private const val EXTRA_CLASH_API_ADDR = "clash_api_addr"
         private const val DEFAULT_SOCKS_ADDR = "127.0.0.1:10808"
+        private const val DEFAULT_CLASH_API_ADDR = "127.0.0.1:10810"
 
         fun start(
             context: Context,
@@ -183,6 +186,7 @@ class SafeLinkVpnService : VpnService() {
             tunnelJson: String? = null,
             configJson: String? = null,
             socksAddr: String = DEFAULT_SOCKS_ADDR,
+            clashAPIAddr: String = DEFAULT_CLASH_API_ADDR,
         ) {
             val intent = Intent(context, SafeLinkVpnService::class.java)
                 .putExtra(EXTRA_KIND, kind)
@@ -192,6 +196,7 @@ class SafeLinkVpnService : VpnService() {
                 .putExtra(EXTRA_TUNNEL_JSON, tunnelJson)
                 .putExtra(EXTRA_CONFIG_JSON, configJson)
                 .putExtra(EXTRA_SOCKS_ADDR, socksAddr)
+                .putExtra(EXTRA_CLASH_API_ADDR, clashAPIAddr)
             ContextCompat.startForegroundService(context, intent)
         }
 

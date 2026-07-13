@@ -504,6 +504,147 @@ func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Option
 	return result
 }
 
+func SpeedTestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Options, timeout time.Duration) TestResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := TestResult{
+		NodeName: node.Name,
+		TestedAt: time.Now().Format(time.RFC3339),
+	}
+	if node.Server == "" || node.Port <= 0 {
+		result.Error = "proxy node has invalid server or port"
+		return result
+	}
+	if timeout <= 0 {
+		timeout = 12 * time.Second
+	}
+	opts = normalizeOptions(opts)
+	if opts.CorePath == "" {
+		opts.CorePath = FindCorePath("")
+	}
+	if opts.CorePath == "" {
+		result.Error = "sing-box executable not found"
+		return result
+	}
+	if err := os.MkdirAll(opts.WorkDir, 0o755); err != nil {
+		result.Error = fmt.Sprintf("create proxy work dir: %v", err)
+		return result
+	}
+
+	testCtx, cancel := context.WithTimeout(ctx, timeout+3*time.Second)
+	defer cancel()
+
+	httpAddr, err := freeLoopbackAddr()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	socksAddr, err := freeLoopbackAddr()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	clashAPIAddr, err := freeLoopbackAddr()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	testDir, err := os.MkdirTemp(opts.WorkDir, "speed-test-*")
+	if err != nil {
+		result.Error = fmt.Sprintf("create speed test work dir: %v", err)
+		return result
+	}
+	defer func() { _ = os.RemoveAll(testDir) }()
+
+	cfg, err := BuildConfig(node, Options{
+		CorePath:      opts.CorePath,
+		WorkDir:       testDir,
+		Mode:          opts.Mode,
+		SOCKSAddr:     socksAddr,
+		HTTPAddr:      httpAddr,
+		ClashAPIAddr:  clashAPIAddr,
+		RuleModeRules: opts.RuleModeRules,
+	})
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	configPath := filepath.Join(testDir, "sing-box-speed-test.json")
+	if err := os.WriteFile(configPath, cfg, 0o600); err != nil {
+		result.Error = fmt.Sprintf("write speed test config: %v", err)
+		return result
+	}
+	if err := checkCoreConfig(testCtx, opts.CorePath, configPath, testDir); err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	runCtx, stopCore := context.WithCancel(testCtx)
+	defer stopCore()
+	var coreOutput bytes.Buffer
+	cmd := exec.CommandContext(runCtx, opts.CorePath, "run", "-c", configPath)
+	cmd.Dir = testDir
+	cmd.Stdout = &coreOutput
+	cmd.Stderr = &coreOutput
+	hideCommandWindow(cmd)
+	if err := cmd.Start(); err != nil {
+		result.Error = fmt.Sprintf("start sing-box: %v", err)
+		return result
+	}
+	done := make(chan error, 1)
+	readyDone := make(chan struct{})
+	go func() {
+		done <- cmd.Wait()
+		close(readyDone)
+	}()
+	defer func() {
+		stopCore()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-done
+		}
+	}()
+
+	if err := waitForLocalTCPWithDone(testCtx, httpAddr, readyDone, "sing-box speed test inbound"); err != nil {
+		output := strings.TrimSpace(coreOutput.String())
+		if output != "" {
+			result.Error = fmt.Sprintf("%v: %s", err, output)
+		} else {
+			result.Error = err.Error()
+		}
+		return result
+	}
+
+	dialTimeout := timeout
+	if dialTimeout <= 0 || dialTimeout > 3*time.Second {
+		dialTimeout = 3 * time.Second
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: httpAddr}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyURL(proxyURL),
+		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		TLSHandshakeTimeout:   dialTimeout,
+		ResponseHeaderTimeout: timeout,
+	}
+	defer transport.CloseIdleConnections()
+	speed, err := testDownloadSpeedThroughProxy(testCtx, &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	})
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.OK = true
+	result.SpeedMbps = speed
+	return result
+}
+
 type batchTestOutbound struct {
 	index    int
 	tag      string
@@ -1145,16 +1286,12 @@ func buildRemoteRuleSetDefinitions(ruleSets []string) []map[string]any {
 
 func buildInbound(tag, inboundType, addr string) map[string]any {
 	host, port := splitListenAddr(addr)
-	inbound := map[string]any{
+	return map[string]any{
 		"type":        inboundType,
 		"tag":         tag,
 		"listen":      host,
 		"listen_port": port,
 	}
-	if inboundType == "socks" {
-		inbound["udp"] = true
-	}
-	return inbound
 }
 
 func buildOutbound(node proxysubscription.ProxyNode) (map[string]any, error) {

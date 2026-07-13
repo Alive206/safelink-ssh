@@ -40,3 +40,47 @@ func TestCoreBuildsProxyConfig(t *testing.T) {
 		t.Fatalf("Call(buildProxyConfig) = %s", got)
 	}
 }
+
+func TestCoreProxyTestMethodsReturnStructuredFailures(t *testing.T) {
+	core := NewCore(t.TempDir())
+	payload := `{"node":{"name":"bad","protocol":"ss","server":"","port":0}}`
+	for _, method := range []string{"testProxyNode", "speedTestProxyNode"} {
+		got := core.Call(method, payload)
+		var resp struct {
+			OK   bool `json:"ok"`
+			Data struct {
+				Result struct {
+					OK    bool   `json:"ok"`
+					Error string `json:"error"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(got), &resp); err != nil {
+			t.Fatalf("%s response is not JSON: %v", method, err)
+		}
+		if !resp.OK || resp.Data.Result.OK || resp.Data.Result.Error == "" {
+			t.Fatalf("%s = %s", method, got)
+		}
+	}
+}
+
+func TestCoreBatchProxyTestMethodDecodesNodes(t *testing.T) {
+	core := NewCore(t.TempDir())
+	payload := `{"nodes":[{"name":"bad","protocol":"ss","server":"","port":0}]}`
+	got := core.Call("testProxyNodes", payload)
+	var resp struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Results []struct {
+				OK    bool   `json:"ok"`
+				Error string `json:"error"`
+			} `json:"results"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(got), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || len(resp.Data.Results) != 1 || resp.Data.Results[0].OK || resp.Data.Results[0].Error == "" {
+		t.Fatalf("Call(testProxyNodes) = %s", got)
+	}
+}

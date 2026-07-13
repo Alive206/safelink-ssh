@@ -37,6 +37,7 @@ class LocalProxyService : Service() {
                 intent.getStringExtra(EXTRA_NODE_NAME) ?: "proxy",
                 intent.getStringExtra(EXTRA_MODE) ?: "rule",
                 intent.getStringExtra(EXTRA_SOCKS_ADDR) ?: DEFAULT_SOCKS_ADDR,
+                intent.getStringExtra(EXTRA_CLASH_API_ADDR) ?: DEFAULT_CLASH_API_ADDR,
             )
         } catch (error: Throwable) {
             EventBus.emit(
@@ -60,7 +61,9 @@ class LocalProxyService : Service() {
         private const val EXTRA_NODE_NAME = "node_name"
         private const val EXTRA_MODE = "mode"
         private const val EXTRA_SOCKS_ADDR = "socks_addr"
+        private const val EXTRA_CLASH_API_ADDR = "clash_api_addr"
         private const val DEFAULT_SOCKS_ADDR = "127.0.0.1:10808"
+        private const val DEFAULT_CLASH_API_ADDR = "127.0.0.1:10810"
 
         fun start(
             context: Context,
@@ -68,12 +71,14 @@ class LocalProxyService : Service() {
             nodeName: String,
             mode: String,
             socksAddr: String = DEFAULT_SOCKS_ADDR,
+            clashAPIAddr: String = DEFAULT_CLASH_API_ADDR,
         ) {
             val intent = Intent(context, LocalProxyService::class.java)
                 .putExtra(EXTRA_CONFIG_JSON, configJson)
                 .putExtra(EXTRA_NODE_NAME, nodeName)
                 .putExtra(EXTRA_MODE, mode)
                 .putExtra(EXTRA_SOCKS_ADDR, socksAddr)
+                .putExtra(EXTRA_CLASH_API_ADDR, clashAPIAddr)
             ContextCompat.startForegroundService(context, intent)
         }
 

@@ -3,6 +3,7 @@ package com.safelink.ssh
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import java.io.File
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -32,6 +33,7 @@ class MainActivity : FlutterActivity() {
                             args["tunnelJson"] as? String,
                             args["configJson"] as? String,
                             args["socksAddr"] as? String ?: "127.0.0.1:10808",
+                            args["clashApiAddr"] as? String ?: "127.0.0.1:10810",
                         )
                         result.success(mapOf("state" to "starting"))
                     }
@@ -52,6 +54,7 @@ class MainActivity : FlutterActivity() {
                             args["node"] as? String ?: "proxy",
                             args["mode"] as? String ?: "rule",
                             args["socksAddr"] as? String ?: "127.0.0.1:10808",
+                            args["clashApiAddr"] as? String ?: "127.0.0.1:10810",
                         )
                         result.success(mapOf("state" to "starting"))
                     }
@@ -82,6 +85,10 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
                     "getDeviceInfo" -> result.success(deviceInfo())
+                    "shareApp" -> {
+                        shareApp()
+                        result.success(mapOf("shared" to true))
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -95,7 +102,7 @@ class MainActivity : FlutterActivity() {
                             result.error("bad_request", "core call requires method", null)
                         } else {
                             try {
-                                result.success(core.call(method, payload))
+                                result.success(core.call(method, enrichCorePayload(payload)))
                             } catch (error: Throwable) {
                                 result.error("core_error", error.message, null)
                             }
@@ -147,6 +154,26 @@ class MainActivity : FlutterActivity() {
         "manufacturer" to Build.MANUFACTURER,
         "arch" to Build.SUPPORTED_ABIS.firstOrNull(),
     )
+
+    private fun enrichCorePayload(payload: String): String {
+        val trimmed = payload.ifBlank { "{}" }
+        val json = org.json.JSONObject(trimmed)
+        if (!json.has("core_path")) {
+            json.put("core_path", File(applicationInfo.nativeLibraryDir, "libsing-box.so").absolutePath)
+        }
+        if (!json.has("work_dir")) {
+            json.put("work_dir", File(filesDir, "proxy-tests").absolutePath)
+        }
+        return json.toString()
+    }
+
+    private fun shareApp() {
+        val intent = Intent(Intent.ACTION_SEND)
+            .setType("text/plain")
+            .putExtra(Intent.EXTRA_SUBJECT, "SafeLink")
+            .putExtra(Intent.EXTRA_TEXT, "SafeLink")
+        startActivity(Intent.createChooser(intent, "分享 SafeLink"))
+    }
 
     private fun stringList(value: Any?, fallback: List<String>): ArrayList<String> {
         val items = (value as? List<*>)?.mapNotNull { it as? String } ?: fallback

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,16 @@ import (
 	"github.com/example/safelink/pkg/proxysubscription"
 	"github.com/example/safelink/pkg/subscription"
 )
+
+// Usage is the Clash-compatible subscription-userinfo metadata returned by a provider.
+type Usage struct {
+	Upload   uint64
+	Download uint64
+	Total    uint64
+	Expire   int64
+}
+
+const subscriptionUserAgent = "ClashVerge/2.4.1"
 
 type Result struct {
 	Source   store.SubscriptionSource
@@ -35,18 +46,18 @@ func Import(ctx context.Context, mgr *manager.Manager, st *store.Store, name, ur
 		return Result{}, fmt.Errorf("subscription URL is required")
 	}
 
-	data, err := FetchRaw(ctx, url)
+	data, usage, err := FetchWithUsage(ctx, url)
 	if err != nil {
 		return Result{}, err
 	}
 
 	tunnels, detected, err := subscription.Parse(data, subscription.FormatAuto)
 	if err == nil {
-		return importVPNTunnels(mgr, st, name, url, tunnels, detected)
+		return importVPNTunnels(mgr, st, name, url, tunnels, detected, usage)
 	}
 	nodes, proxyDetected, proxyErr := proxysubscription.Parse(data, proxysubscription.FormatAuto)
 	if proxyErr == nil {
-		return importProxyNodes(st, name, url, nodes, proxyDetected)
+		return importProxyNodes(st, name, url, nodes, proxyDetected, usage)
 	}
 	return Result{}, fmt.Errorf("parse subscription: %v; parse proxy subscription: %w", err, proxyErr)
 }
@@ -111,7 +122,7 @@ func Update(ctx context.Context, mgr *manager.Manager, st *store.Store, id, name
 	return Result{}, fmt.Errorf("subscription %q not found", id)
 }
 
-func importVPNTunnels(mgr *manager.Manager, st *store.Store, name, url string, tunnels []config.TunnelCfg, detected string) (Result, error) {
+func importVPNTunnels(mgr *manager.Manager, st *store.Store, name, url string, tunnels []config.TunnelCfg, detected string, usage Usage) (Result, error) {
 	imported, skipped, errs := mgr.BulkUpsert(tunnels, Prefix(name))
 
 	src := store.SubscriptionSource{
@@ -124,6 +135,7 @@ func importVPNTunnels(mgr *manager.Manager, st *store.Store, name, url string, t
 		LastRefresh: time.Now().Format(time.RFC3339),
 		LastError:   strings.Join(errs, "; "),
 		TunnelCount: imported,
+		UsageUpload: usage.Upload, UsageDownload: usage.Download, UsageTotal: usage.Total, UsageExpire: usage.Expire,
 	}
 	if err := st.AddSubscription(src); err != nil {
 		return Result{}, err
@@ -134,14 +146,19 @@ func importVPNTunnels(mgr *manager.Manager, st *store.Store, name, url string, t
 	return Result{Source: src, Kind: store.SubscriptionKindVPN, Imported: imported, Skipped: skipped, Errors: errs}, nil
 }
 
-func importProxyNodes(st *store.Store, name, url string, nodes []proxysubscription.ProxyNode, detected string) (Result, error) {
+func importProxyNodes(st *store.Store, name, url string, nodes []proxysubscription.ProxyNode, detected string, usage Usage) (Result, error) {
 	sourceID := store.NewID()
 	prefix := Prefix(name)
+	filtered := nodes[:0]
 	for i := range nodes {
+		if proxysubscription.IsInformationalNodeName(nodes[i].Name) {
+			continue
+		}
 		nodes[i].Name = prefix + nodes[i].Name
 		nodes[i].SubscriptionID = sourceID
+		filtered = append(filtered, nodes[i])
 	}
-	imported, skipped, errs := st.UpsertProxyNodes(nodes)
+	imported, skipped, errs := st.UpsertProxyNodes(filtered)
 	src := store.SubscriptionSource{
 		ID:          sourceID,
 		Name:        name,
@@ -152,6 +169,7 @@ func importProxyNodes(st *store.Store, name, url string, nodes []proxysubscripti
 		LastRefresh: time.Now().Format(time.RFC3339),
 		LastError:   strings.Join(errs, "; "),
 		NodeCount:   imported,
+		UsageUpload: usage.Upload, UsageDownload: usage.Download, UsageTotal: usage.Total, UsageExpire: usage.Expire,
 	}
 	if err := st.AddSubscription(src); err != nil {
 		return Result{}, err
@@ -163,7 +181,7 @@ func importProxyNodes(st *store.Store, name, url string, nodes []proxysubscripti
 }
 
 func refreshSource(ctx context.Context, mgr *manager.Manager, st *store.Store, src store.SubscriptionSource) (Result, error) {
-	data, err := FetchRaw(ctx, src.URL)
+	data, usage, err := FetchWithUsage(ctx, src.URL)
 	if err != nil {
 		src.LastRefresh = time.Now().Format(time.RFC3339)
 		src.LastError = err.Error()
@@ -173,11 +191,11 @@ func refreshSource(ctx context.Context, mgr *manager.Manager, st *store.Store, s
 
 	tunnels, detected, err := subscription.Parse(data, subscription.FormatAuto)
 	if err == nil {
-		return refreshVPNTunnels(mgr, st, src, tunnels, detected)
+		return refreshVPNTunnels(mgr, st, src, tunnels, detected, usage)
 	}
 	nodes, proxyDetected, proxyErr := proxysubscription.Parse(data, proxysubscription.FormatAuto)
 	if proxyErr == nil {
-		return refreshProxyNodes(st, src, nodes, proxyDetected)
+		return refreshProxyNodes(st, src, nodes, proxyDetected, usage)
 	}
 	parseErr := fmt.Errorf("parse subscription: %v; parse proxy subscription: %w", err, proxyErr)
 	src.LastRefresh = time.Now().Format(time.RFC3339)
@@ -186,7 +204,7 @@ func refreshSource(ctx context.Context, mgr *manager.Manager, st *store.Store, s
 	return Result{}, parseErr
 }
 
-func refreshVPNTunnels(mgr *manager.Manager, st *store.Store, src store.SubscriptionSource, tunnels []config.TunnelCfg, detected string) (Result, error) {
+func refreshVPNTunnels(mgr *manager.Manager, st *store.Store, src store.SubscriptionSource, tunnels []config.TunnelCfg, detected string, usage Usage) (Result, error) {
 	imported, skipped, errs := mgr.BulkUpsert(tunnels, Prefix(src.Name))
 	src.Format = detected
 	src.Kind = store.SubscriptionKindVPN
@@ -194,6 +212,7 @@ func refreshVPNTunnels(mgr *manager.Manager, st *store.Store, src store.Subscrip
 	src.LastError = strings.Join(errs, "; ")
 	src.TunnelCount = imported
 	src.NodeCount = 0
+	src.UsageUpload, src.UsageDownload, src.UsageTotal, src.UsageExpire = usage.Upload, usage.Download, usage.Total, usage.Expire
 	if err := st.UpdateSubscription(src); err != nil {
 		return Result{}, err
 	}
@@ -203,22 +222,39 @@ func refreshVPNTunnels(mgr *manager.Manager, st *store.Store, src store.Subscrip
 	return Result{Source: src, Kind: store.SubscriptionKindVPN, Imported: imported, Skipped: skipped, Errors: errs}, nil
 }
 
-func refreshProxyNodes(st *store.Store, src store.SubscriptionSource, nodes []proxysubscription.ProxyNode, detected string) (Result, error) {
+func refreshProxyNodes(st *store.Store, src store.SubscriptionSource, nodes []proxysubscription.ProxyNode, detected string, usage Usage) (Result, error) {
+	existing, err := st.LoadProxyNodes()
+	if err != nil {
+		return Result{}, err
+	}
+	existingIDs := make(map[string]string)
+	for _, node := range existing {
+		if node.SubscriptionID == src.ID {
+			existingIDs[node.Name] = node.ID
+		}
+	}
 	if err := st.DeleteProxyNodesBySubscriptionID(src.ID); err != nil {
 		return Result{}, err
 	}
 	prefix := Prefix(src.Name)
+	filtered := nodes[:0]
 	for i := range nodes {
+		if proxysubscription.IsInformationalNodeName(nodes[i].Name) {
+			continue
+		}
 		nodes[i].Name = prefix + nodes[i].Name
 		nodes[i].SubscriptionID = src.ID
+		nodes[i].ID = existingIDs[nodes[i].Name]
+		filtered = append(filtered, nodes[i])
 	}
-	imported, skipped, errs := st.UpsertProxyNodes(nodes)
+	imported, skipped, errs := st.UpsertProxyNodes(filtered)
 	src.Format = detected
 	src.Kind = store.SubscriptionKindProxy
 	src.LastRefresh = time.Now().Format(time.RFC3339)
 	src.LastError = strings.Join(errs, "; ")
 	src.TunnelCount = 0
 	src.NodeCount = imported
+	src.UsageUpload, src.UsageDownload, src.UsageTotal, src.UsageExpire = usage.Upload, usage.Download, usage.Total, usage.Expire
 	if err := st.UpdateSubscription(src); err != nil {
 		return Result{}, err
 	}
@@ -252,27 +288,59 @@ func Fetch(ctx context.Context, url, format string) ([]config.TunnelCfg, string,
 }
 
 func FetchRaw(ctx context.Context, url string) ([]byte, error) {
+	data, _, err := FetchWithUsage(ctx, url)
+	return data, err
+}
+
+func FetchWithUsage(ctx context.Context, url string) ([]byte, Usage, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create subscription request: %w", err)
+		return nil, Usage{}, fmt.Errorf("create subscription request: %w", err)
 	}
+	// Some subscription providers only expose Clash-compatible usage metadata to known clients.
+	req.Header.Set("User-Agent", subscriptionUserAgent)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch subscription: %w", err)
+		return nil, Usage{}, fmt.Errorf("fetch subscription: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("fetch subscription: HTTP %d", resp.StatusCode)
+		return nil, Usage{}, fmt.Errorf("fetch subscription: HTTP %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read subscription: %w", err)
+		return nil, Usage{}, fmt.Errorf("read subscription: %w", err)
 	}
-	return data, nil
+	return data, parseUsage(resp.Header.Get("subscription-userinfo")), nil
+}
+
+func parseUsage(raw string) Usage {
+	var usage Usage
+	for _, field := range strings.Split(raw, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "upload":
+			usage.Upload = n
+		case "download":
+			usage.Download = n
+		case "total":
+			usage.Total = n
+		case "expire":
+			usage.Expire = int64(n)
+		}
+	}
+	return usage
 }
 
 func Prefix(name string) string {

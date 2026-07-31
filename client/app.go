@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -371,7 +370,7 @@ func (a *App) GetLaunchOptions() LaunchOptions {
 	return a.launch
 }
 
-// OpenSSHConnectionWindow launches a new app window focused on one SSH connection.
+// OpenSSHConnectionWindow focuses the existing app and asks it to open the connection in a tab.
 func (a *App) OpenSSHConnectionWindow(id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -391,17 +390,9 @@ func (a *App) OpenSSHConnectionWindow(id string) error {
 	if !found {
 		return fmt.Errorf("ssh connection %q not found", id)
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command(exe, "--ssh-connection-id="+id)
-	cmd.Dir = filepath.Dir(exe)
-	if err := cmd.Start(); err != nil {
-		a.recordLog("error", "SSH 终端", fmt.Sprintf("新建窗口：%s", id), err)
-		return err
-	}
-	a.recordLog("info", "SSH 终端", fmt.Sprintf("新建窗口：%s", id), nil)
+	a.showMainWindow()
+	wailsruntime.EventsEmit(a.ctx, "ssh:open-request", id)
+	a.recordLog("info", "SSH 终端", fmt.Sprintf("在主窗口打开：%s", id), nil)
 	return nil
 }
 
@@ -640,6 +631,11 @@ func (a *App) StartProxyNode(nodeName string) error {
 			}
 			err := a.proxy.Start(a.ctx, node)
 			if err == nil {
+				settings.SelectedProxyNodeID = node.ID
+				settings.SelectedProxySubscriptionID = node.SubscriptionID
+				if saveErr := a.store.SaveSettings(settings); saveErr != nil {
+					return saveErr
+				}
 				if proxyErr := a.enableSystemProxy(&settings); proxyErr != nil {
 					_ = a.proxy.Stop()
 					err = proxyErr
@@ -652,6 +648,30 @@ func (a *App) StartProxyNode(nodeName string) error {
 	err = fmt.Errorf("proxy node %q not found", nodeName)
 	a.recordLog("error", "节点", fmt.Sprintf("切换节点：%s", nodeName), err)
 	return err
+}
+
+// SetSelectedProxyNode persists the user's node selection without connecting it.
+func (a *App) SetSelectedProxyNode(nodeID string) error {
+	nodeID = strings.TrimSpace(nodeID)
+	settings, err := a.store.LoadSettings()
+	if err != nil {
+		return err
+	}
+	if nodeID == "" {
+		settings.SelectedProxyNodeID, settings.SelectedProxySubscriptionID = "", ""
+		return a.store.SaveSettings(settings)
+	}
+	nodes, err := a.store.LoadActiveProxyNodes()
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if node.ID == nodeID {
+			settings.SelectedProxyNodeID, settings.SelectedProxySubscriptionID = node.ID, node.SubscriptionID
+			return a.store.SaveSettings(settings)
+		}
+	}
+	return fmt.Errorf("proxy node %q not found", nodeID)
 }
 
 // TestProxyNode measures HTTP latency through a selected proxy node.
@@ -986,7 +1006,7 @@ func parseLaunchOptions(args []string) LaunchOptions {
 
 // GetVersion returns the application version.
 func (a *App) GetVersion() string {
-	return "2.0.0"
+	return "3.0.0"
 }
 
 // GetDataDir returns the data directory path.

@@ -74,6 +74,39 @@ func TestSettingsMigrationAddsRuleSetsOnce(t *testing.T) {
 	}
 }
 
+func TestLoadActiveProxyNodesDoesNotTreatSubscriptionPrefixAsInformation(t *testing.T) {
+	st := store.New(t.TempDir())
+	src := store.SubscriptionSource{ID: "sub-traffic", Name: "流量订阅", Kind: store.SubscriptionKindProxy, Enabled: true}
+	if err := st.SaveSubscriptions([]store.SubscriptionSource{src}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveProxyNodes([]proxysubscription.ProxyNode{{Name: "subscription-node", Protocol: proxysubscription.ProtocolShadowsocks, Server: "node.example.com", Port: 8388, Method: "aes-128-gcm", Password: "secret", SubscriptionID: src.ID}}); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := st.LoadActiveProxyNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %+v, want one normal node", nodes)
+	}
+}
+
+func TestSettingsPersistSelectedProxyNode(t *testing.T) {
+	st := store.New(t.TempDir())
+	want := store.ClientSettings{SelectedProxyNodeID: "node-1", SelectedProxySubscriptionID: "sub-1"}
+	if err := st.SaveSettings(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SelectedProxyNodeID != want.SelectedProxyNodeID || got.SelectedProxySubscriptionID != want.SelectedProxySubscriptionID {
+		t.Fatalf("selected node = %q/%q, want %q/%q", got.SelectedProxyNodeID, got.SelectedProxySubscriptionID, want.SelectedProxyNodeID, want.SelectedProxySubscriptionID)
+	}
+}
+
 func hasRuleSet(rules []config.ProxyRule, value string) bool {
 	for _, rule := range rules {
 		if rule.Type == config.ProxyRuleTypeRuleSet && rule.Value == value {

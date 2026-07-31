@@ -158,6 +158,10 @@ export function SetProxyRules(arg1) {
   return window['go']['main']['App']['SetProxyRules'](arg1);
 }
 
+export function SetSelectedProxyNode(arg1) {
+  return window['go']['main']['App']['SetSelectedProxyNode'](arg1);
+}
+
 export function SetSystemProxyEnabled(arg1) {
   return window['go']['main']['App']['SetSystemProxyEnabled'](arg1);
 }

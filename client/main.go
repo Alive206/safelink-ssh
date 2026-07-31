@@ -22,6 +22,11 @@ var assets embed.FS
 var trayIcon []byte
 
 func main() {
+	releaseInstance, primary := acquireSingleInstance()
+	if !primary {
+		return
+	}
+	defer releaseInstance()
 	app := NewApp()
 	stopSignals := watchProcessSignals(app)
 	defer stopSignals()

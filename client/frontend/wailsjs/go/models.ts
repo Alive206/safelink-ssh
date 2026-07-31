@@ -429,6 +429,8 @@ export namespace store {
 	    minimize_to_tray: boolean;
 	    rule_mode_rules: config.ProxyRule[];
 	    rule_mode_rules_version: number;
+	    selected_proxy_node_id?: string;
+	    selected_proxy_subscription_id?: string;
 
 	    static createFrom(source: any = {}) {
 	        return new ClientSettings(source);
@@ -444,6 +446,8 @@ export namespace store {
 	        this.minimize_to_tray = source["minimize_to_tray"];
 	        this.rule_mode_rules = source["rule_mode_rules"] ? source["rule_mode_rules"].map((item: any) => new config.ProxyRule(item)) : [];
 	        this.rule_mode_rules_version = source["rule_mode_rules_version"];
+	        this.selected_proxy_node_id = source["selected_proxy_node_id"];
+	        this.selected_proxy_subscription_id = source["selected_proxy_subscription_id"];
 	    }
 	}
 	export class SSHConnection {
@@ -479,6 +483,10 @@ export namespace store {
 	    last_error?: string;
 	    tunnel_count: number;
 	    node_count?: number;
+	    usage_upload?: number;
+	    usage_download?: number;
+	    usage_total?: number;
+	    usage_expire?: number;
 
 	    static createFrom(source: any = {}) {
 	        return new SubscriptionSource(source);
@@ -498,6 +506,10 @@ export namespace store {
 	        this.last_error = source["last_error"];
 	        this.tunnel_count = source["tunnel_count"];
 	        this.node_count = source["node_count"];
+	        this.usage_upload = source["usage_upload"];
+	        this.usage_download = source["usage_download"];
+	        this.usage_total = source["usage_total"];
+	        this.usage_expire = source["usage_expire"];
 	    }
 	}
 

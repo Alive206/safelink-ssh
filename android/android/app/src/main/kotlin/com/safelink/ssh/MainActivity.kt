@@ -13,7 +13,7 @@ import mobilecore.Mobilecore
 class MainActivity : FlutterActivity() {
     private var pendingVpnPrepare: MethodChannel.Result? = null
     private lateinit var secureStore: SecureJsonStore
-    private val core by lazy { Mobilecore.newCore(filesDir.absolutePath) }
+    private val core by lazy { CoreHolder.get(this) }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -85,10 +85,6 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
                     "getDeviceInfo" -> result.success(deviceInfo())
-                    "shareApp" -> {
-                        shareApp()
-                        result.success(mapOf("shared" to true))
-                    }
                     else -> result.notImplemented()
                 }
             }
@@ -165,14 +161,6 @@ class MainActivity : FlutterActivity() {
             json.put("work_dir", File(filesDir, "proxy-tests").absolutePath)
         }
         return json.toString()
-    }
-
-    private fun shareApp() {
-        val intent = Intent(Intent.ACTION_SEND)
-            .setType("text/plain")
-            .putExtra(Intent.EXTRA_SUBJECT, "SafeLink")
-            .putExtra(Intent.EXTRA_TEXT, "SafeLink")
-        startActivity(Intent.createChooser(intent, "分享 SafeLink"))
     }
 
     private fun stringList(value: Any?, fallback: List<String>): ArrayList<String> {

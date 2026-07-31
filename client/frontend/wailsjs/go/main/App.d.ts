@@ -87,6 +87,8 @@ export function SetProxyMode(arg1:string):Promise<void>;
 
 export function SetProxyRules(arg1:Array<config.ProxyRule>):Promise<void>;
 
+export function SetSelectedProxyNode(arg1:string):Promise<void>;
+
 export function SetSystemProxyEnabled(arg1:boolean):Promise<void>;
 
 export function StartProxyNode(arg1:string):Promise<void>;

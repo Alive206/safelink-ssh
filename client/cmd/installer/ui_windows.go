@@ -195,7 +195,7 @@ func showInstallOptions(defaults installOptions) (installOptions, bool, error) {
 	}
 
 	width := int32(680)
-	height := int32(420)
+	height := int32(470)
 	x := (int32(systemMetric(smCXScreen)) - width) / 2
 	y := (int32(systemMetric(smCYScreen)) - height) / 2
 	if x < 0 {
@@ -208,7 +208,7 @@ func showInstallOptions(defaults installOptions) (installOptions, bool, error) {
 	hwnd, err := createWindowEx(
 		0,
 		className,
-		"SafeLink 安装程序",
+		"安装 - SafeLink",
 		wsOverlapped|wsCaption|wsSysMenu|wsMinimizeBox,
 		x,
 		y,
@@ -302,19 +302,21 @@ func (s *installDialogState) createControls(hwnd uintptr) {
 	s.headingFont = createUIFont(-18, fwSemiBold)
 	s.captionFont = createUIFont(-14, fwRegular)
 
-	createLabel(hwnd, appName, 36, 26, 240, 38, s.titleFont)
-	createLabel(hwnd, "安装向导", 38, 66, 180, 22, s.captionFont)
-	createSeparator(hwnd, 0, 104, 664)
+	createLabel(hwnd, "选择安装位置", 34, 22, 300, 30, s.headingFont)
+	createLabel(hwnd, "请选择 SafeLink 的安装目录。", 36, 56, 360, 20, s.captionFont)
+	createSeparator(hwnd, 0, 88, 664)
 
-	createLabel(hwnd, "安装位置", 40, 134, 160, 24, s.headingFont)
-	createLabel(hwnd, "选择 SafeLink 的安装目录", 40, 162, 260, 20, s.captionFont)
+	createLabel(hwnd, "安装文件夹", 36, 116, 160, 24, s.headingFont)
+	createLabel(hwnd, "Setup 将把 SafeLink 安装到以下文件夹。", 36, 148, 420, 20, s.captionFont)
 
-	s.installEdit = createControl("EDIT", s.defaults.InstallDir, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, 40, 194, 480, 30, hwnd, idInstallDirEdit)
+	s.installEdit = createControl("EDIT", s.defaults.InstallDir, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, 36, 180, 484, 30, hwnd, idInstallDirEdit)
 	setControlFont(s.installEdit, s.bodyFont)
-	browseButton := createControl("BUTTON", "浏览...", wsChild|wsVisible|wsTabStop|bsPushButton, 536, 193, 96, 32, hwnd, idBrowseButton)
+	browseButton := createControl("BUTTON", "浏览...", wsChild|wsVisible|wsTabStop|bsPushButton, 536, 179, 96, 32, hwnd, idBrowseButton)
 	setControlFont(browseButton, s.bodyFont)
 
-	s.desktopCheck = createControl("BUTTON", "创建桌面快捷方式", wsChild|wsVisible|wsTabStop|bsAutoCheckBox, 40, 244, 220, 24, hwnd, idDesktopCheck)
+	createLabel(hwnd, "附加任务", 36, 236, 160, 24, s.headingFont)
+	createLabel(hwnd, "选择安装时需要执行的附加任务。", 36, 266, 360, 20, s.captionFont)
+	s.desktopCheck = createControl("BUTTON", "创建桌面快捷方式", wsChild|wsVisible|wsTabStop|bsAutoCheckBox, 40, 296, 220, 24, hwnd, idDesktopCheck)
 	setControlFont(s.desktopCheck, s.bodyFont)
 	if s.defaults.CreateDesktopShortcut {
 		sendMessage(s.desktopCheck, bmSetCheck, bstChecked, 0)
@@ -322,9 +324,9 @@ func (s *installDialogState) createControls(hwnd uintptr) {
 		sendMessage(s.desktopCheck, bmSetCheck, bstUnchecked, 0)
 	}
 
-	createSeparator(hwnd, 0, 300, 664)
-	installButton := createControl("BUTTON", "立即安装", wsChild|wsVisible|wsTabStop|bsDefPushButton, 424, 330, 104, 34, hwnd, idInstallButton)
-	cancelButton := createControl("BUTTON", "取消", wsChild|wsVisible|wsTabStop|bsPushButton, 540, 330, 92, 34, hwnd, idCancelButton)
+	createSeparator(hwnd, 0, 350, 664)
+	installButton := createControl("BUTTON", "下一步 >", wsChild|wsVisible|wsTabStop|bsDefPushButton, 424, 380, 104, 34, hwnd, idInstallButton)
+	cancelButton := createControl("BUTTON", "取消", wsChild|wsVisible|wsTabStop|bsPushButton, 540, 380, 92, 34, hwnd, idCancelButton)
 	setControlFont(installButton, s.bodyFont)
 	setControlFont(cancelButton, s.bodyFont)
 	procSetFocus.Call(s.installEdit)

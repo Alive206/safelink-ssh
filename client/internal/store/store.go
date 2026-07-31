@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/example/safelink/pkg/config"
@@ -25,18 +26,22 @@ const (
 
 // SubscriptionSource represents a remote subscription URL.
 type SubscriptionSource struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	URL         string `json:"url"`
-	Format      string `json:"format"`
-	Kind        string `json:"kind,omitempty"`
-	Enabled     bool   `json:"enabled"`
-	AutoRefresh bool   `json:"auto_refresh"`
-	IntervalMin int    `json:"interval_min"`
-	LastRefresh string `json:"last_refresh,omitempty"`
-	LastError   string `json:"last_error,omitempty"`
-	TunnelCount int    `json:"tunnel_count"`
-	NodeCount   int    `json:"node_count,omitempty"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	URL           string `json:"url"`
+	Format        string `json:"format"`
+	Kind          string `json:"kind,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	AutoRefresh   bool   `json:"auto_refresh"`
+	IntervalMin   int    `json:"interval_min"`
+	LastRefresh   string `json:"last_refresh,omitempty"`
+	LastError     string `json:"last_error,omitempty"`
+	TunnelCount   int    `json:"tunnel_count"`
+	NodeCount     int    `json:"node_count,omitempty"`
+	UsageUpload   uint64 `json:"usage_upload,omitempty"`
+	UsageDownload uint64 `json:"usage_download,omitempty"`
+	UsageTotal    uint64 `json:"usage_total,omitempty"`
+	UsageExpire   int64  `json:"usage_expire,omitempty"`
 }
 
 // SSHConnection is a saved account/password SSH connection profile.
@@ -50,14 +55,16 @@ type SSHConnection struct {
 
 // ClientSettings stores local app preferences that affect proxy startup.
 type ClientSettings struct {
-	ProxyMode            string             `json:"proxy_mode"`
-	SystemProxy          bool               `json:"system_proxy"`
-	AutoStart            bool               `json:"auto_start"`
-	BypassLAN            bool               `json:"bypass_lan"`
-	AutoConnect          bool               `json:"auto_connect"`
-	MinimizeToTray       bool               `json:"minimize_to_tray"`
-	RuleModeRules        []config.ProxyRule `json:"rule_mode_rules"`
-	RuleModeRulesVersion int                `json:"rule_mode_rules_version,omitempty"`
+	ProxyMode                   string             `json:"proxy_mode"`
+	SystemProxy                 bool               `json:"system_proxy"`
+	AutoStart                   bool               `json:"auto_start"`
+	BypassLAN                   bool               `json:"bypass_lan"`
+	AutoConnect                 bool               `json:"auto_connect"`
+	MinimizeToTray              bool               `json:"minimize_to_tray"`
+	RuleModeRules               []config.ProxyRule `json:"rule_mode_rules"`
+	RuleModeRulesVersion        int                `json:"rule_mode_rules_version,omitempty"`
+	SelectedProxyNodeID         string             `json:"selected_proxy_node_id,omitempty"`
+	SelectedProxySubscriptionID string             `json:"selected_proxy_subscription_id,omitempty"`
 }
 
 // Store persists tunnels and subscriptions to JSON files.
@@ -208,10 +215,10 @@ func (s *Store) LoadActiveProxyNodes() ([]proxysubscription.ProxyNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	activeSubscriptions := make(map[string]struct{}, len(sources))
+	activeSubscriptions := make(map[string]string, len(sources))
 	for _, src := range sources {
 		if src.Kind == SubscriptionKindProxy && src.Enabled {
-			activeSubscriptions[src.ID] = struct{}{}
+			activeSubscriptions[src.ID] = subscriptionPrefix(src.Name)
 		}
 	}
 	if len(activeSubscriptions) == 0 {
@@ -223,10 +230,10 @@ func (s *Store) LoadActiveProxyNodes() ([]proxysubscription.ProxyNode, error) {
 	}
 	active := make([]proxysubscription.ProxyNode, 0, len(nodes))
 	for _, node := range nodes {
-		if proxysubscription.IsInformationalNodeName(node.Name) {
-			continue
-		}
-		if _, ok := activeSubscriptions[node.SubscriptionID]; ok {
+		if prefix, ok := activeSubscriptions[node.SubscriptionID]; ok {
+			if proxysubscription.IsInformationalNodeName(strings.TrimPrefix(node.Name, prefix)) {
+				continue
+			}
 			active = append(active, node)
 		}
 	}
@@ -234,6 +241,23 @@ func (s *Store) LoadActiveProxyNodes() ([]proxysubscription.ProxyNode, error) {
 		return proxyNodeProtocolRank(active[i].Protocol) < proxyNodeProtocolRank(active[j].Protocol)
 	})
 	return active, nil
+}
+
+func subscriptionPrefix(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	prefix := strings.Trim(b.String(), "-")
+	if prefix == "" {
+		prefix = "subscription"
+	}
+	return prefix + "-"
 }
 
 // SaveProxyNodes writes proxy nodes atomically.

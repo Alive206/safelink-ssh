@@ -31,6 +31,7 @@ import {
   SetAutoStartEnabled,
   SetProxyMode,
   SetProxyRules,
+	  SetSelectedProxyNode,
   SetSystemProxyEnabled,
   StartProxyNode,
   StartTunnel,
@@ -217,6 +218,8 @@ const defaultClientSettings: store.ClientSettings = {
   bypass_lan: false,
   auto_connect: false,
   minimize_to_tray: false,
+	  selected_proxy_node_id: '',
+	  selected_proxy_subscription_id: '',
   rule_mode_rules: defaultRouteRules,
   rule_mode_rules_version: 1,
 } as store.ClientSettings
@@ -312,7 +315,7 @@ const sshAddrPlaceholder = '例如：159.75.35.104:22'
 
 function App() {
   const [activeNav, setActiveNav] = useState<NavKey>('home')
-  const [version, setVersion] = useState('2.0.0')
+  const [version, setVersion] = useState('3.0.0')
   const [machineInfo, setMachineInfo] = useState<MachineInfo>(() => browserMachineInfo())
   const [tunnels, setTunnels] = useState<manager.Status[]>([])
   const [subscriptions, setSubscriptions] = useState<store.SubscriptionSource[]>([])
@@ -348,10 +351,11 @@ function App() {
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const routeRulesDirtyRef = useRef(false)
+  const silentSubscriptionRefreshRef = useRef(false)
 
   const backendReady = isBackendReady()
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (reportError = true) => {
     if (!isBackendReady()) {
       return
     }
@@ -368,7 +372,7 @@ function App() {
         GetMachineInfo(),
         GetLogs(),
       ])
-      setVersion(nextVersion || '2.0.0')
+      setVersion(nextVersion || '3.0.0')
       setTunnels(nextTunnels ?? [])
       setSubscriptions(nextSubscriptions ?? [])
       setProxyNodes(nextProxyNodes ?? [])
@@ -383,7 +387,9 @@ function App() {
       setLogs(nextLogs ?? [])
       setError('')
     } catch (err) {
-      setError(errorMessage(err))
+      if (reportError) {
+        setError(errorMessage(err))
+      }
     }
   }, [])
 
@@ -471,6 +477,15 @@ function App() {
   const tunnelRows = useMemo(() => sshTunnels.map(toTunnelRow), [sshTunnels])
   const sshRows = useMemo(() => sshConnections.map(toSSHRow), [sshConnections])
   const filteredSSHRows = useMemo(() => filterSSHRows(sshRows, terminalConnectionSearch), [sshRows, terminalConnectionSearch])
+
+  useEffect(() => {
+    if (!backendReady || !SSH_TERMINAL_ENABLED) return
+    const offOpen = EventsOn('ssh:open-request', (connectionID: string) => {
+      const row = sshRows.find((item) => item.source?.id === connectionID)
+      if (row) void openTerminal(row)
+    })
+    return () => offOpen()
+  }, [backendReady, sshRows])
   const activeTerminalTab = useMemo(() => {
     if (!activeTerminalTabID) {
       return terminalTabs[0]
@@ -483,6 +498,15 @@ function App() {
       setSelectedNodeID('')
       return
     }
+    const rememberedID = clientSettings.selected_proxy_node_id
+    if (rememberedID) {
+      const remembered = nodes.find((node) => node.id === rememberedID)
+      if (remembered) {
+        if (selectedNodeID !== remembered.id) setSelectedNodeID(remembered.id)
+        return
+      }
+      if (backendReady) void SetSelectedProxyNode('').catch(() => undefined)
+    }
     const runningID = nodes.find((node) => node.name === proxyStatus?.node_name)?.id
     if (runningID && !selectedNodeID) {
       setSelectedNodeID(runningID)
@@ -491,7 +515,7 @@ function App() {
     if (!selectedNodeID || !nodes.some((node) => node.id === selectedNodeID)) {
       setSelectedNodeID(nodes[0].id)
     }
-  }, [nodes, proxyStatus?.node_name, selectedNodeID])
+  }, [backendReady, clientSettings.selected_proxy_node_id, nodes, proxyStatus?.node_name, selectedNodeID])
 
   useEffect(() => {
     if (tunnelRows.length === 0) {
@@ -558,8 +582,15 @@ function App() {
   const connectedSince = proxyStatus?.started_at ? formatClockDuration(proxyStatus.started_at) : '00:00:00'
   const testingNodes = testingNodeNames.size > 0
   const filteredLogs = useMemo(() => filterLogs(logs, logLevelFilter, logRangeFilter, logSearch), [logs, logLevelFilter, logRangeFilter, logSearch])
+  const subscriptionUsage = useMemo(() => {
+    const items = subscriptions.filter((item) => (item.usage_total ?? 0) > 0)
+    const total = items.reduce((sum, item) => sum + (item.usage_total ?? 0), 0)
+    const used = items.reduce((sum, item) => sum + (item.usage_upload ?? 0) + (item.usage_download ?? 0), 0)
+    const expiries = items.map((item) => item.usage_expire ?? 0).filter((value) => value > 0)
+    return { total, used, remaining: Math.max(0, total - used), expiry: expiries.length ? Math.min(...expiries) : 0 }
+  }, [subscriptions])
 
-  async function runAction(label: string, action: () => Promise<unknown>) {
+  async function runAction(label: string, action: () => Promise<unknown>, showSuccess = true) {
     if (!backendReady) {
       setNotice('当前为前端预览模式')
       window.setTimeout(() => setNotice(''), 1800)
@@ -572,8 +603,10 @@ function App() {
     try {
       await action()
       await refresh()
-      setNotice(`${label}成功`)
-      window.setTimeout(() => setNotice(''), 1800)
+      if (showSuccess) {
+        setNotice(`${label}成功`)
+        window.setTimeout(() => setNotice(''), 1800)
+      }
     } catch (err) {
       setError(errorMessage(err))
     } finally {
@@ -589,6 +622,7 @@ function App() {
       return
     }
     setSelectedNodeID(node.id)
+    if (backendReady) await SetSelectedProxyNode(node.id)
     const alreadyActive = connected && proxyStatus?.node_name === node.name && clientSettings.system_proxy
     if (alreadyActive || busy) {
       return
@@ -834,8 +868,31 @@ function App() {
     await runAction('刷新订阅', () => RefreshSubscription(item.id))
   }
 
-  async function refreshAllSubs() {
-    await runAction('刷新全部订阅', () => RefreshAllSubscriptions())
+  async function refreshAllSubs(showSuccess = true) {
+    await runAction('刷新全部订阅', () => RefreshAllSubscriptions(), showSuccess)
+  }
+
+  async function refreshAllSubsSilently() {
+    if (!backendReady || subscriptions.length === 0 || silentSubscriptionRefreshRef.current) {
+      return
+    }
+
+    silentSubscriptionRefreshRef.current = true
+    try {
+      await RefreshAllSubscriptions()
+      await refresh(false)
+    } catch {
+      // Navigation-triggered refreshes should never interrupt the user with a toast.
+    } finally {
+      silentSubscriptionRefreshRef.current = false
+    }
+  }
+
+  async function selectNav(key: NavKey) {
+    setActiveNav(key)
+    if (key === 'home' || key === 'subscriptions') {
+      await refreshAllSubsSilently()
+    }
   }
 
   async function toggleSub(item: store.SubscriptionSource) {
@@ -1082,7 +1139,7 @@ function App() {
             <button
               className={`nav-item ${activeNav === item.key ? 'active' : ''} ${item.key === 'settings' ? 'with-divider' : ''}`}
               key={item.key}
-              onClick={() => setActiveNav(item.key)}
+              onClick={() => void selectNav(item.key)}
               type="button"
             >
               <Icon name={item.icon} />
@@ -1164,7 +1221,15 @@ function App() {
         </section>
 
         <section className="card home-node-section">
-          <PanelTitle title="节点概览" action={<button className="small-outline" onClick={() => setActiveNav('nodes')} type="button">查看全部节点</button>} />
+          <PanelTitle
+            title="节点概览"
+            action={<div className="home-node-actions">
+              <span className="home-usage" title={subscriptionUsage.total > 0 ? `已用 ${formatSubscriptionBytes(subscriptionUsage.used)}，剩余 ${formatSubscriptionBytes(subscriptionUsage.remaining)}${subscriptionUsage.expiry ? `，到期 ${formatUsageExpiry(subscriptionUsage.expiry)}` : ''}` : '订阅服务商未提供用量信息'}>
+                {subscriptionUsage.total > 0 ? <>用量：{formatSubscriptionBytes(subscriptionUsage.used)} / {formatSubscriptionBytes(subscriptionUsage.total)} · 剩余 {formatSubscriptionBytes(subscriptionUsage.remaining)}{subscriptionUsage.expiry ? ` · 到期 ${formatUsageExpiry(subscriptionUsage.expiry)}` : ''}</> : '用量：服务商未提供'}
+              </span>
+              <button className="small-outline" onClick={() => setActiveNav('nodes')} type="button">查看全部节点</button>
+            </div>}
+          />
           {renderHomeNodeCards()}
         </section>
 
@@ -1366,7 +1431,7 @@ function App() {
   function renderSubscriptionsPage() {
     return (
       <section className="page-card subscriptions-page">
-        <PageHeader title="订阅" actions={<><button className="small-outline" onClick={() => openSubscriptionForm()} type="button">＋ 添加订阅</button><button className="small-outline" disabled={Boolean(busy) || subscriptions.length === 0} onClick={refreshAllSubs} type="button">↻ 更新所有</button><span className="subscription-summary">已启用 {subscriptions.filter((item) => item.enabled).length}/{subscriptions.length}</span></>} />
+        <PageHeader title="订阅" actions={<><button className="small-outline" onClick={() => openSubscriptionForm()} type="button">＋ 添加订阅</button><button className="small-outline" disabled={Boolean(busy) || subscriptions.length === 0} onClick={() => void refreshAllSubs()} type="button">↻ 更新所有</button><span className="subscription-summary">已启用 {subscriptions.filter((item) => item.enabled).length}/{subscriptions.length}</span></>} />
         <div className="subscription-list">
           {subscriptions.map((item) => (
             <div className="subscription-card" key={item.id}>
@@ -1380,6 +1445,11 @@ function App() {
                 <InfoPair label="节点总数" value={item.node_count ?? item.tunnel_count ?? 0} />
                 <InfoPair label="展示节点" value={item.enabled ? item.node_count ?? item.tunnel_count ?? 0 : 0} />
                 <InfoPair label="自动刷新" value={item.auto_refresh ? '开启' : '关闭'} highlight={item.auto_refresh} />
+                {item.usage_total ? <>
+                  <InfoPair label="套餐已用" value={`${formatSubscriptionBytes((item.usage_upload ?? 0) + (item.usage_download ?? 0))} / ${formatSubscriptionBytes(item.usage_total)}`} />
+                  <InfoPair label="套餐剩余" value={formatSubscriptionBytes(Math.max(0, item.usage_total - (item.usage_upload ?? 0) - (item.usage_download ?? 0)))} />
+                  <InfoPair label="到期时间" value={formatUsageExpiry(item.usage_expire)} />
+                </> : <InfoPair label="套餐用量" value="服务商未提供" faded />}
               </div>
               <div className="subscription-actions">
                 <button className={`big-switch ${item.enabled ? 'on' : ''}`} disabled={Boolean(busy)} onClick={() => toggleSub(item)} title={item.enabled ? '停用订阅' : '启用订阅'} type="button"><i /></button>
@@ -2888,6 +2958,24 @@ function formatDateTime(value: string) {
 
 function formatOptionalDate(value?: string) {
   return value ? formatDateTime(value) : '-'
+}
+
+// Subscription providers conventionally label binary (1024-based) units as GB.
+// Keep two decimals here so the value matches common Clash provider dashboards.
+function formatSubscriptionBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return '0.00 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let size = value
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024
+    unit += 1
+  }
+  return `${size.toFixed(2)} ${units[unit]}`
+}
+
+function formatUsageExpiry(value?: number) {
+  return value && value > 0 ? formatDateTime(new Date(value * 1000).toISOString()) : '未提供'
 }
 
 function filterLogs(entries: main.LogEntry[], level: LogLevelFilter, range: LogRangeFilter, search: string) {

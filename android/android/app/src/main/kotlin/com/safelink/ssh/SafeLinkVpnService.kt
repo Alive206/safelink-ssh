@@ -5,13 +5,12 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import androidx.core.content.ContextCompat
-import mobilecore.Mobilecore
 import org.json.JSONObject
 
 class SafeLinkVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var currentKind: String = ""
-    private val core by lazy { Mobilecore.newCore(filesDir.absolutePath) }
+    private val core by lazy { CoreHolder.get(this) }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -120,6 +119,15 @@ class SafeLinkVpnService : VpnService() {
                 .put("fd", fd)
                 .put("tunnel", JSONObject(tunnelJson))
             val response = core.call("startVPNFromFD", payload.toString())
+            val responseJson = JSONObject(response)
+            if (!responseJson.optBoolean("ok")) {
+                EventBus.emit(
+                    "vpn.status",
+                    mapOf("state" to "error", "kind" to kind, "message" to responseJson.optString("message")),
+                )
+                stopSelf()
+                return
+            }
             EventBus.emit(
                 "vpn.status",
                 mapOf("state" to "starting", "kind" to kind, "session" to sessionName, "core" to response),

@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 void main() {
   runApp(const SafeLinkApp());
@@ -35,33 +36,86 @@ class _SafeLinkAppState extends State<SafeLinkApp> {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xff0f766e),
-      brightness: Brightness.light,
-    );
-    return MaterialApp(
-      title: 'SafeLink',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: scheme,
-        useMaterial3: true,
-        cardTheme: const CardThemeData(
-          elevation: 0,
-          margin: EdgeInsets.zero,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(8)),
-          ),
-        ),
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.all(Radius.circular(8)),
-          ),
-        ),
-      ),
-      home: SafeLinkShell(controller: controller),
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        return MaterialApp(
+          title: 'SafeLink',
+          debugShowCheckedModeBanner: false,
+          themeMode: switch (controller.themeMode) {
+            'light' => ThemeMode.light,
+            'dark' => ThemeMode.dark,
+            _ => ThemeMode.system,
+          },
+          theme: buildAppTheme(Brightness.light),
+          darkTheme: buildAppTheme(Brightness.dark),
+          home: SafeLinkShell(controller: controller),
+        );
+      },
     );
   }
 }
+
+ThemeData buildAppTheme(Brightness brightness) {
+  final scheme = ColorScheme.fromSeed(
+    seedColor: const Color(0xff4a7dbd),
+    brightness: brightness,
+  );
+  return ThemeData(
+    colorScheme: scheme,
+    useMaterial3: true,
+    scaffoldBackgroundColor: brightness == Brightness.light
+        ? const Color(0xfff2f3f7)
+        : scheme.surface,
+    appBarTheme: AppBarTheme(
+      backgroundColor: brightness == Brightness.light
+          ? const Color(0xff3d6db4)
+          : const Color(0xff2f4d70),
+      foregroundColor: Colors.white,
+      elevation: 0,
+      centerTitle: true,
+    ),
+    cardTheme: const CardThemeData(
+      elevation: 0,
+      margin: EdgeInsets.zero,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.all(Radius.circular(8)),
+      ),
+    ),
+    inputDecorationTheme: const InputDecorationTheme(
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.all(Radius.circular(8)),
+      ),
+    ),
+  );
+}
+
+bool isDarkMode(BuildContext context) =>
+    Theme.of(context).brightness == Brightness.dark;
+
+Color primaryTextColor(BuildContext context) => isDarkMode(context)
+    ? Theme.of(context).colorScheme.onSurface
+    : const Color(0xff26324a);
+
+Color secondaryTextColor(BuildContext context) => isDarkMode(context)
+    ? Theme.of(context).colorScheme.onSurfaceVariant
+    : const Color(0xff6b7280);
+
+Color softCardColor(BuildContext context) => isDarkMode(context)
+    ? Theme.of(context).colorScheme.surfaceContainer
+    : Colors.white;
+
+Color chipBackgroundColor(BuildContext context) => isDarkMode(context)
+    ? Theme.of(context).colorScheme.surfaceContainerHighest
+    : const Color(0xfff2f5fa);
+
+Color subtleBorderColor(BuildContext context) => isDarkMode(context)
+    ? Theme.of(context).colorScheme.outlineVariant
+    : const Color(0xffdbe4f0);
+
+Color activeRowColor(BuildContext context) => isDarkMode(context)
+    ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.35)
+    : const Color(0xffeef5ff);
 
 class NativeBridge {
   static const _native = MethodChannel('safelink/native');
@@ -108,6 +162,15 @@ class NativeBridge {
     }
   }
 
+  Future<String> coreVersion() async {
+    try {
+      final version = await _core.invokeMethod<String>('version');
+      return (version == null || version.isEmpty) ? '未知' : version;
+    } on MissingPluginException {
+      return '未知';
+    }
+  }
+
   Future<Map<String, dynamic>?> coreCall(
     String method, [
     Map<String, Object?> payload = const {},
@@ -130,12 +193,10 @@ class NativeBridge {
 class AppController extends ChangeNotifier {
   AppController(this.native) {
     _eventSub = native.events.listen(_handleNativeEvent, onError: (_) {});
-    _sshPoll = Timer.periodic(const Duration(milliseconds: 500), (_) {
-      _pollSSHEvents();
-    });
     _runtimePoll = Timer.periodic(const Duration(seconds: 2), (_) {
       _pollRuntimeStatus();
     });
+    _loadAboutInfo();
   }
 
   static const _proxySocksAddr = '127.0.0.1:10808';
@@ -145,9 +206,7 @@ class AppController extends ChangeNotifier {
   static const _settingsVersion = 2;
   final NativeBridge native;
   StreamSubscription<Map<String, dynamic>>? _eventSub;
-  Timer? _sshPoll;
   Timer? _runtimePoll;
-  bool _pollingSSH = false;
   bool _pollingRuntime = false;
 
   bool loaded = false;
@@ -155,7 +214,10 @@ class AppController extends ChangeNotifier {
   bool allowInsecureSubscriptionCerts = true;
   int selectedIndex = 0;
   String nodeFilter = 'all';
+  String nodeSort = 'default';
+  String themeMode = 'system';
   String proxyMode = 'rule';
+  String selectedNodeId = '';
   RuntimeSession? activeSession;
   int uploadSpeedBps = 0;
   int downloadSpeedBps = 0;
@@ -164,10 +226,11 @@ class AppController extends ChangeNotifier {
   final subscriptions = <SubscriptionSource>[];
   final proxyNodes = <ProxyNode>[];
   final tunnels = <TunnelConfig>[];
-  final sshConnections = <SshConnection>[];
   final routeRules = <ProxyRule>[];
   final logs = <LogEntry>[];
-  final terminalTabs = <TerminalTab>[];
+  final collapsedSubscriptions = <String>{};
+  String coreVersionText = '获取中…';
+  String deviceInfoText = '获取中…';
 
   String get proxyModeLabel => switch (proxyMode) {
     'global' => '全局模式',
@@ -182,10 +245,27 @@ class AppController extends ChangeNotifier {
         final data = jsonDecode(raw) as Map<String, dynamic>;
         proxyMode = data['proxy_mode'] as String? ?? 'rule';
         nodeFilter = data['node_filter'] as String? ?? 'all';
+        nodeSort = switch (data['node_sort'] as String? ?? 'default') {
+          'latency' => 'latency',
+          'speed' => 'speed',
+          _ => 'default',
+        };
+        themeMode = switch (data['theme_mode'] as String? ?? 'system') {
+          'light' => 'light',
+          'dark' => 'dark',
+          _ => 'system',
+        };
         final settingsVersion = data['settings_version'] as int? ?? 0;
         allowInsecureSubscriptionCerts = settingsVersion < _settingsVersion
             ? true
             : data['allow_insecure_subscription_certs'] as bool? ?? true;
+        selectedNodeId = data['selected_node_id'] as String? ?? '';
+        collapsedSubscriptions
+          ..clear()
+          ..addAll(
+            (data['collapsed_subscriptions'] as List? ?? const [])
+                .whereType<String>(),
+          );
         subscriptions
           ..clear()
           ..addAll(
@@ -197,9 +277,6 @@ class AppController extends ChangeNotifier {
         tunnels
           ..clear()
           ..addAll(_list(data['tunnels']).map(TunnelConfig.fromJson));
-        sshConnections
-          ..clear()
-          ..addAll(_list(data['ssh_connections']).map(SshConnection.fromJson));
         routeRules
           ..clear()
           ..addAll(
@@ -224,6 +301,7 @@ class AppController extends ChangeNotifier {
     }
     loaded = true;
     notifyListeners();
+    await _restoreActiveSession();
   }
 
   Future<void> save() async {
@@ -231,11 +309,14 @@ class AppController extends ChangeNotifier {
       'settings_version': _settingsVersion,
       'proxy_mode': proxyMode,
       'node_filter': nodeFilter,
+      'node_sort': nodeSort,
+      'theme_mode': themeMode,
+      'selected_node_id': selectedNodeId,
+      'collapsed_subscriptions': collapsedSubscriptions.toList(),
       'allow_insecure_subscription_certs': allowInsecureSubscriptionCerts,
       'subscriptions': subscriptions.map((item) => item.toJson()).toList(),
       'proxy_nodes': proxyNodes.map((item) => item.toJson()).toList(),
       'tunnels': tunnels.map((item) => item.toJson()).toList(),
-      'ssh_connections': sshConnections.map((item) => item.toJson()).toList(),
       'rule_mode_rules': routeRules.map((item) => item.toJson()).toList(),
       'rule_mode_rules_version': ProxyRule.currentVersion,
       'logs': logs.take(200).map((item) => item.toJson()).toList(),
@@ -253,14 +334,40 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> setNodeSort(String value) async {
+    nodeSort = value;
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> setThemeMode(String value) async {
+    themeMode = value;
+    _log('info', '外观切换为 ${themeModeLabel(value)}');
+    // 先刷新 UI 再持久化，避免主题切换被存储调用阻塞
+    notifyListeners();
+    await save();
+  }
+
+  static String themeModeLabel(String value) => switch (value) {
+    'light' => '浅色',
+    'dark' => '深色',
+    _ => '跟随系统',
+  };
+
   List<ProxyNode> get visibleProxyNodes {
     final nodes = switch (nodeFilter) {
       'favorite' => proxyNodes.where((item) => item.favorite).toList(),
-      'auto' => List<ProxyNode>.from(
-        proxyNodes,
-      )..sort((a, b) => a.latencySortValue.compareTo(b.latencySortValue)),
       _ => List<ProxyNode>.from(proxyNodes),
     };
+    final order = nodeFilter == 'auto' ? 'latency' : nodeSort;
+    switch (order) {
+      case 'latency':
+        nodes.sort((a, b) => a.latencySortValue.compareTo(b.latencySortValue));
+      case 'speed':
+        nodes.sort(
+          (a, b) => (b.speedMbps ?? -1).compareTo(a.speedMbps ?? -1),
+        );
+    }
     return nodes;
   }
 
@@ -273,12 +380,54 @@ class AppController extends ChangeNotifier {
     return null;
   }
 
-  Future<void> importSubscription(String name, String url) async {
+  ProxyNode? get selectedNode {
+    for (final node in proxyNodes) {
+      if (node.id == selectedNodeId) return node;
+    }
+    return proxyNodes.firstOrNull;
+  }
+
+  List<ProxyNode> nodesOfSubscription(SubscriptionSource source) =>
+      proxyNodes.where((item) => item.subscriptionId == source.id).toList();
+
+  Future<void> selectNode(ProxyNode node) async {
+    selectedNodeId = node.id;
+    notifyListeners();
+    await save();
+  }
+
+  void toggleSubscriptionCollapsed(String id) {
+    if (!collapsedSubscriptions.add(id)) {
+      collapsedSubscriptions.remove(id);
+    }
+    notifyListeners();
+  }
+
+  Future<void> toggleConnection(BuildContext context) async {
+    if (activeSession != null) {
+      await stopRuntime();
+      return;
+    }
+    final node = selectedNode;
+    if (node == null) {
+      _log('warn', '请先添加订阅并选择节点');
+      notifyListeners();
+      return;
+    }
+    await startProxyNode(context, node, vpnMode: true);
+  }
+
+  Future<void> importSubscription(String url) async {
     await _run('导入订阅', () async {
+      final trimmedUrl = url.trim();
+      if (trimmedUrl.isEmpty) {
+        throw const FormatException('请填写订阅 URL');
+      }
       final source = SubscriptionSource(
         id: _id(),
-        name: name.trim(),
-        url: url.trim(),
+        // 先用域名占位，下载成功后由订阅内容里的名称覆盖
+        name: Uri.tryParse(trimmedUrl)?.host ?? '新订阅',
+        url: trimmedUrl,
         enabled: true,
         lastRefresh: DateTime.now(),
       );
@@ -287,17 +436,104 @@ class AppController extends ChangeNotifier {
     });
   }
 
+  Future<void> importScannedText(String text) async {
+    final content = text.trim();
+    if (content.isEmpty) {
+      _log('warn', '二维码内容为空，无法导入');
+      notifyListeners();
+      return;
+    }
+    final uri = Uri.tryParse(content);
+    if (uri != null && (uri.isScheme('http') || uri.isScheme('https'))) {
+      await importSubscription(content);
+      return;
+    }
+    await _run('扫码导入', () async {
+      // 兼容整体 base64 编码的订阅内容
+      var body = content;
+      if (!content.contains('://') &&
+          !content.startsWith('{') &&
+          !content.startsWith('[')) {
+        try {
+          body = utf8.decode(base64Decode(content));
+        } catch (_) {}
+      }
+      final source = SubscriptionSource(
+        id: _id(),
+        name: '扫码导入',
+        url: '',
+        enabled: false,
+        lastRefresh: DateTime.now(),
+      );
+      final parsed = await native.coreCall('parseSubscription', {'body': body});
+      final imported = parsed != null && parsed['ok'] == true
+          ? _importCoreSubscription(source, parsed['data'])
+          : _parseSubscription(source, body);
+      if (imported <= 0) {
+        throw const FormatException('二维码内容不是有效的订阅或节点');
+      }
+      subscriptions.add(source);
+      _log('info', '扫码导入 $imported 项');
+      await save();
+    });
+  }
+
+  Future<void> _restoreActiveSession() async {
+    try {
+      final vpnResp = await native.coreCall('vpnStatus');
+      if (vpnResp != null && vpnResp['ok'] == true) {
+        final data = Map<String, dynamic>.from(vpnResp['data'] as Map? ?? {});
+        final state = data['state'] as String? ?? '';
+        if (state == 'running' ||
+            state == 'connecting' ||
+            state == 'reconnecting') {
+          activeSession = RuntimeSession(
+            kind: data['kind'] as String? ?? 'safelink-vpn',
+            name: data['name'] as String? ?? 'SafeLink VPN',
+            startedAt:
+                DateTime.tryParse(data['started_at'] as String? ?? '') ??
+                DateTime.now(),
+          );
+          _log('info', '检测到正在运行的 ${activeSession!.kindLabel}，已同步状态');
+          notifyListeners();
+          return;
+        }
+      }
+      final proxy = await native.call('proxyStatus');
+      if (proxy['state'] == 'running') {
+        final startedMs = _int(proxy['started_at']);
+        activeSession = RuntimeSession(
+          kind: 'local-proxy',
+          name: proxy['node'] as String? ?? '本地代理',
+          startedAt: startedMs > 0
+              ? DateTime.fromMillisecondsSinceEpoch(startedMs)
+              : DateTime.now(),
+        );
+        _log('info', '检测到正在运行的本地代理，已同步状态');
+        notifyListeners();
+      }
+    } catch (error) {
+      _log('warn', '同步运行状态失败: $error');
+    }
+  }
+
   Future<void> refreshSubscription(SubscriptionSource source) async {
     await _run(
       '刷新订阅',
       () async {
-        final body = await _fetchText(source.url);
+        final fetched = await _fetchSubscription(source.url);
+        // 名称以订阅内容为准，需在解析节点前确定（节点名带订阅前缀）
+        if (fetched.title.isNotEmpty) {
+          source.name = fetched.title;
+        } else if (source.name.trim().isEmpty) {
+          source.name = Uri.tryParse(source.url)?.host ?? '新订阅';
+        }
         final parsed = await native.coreCall('parseSubscription', {
-          'body': body,
+          'body': fetched.body,
         });
         final imported = parsed != null && parsed['ok'] == true
             ? _importCoreSubscription(source, parsed['data'])
-            : _parseSubscription(source, body);
+            : _parseSubscription(source, fetched.body);
         source.lastRefresh = DateTime.now();
         source.lastError = '';
         _log('info', '订阅 ${source.name} 已更新，导入 $imported 项');
@@ -420,23 +656,6 @@ class AppController extends ChangeNotifier {
     });
   }
 
-  Future<void> testProxyNode(ProxyNode node) async {
-    await _run(
-      '测试节点',
-      () async {
-        final result = await _coreTestResult('testProxyNode', node);
-        _applyTestResult(node, result);
-        _log('info', '${node.name} 延迟 ${node.latencyMs ?? '-'} ms');
-        await save();
-        notifyListeners();
-      },
-      onError: (error) {
-        node.latencyMs = null;
-        node.lastError = error.toString();
-      },
-    );
-  }
-
   Future<void> speedTestProxyNode(ProxyNode node) async {
     await _run(
       '速度测试',
@@ -501,24 +720,6 @@ class AppController extends ChangeNotifier {
     await startProxyNode(context, selected, vpnMode: false);
   }
 
-  void toggleFavorite(ProxyNode node) {
-    node.favorite = !node.favorite;
-    save();
-    notifyListeners();
-  }
-
-  Future<void> shareApp() async {
-    await native.call('shareApp');
-    _log('info', '已打开系统分享');
-    notifyListeners();
-  }
-
-  void showScanComingSoon(BuildContext context) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('扫码导入将在后续版本支持')));
-  }
-
   Future<Map<String, dynamic>> _coreTestResult(
     String method,
     ProxyNode node,
@@ -563,41 +764,6 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> saveRouteRule(ProxyRule rule) async {
-    final normalized = rule.normalized();
-    final index = routeRules.indexWhere((item) => item.id == normalized.id);
-    if (index >= 0) {
-      routeRules[index] = normalized;
-    } else {
-      routeRules.add(normalized);
-    }
-    _log('info', '已保存路由规则 ${normalized.name}');
-    await save();
-    notifyListeners();
-  }
-
-  Future<void> removeRouteRule(ProxyRule rule) async {
-    routeRules.removeWhere((item) => item.id == rule.id);
-    _log('info', '已删除路由规则 ${rule.name}');
-    await save();
-    notifyListeners();
-  }
-
-  Future<void> setRouteRuleEnabled(ProxyRule rule, bool enabled) async {
-    rule.enabled = enabled;
-    await save();
-    notifyListeners();
-  }
-
-  Future<void> resetRouteRules() async {
-    routeRules
-      ..clear()
-      ..addAll(ProxyRule.defaultRules());
-    _log('info', '已恢复默认路由规则');
-    await save();
-    notifyListeners();
-  }
-
   Future<void> setAllowInsecureSubscriptionCerts(bool value) async {
     allowInsecureSubscriptionCerts = value;
     _log('info', value ? '已允许订阅使用不受信任证书' : '已恢复订阅证书校验');
@@ -633,170 +799,6 @@ class AppController extends ChangeNotifier {
     });
   }
 
-  Future<void> saveTunnel(TunnelConfig tunnel) async {
-    final index = tunnels.indexWhere((item) => item.id == tunnel.id);
-    if (index >= 0) {
-      tunnels[index] = tunnel;
-    } else {
-      tunnels.add(tunnel);
-    }
-    _log('info', '已保存隧道 ${tunnel.name}');
-    await save();
-    notifyListeners();
-  }
-
-  Future<void> toggleTunnel(TunnelConfig tunnel) async {
-    await _run('切换 SSH 隧道', () async {
-      if (tunnel.running) {
-        final resp = await native.coreCall('stopTunnel', {'name': tunnel.name});
-        if (resp == null || resp['ok'] != true) {
-          throw StateError(resp?['message'] as String? ?? 'stop tunnel failed');
-        }
-        tunnel.running = false;
-      } else {
-        final resp = await native.coreCall('startTunnel', {
-          'tunnel': tunnel.toCoreJson(),
-        });
-        if (resp == null || resp['ok'] != true) {
-          throw StateError(
-            resp?['message'] as String? ?? 'start tunnel failed',
-          );
-        }
-        tunnel.running = true;
-      }
-      _log('info', '${tunnel.name} ${tunnel.running ? '已启动' : '已停止'}');
-      await save();
-      notifyListeners();
-    });
-  }
-
-  Future<void> deleteTunnel(TunnelConfig tunnel) async {
-    tunnels.removeWhere((item) => item.id == tunnel.id);
-    _log('info', '已删除隧道 ${tunnel.name}');
-    await save();
-    notifyListeners();
-  }
-
-  Future<void> saveSshConnection(SshConnection conn) async {
-    final index = sshConnections.indexWhere((item) => item.id == conn.id);
-    if (index >= 0) {
-      sshConnections[index] = conn;
-    } else {
-      sshConnections.add(conn);
-    }
-    _log('info', '已保存 SSH 连接 ${conn.name}');
-    await save();
-    notifyListeners();
-  }
-
-  Future<void> deleteSshConnection(SshConnection conn) async {
-    sshConnections.removeWhere((item) => item.id == conn.id);
-    _log('info', '已删除 SSH 连接 ${conn.name}');
-    await save();
-    notifyListeners();
-  }
-
-  Future<void> openTerminal(SshConnection conn) async {
-    await _run('连接 SSH 终端', () async {
-      final resp = await native.coreCall('createSSHSession', {
-        'config': {
-          'addr': conn.addr,
-          'user': conn.user,
-          'password': conn.password,
-          'rows': 24,
-          'cols': 80,
-        },
-      });
-      if (resp == null || resp['ok'] != true) {
-        throw StateError(
-          resp?['message'] as String? ?? 'Go core is unavailable',
-        );
-      }
-      final data = Map<String, dynamic>.from(resp['data'] as Map? ?? {});
-      terminalTabs.add(
-        TerminalTab(
-          id: _id(),
-          sessionId: data['session_id'] as String? ?? '',
-          title: conn.name,
-          connection: conn,
-          buffer: 'Connected to ${conn.addr}\r\n',
-          connected: true,
-        ),
-      );
-      _log('info', '已打开 SSH 终端 ${conn.name}');
-      notifyListeners();
-    });
-  }
-
-  Future<void> sendTerminalInput(TerminalTab tab, String input) async {
-    if (!tab.connected || tab.sessionId.isEmpty) {
-      tab.buffer += '> $input\r\n';
-      notifyListeners();
-      return;
-    }
-    final resp = await native.coreCall('sendSSHInput', {
-      'session_id': tab.sessionId,
-      'data': '$input\n',
-    });
-    if (resp == null || resp['ok'] != true) {
-      tab.buffer += '\r\n${resp?['message'] ?? 'send failed'}\r\n';
-    }
-    notifyListeners();
-  }
-
-  Future<void> closeTerminal(TerminalTab tab) async {
-    if (tab.sessionId.isNotEmpty) {
-      await native.coreCall('closeSSHSession', {'session_id': tab.sessionId});
-    }
-    terminalTabs.removeWhere((item) => item.id == tab.id);
-    _log('info', '终端 ${tab.title} 已关闭');
-    notifyListeners();
-  }
-
-  Future<void> _pollSSHEvents() async {
-    if (_pollingSSH || terminalTabs.isEmpty) {
-      return;
-    }
-    _pollingSSH = true;
-    try {
-      final resp = await native.coreCall('drainSSHEvents');
-      if (resp == null || resp['ok'] != true) {
-        return;
-      }
-      final data = Map<String, dynamic>.from(resp['data'] as Map? ?? {});
-      final events = (data['events'] as List? ?? const []).whereType<Map>();
-      var changed = false;
-      for (final raw in events) {
-        final event = Map<String, dynamic>.from(raw);
-        final sessionId = event['session_id'] as String? ?? '';
-        final tab = terminalTabs
-            .where((item) => item.sessionId == sessionId)
-            .firstOrNull;
-        if (tab == null) {
-          continue;
-        }
-        switch (event['type']) {
-          case 'output':
-            tab.buffer += event['data'] as String? ?? '';
-            break;
-          case 'closed':
-            tab.connected = false;
-            tab.buffer += '\r\n[closed] ${event['message'] ?? ''}\r\n';
-            break;
-          case 'error':
-            tab.buffer += '\r\n[error] ${event['message'] ?? ''}\r\n';
-            break;
-        }
-        changed = true;
-      }
-      if (changed) {
-        notifyListeners();
-      }
-    } finally {
-      _pollingSSH = false;
-    }
-  }
-
   Future<void> _pollRuntimeStatus() async {
     final session = activeSession;
     if (session == null || _pollingRuntime) return;
@@ -811,6 +813,26 @@ class AppController extends ChangeNotifier {
         if (response?['ok'] == true) {
           status = Map<String, dynamic>.from(response?['data'] as Map? ?? {});
         }
+        if (session.kind == 'proxy-vpn' && status != null) {
+          // tun2socks 不统计流量，叠加 sing-box clash API 的数据；
+          // 若 sing-box 进程已退出（事件可能丢失），视为会话结束
+          final proxy = await native.call('proxyStatus');
+          if (proxy['missing_plugin'] != true) {
+            final proxyState = proxy['state'] as String? ?? '';
+            if (proxyState == 'running') {
+              status['upload_total_bytes'] = proxy['upload_total_bytes'];
+              status['download_total_bytes'] = proxy['download_total_bytes'];
+              status['upload_speed_bps'] = proxy['upload_speed_bps'];
+              status['download_speed_bps'] = proxy['download_speed_bps'];
+            } else {
+              status['state'] = 'stopped';
+              final proxyError = proxy['last_error'] as String? ?? '';
+              if (proxyError.isNotEmpty) {
+                status['last_error'] = proxyError;
+              }
+            }
+          }
+        }
       }
       final state = status?['state'] as String? ?? '';
       uploadTotalBytes = _int(
@@ -822,6 +844,14 @@ class AppController extends ChangeNotifier {
       uploadSpeedBps = _int(status?['upload_speed_bps']);
       downloadSpeedBps = _int(status?['download_speed_bps']);
       if (state == 'stopped' || state == 'error') {
+        // 启动窗口内容忍 stopped：服务尚未完成初始化时不误判为断开
+        final starting =
+            DateTime.now().difference(session.startedAt) <
+            const Duration(seconds: 15);
+        if (starting && state == 'stopped') {
+          notifyListeners();
+          return;
+        }
         activeSession = null;
         uploadSpeedBps = 0;
         downloadSpeedBps = 0;
@@ -847,9 +877,34 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> clearTestResults() async {
+    for (final node in proxyNodes) {
+      node.latencyMs = null;
+      node.speedMbps = null;
+      node.lastError = '';
+      node.lastTestedAt = null;
+    }
+    _log('info', '已清除全部节点的测试结果');
+    await save();
+    notifyListeners();
+  }
+
+  Future<void> _loadAboutInfo() async {
+    coreVersionText = await native.coreVersion();
+    final info = await native.call('getDeviceInfo');
+    if (info['missing_plugin'] == true || info['model'] == null) {
+      deviceInfoText = '未知';
+    } else {
+      final release = info['release'] ?? '';
+      final model = info['model'] ?? '';
+      final arch = info['arch'] ?? '';
+      deviceInfoText = 'Android $release · $model · $arch';
+    }
+    notifyListeners();
+  }
+
   @override
   void dispose() {
-    _sshPoll?.cancel();
     _runtimePoll?.cancel();
     _eventSub?.cancel();
     super.dispose();
@@ -880,9 +935,12 @@ class AppController extends ChangeNotifier {
     String nextKind,
   ) async {
     final current = activeSession;
-    if (current == null ||
-        current.kind == nextKind ||
-        current.kind == 'local-proxy') {
+    if (current == null || current.kind == nextKind) {
+      return true;
+    }
+    if (current.kind == 'local-proxy') {
+      // 本地代理可直接切换，但需停掉旧的前台服务，避免通知栏残留
+      await stopRuntime();
       return true;
     }
     final ok = await showDialog<bool>(
@@ -909,7 +967,7 @@ class AppController extends ChangeNotifier {
     return false;
   }
 
-  Future<String> _fetchText(String url) async {
+  Future<({String body, String title})> _fetchSubscription(String url) async {
     final uri = Uri.parse(url);
     final client = HttpClient();
     if (allowInsecureSubscriptionCerts) {
@@ -925,7 +983,8 @@ class AppController extends ChangeNotifier {
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw HttpException('HTTP ${response.statusCode}', uri: uri);
       }
-      return await response.transform(utf8.decoder).join();
+      final body = await response.transform(utf8.decoder).join();
+      return (body: body, title: _subscriptionTitle(response.headers));
     } on HandshakeException catch (error) {
       if (allowInsecureSubscriptionCerts) {
         rethrow;
@@ -934,6 +993,36 @@ class AppController extends ChangeNotifier {
     } finally {
       client.close(force: true);
     }
+  }
+
+  // 订阅名称优先取机场约定的 profile-title 头，其次取附件文件名
+  static String _subscriptionTitle(HttpHeaders headers) {
+    var title = headers.value('profile-title')?.trim() ?? '';
+    if (title.startsWith('base64:')) {
+      try {
+        title = utf8.decode(base64Decode(title.substring(7).trim()));
+      } catch (_) {
+        title = '';
+      }
+    }
+    if (title.isNotEmpty) {
+      return title;
+    }
+    final disposition = headers.value('content-disposition') ?? '';
+    final encoded = RegExp(
+      "filename\\*=(?:utf-8|UTF-8)''([^;]+)",
+    ).firstMatch(disposition);
+    var filename = encoded != null
+        ? Uri.decodeComponent(encoded.group(1)!.trim())
+        : RegExp(
+                'filename="?([^";]+)"?',
+              ).firstMatch(disposition)?.group(1)?.trim() ??
+              '';
+    final dot = filename.lastIndexOf('.');
+    if (dot > 0) {
+      filename = filename.substring(0, dot);
+    }
+    return filename.trim();
   }
 
   int _parseSubscription(SubscriptionSource source, String body) {
@@ -1030,8 +1119,21 @@ class AppController extends ChangeNotifier {
     }
     if (type == 'vpn.status' || type == 'proxy.status') {
       final state = payload['state'] as String? ?? '';
-      if (state == 'stopped' || state == 'error') {
+      if (state == 'running' || state == 'starting') {
+        _syncSessionFromStatus(type, payload);
+      } else if (state == 'error') {
         activeSession = null;
+      } else if (state == 'stopped') {
+        // stopped 事件无法归因到具体会话，新会话启动窗口内忽略，
+        // 避免停止旧服务时延迟到达的事件误清新会话
+        final current = activeSession;
+        final starting =
+            current != null &&
+            DateTime.now().difference(current.startedAt) <
+                const Duration(seconds: 15);
+        if (!starting) {
+          activeSession = null;
+        }
       }
       final message =
           payload['message'] as String? ??
@@ -1043,6 +1145,30 @@ class AppController extends ChangeNotifier {
       );
       notifyListeners();
     }
+  }
+
+  void _syncSessionFromStatus(String type, Map<String, dynamic> payload) {
+    var kind = payload['kind'] as String? ?? '';
+    if (kind.isEmpty && type == 'proxy.status') {
+      // sing-box 状态事件用 mode 区分本地代理与全局 VPN 代理
+      kind = (payload['mode'] as String?) == 'vpn' ? 'proxy-vpn' : 'local-proxy';
+    }
+    if (kind.isEmpty) return;
+    final name =
+        payload['session'] as String? ??
+        payload['node'] as String? ??
+        activeSession?.name ??
+        '';
+    if (name.isEmpty) return;
+    final current = activeSession;
+    if (current != null && current.kind == kind && current.name == name) {
+      return;
+    }
+    activeSession = RuntimeSession(
+      kind: kind,
+      name: name,
+      startedAt: DateTime.now(),
+    );
   }
 
   void _log(String level, String message) {
@@ -1095,68 +1221,223 @@ class SafeLinkShell extends StatelessWidget {
       builder: (context, _) {
         final pages = [
           HomePage(controller: controller),
-          NodesPage(controller: controller),
-          MePage(controller: controller),
+          DataPage(controller: controller),
+          SettingsPage(controller: controller),
         ];
         return Scaffold(
-          backgroundColor: const Color(0xfff4f8ff),
           appBar: AppBar(
-            backgroundColor: const Color(0xfff4f8ff),
-            surfaceTintColor: Colors.transparent,
-            elevation: 0,
-            title: const BrandTitle(),
+            leading: IconButton(
+              tooltip: '扫码导入',
+              onPressed: controller.busy
+                  ? null
+                  : () async {
+                      final text = await Navigator.push<String>(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const ScanImportPage(),
+                        ),
+                      );
+                      if (text != null && text.isNotEmpty) {
+                        await controller.importScannedText(text);
+                      }
+                    },
+              icon: const Icon(Icons.qr_code_scanner),
+            ),
+            title: const Text(
+              'SafeLink',
+              style: TextStyle(fontWeight: FontWeight.w800),
+            ),
             actions: [
-              if (controller.selectedIndex == 0)
-                IconButton(
-                  tooltip: '添加订阅',
-                  onPressed: controller.busy
-                      ? null
-                      : () => showSubscriptionSheet(context, controller),
-                  icon: const Icon(Icons.add),
-                ),
-              if (controller.selectedIndex == 2)
-                IconButton(
-                  tooltip: '扫码导入',
-                  onPressed: () => controller.showScanComingSoon(context),
-                  icon: const Icon(Icons.qr_code_scanner),
-                ),
               if (controller.busy)
                 const Padding(
-                  padding: EdgeInsets.only(right: 16),
+                  padding: EdgeInsets.only(right: 6),
                   child: SizedBox.square(
                     dimension: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
+                    ),
                   ),
                 ),
+              IconButton(
+                tooltip: '添加订阅',
+                onPressed: controller.busy
+                    ? null
+                    : () => showSubscriptionDialog(context, controller),
+                icon: const Icon(Icons.add),
+              ),
             ],
           ),
           body: SafeArea(child: pages[controller.selectedIndex]),
-          bottomNavigationBar: NavigationBar(
-            height: 72,
-            backgroundColor: Colors.white,
-            indicatorColor: const Color(0xffe8f0ff),
+          bottomNavigationBar: PillNavBar(
             selectedIndex: controller.selectedIndex,
-            onDestinationSelected: controller.selectPage,
-            destinations: const [
-              NavigationDestination(
-                icon: Icon(Icons.dashboard_outlined),
-                selectedIcon: Icon(Icons.dashboard),
-                label: '首页',
-              ),
-              NavigationDestination(
-                icon: Icon(Icons.hub_outlined),
-                selectedIcon: Icon(Icons.hub),
-                label: '节点',
-              ),
-              NavigationDestination(
-                icon: Icon(Icons.person_outline),
-                selectedIcon: Icon(Icons.person),
-                label: '我的',
-              ),
+            onSelected: controller.selectPage,
+            items: const [
+              (Icons.home_outlined, Icons.home, '首页'),
+              (Icons.insert_chart_outlined, Icons.insert_chart, '数据'),
+              (Icons.settings_outlined, Icons.settings, '设置'),
             ],
           ),
         );
       },
+    );
+  }
+}
+
+class PillNavBar extends StatelessWidget {
+  const PillNavBar({
+    super.key,
+    required this.selectedIndex,
+    required this.onSelected,
+    required this.items,
+  });
+
+  final int selectedIndex;
+  final ValueChanged<int> onSelected;
+  final List<(IconData, IconData, String)> items;
+
+  @override
+  Widget build(BuildContext context) {
+    // 仿 Shadowrocket 的悬浮胶囊导航条：整条浮起，选中项带灰色胶囊底
+    final pillColor = isDarkMode(context)
+        ? Theme.of(context).colorScheme.secondaryContainer
+        : const Color(0xffe4e6ea);
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 0, 14, 10),
+        child: Container(
+          height: 64,
+          decoration: BoxDecoration(
+            color: softCardColor(context),
+            borderRadius: BorderRadius.circular(32),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(
+                  0xff23406f,
+                ).withValues(alpha: isDarkMode(context) ? 0.3 : 0.12),
+                blurRadius: 24,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              for (var i = 0; i < items.length; i++)
+                Expanded(
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(32),
+                    onTap: () => onSelected(i),
+                    child: Center(
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 180),
+                        curve: Curves.easeOut,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: selectedIndex == i
+                              ? pillColor
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(24),
+                        ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              selectedIndex == i ? items[i].$2 : items[i].$1,
+                              size: 22,
+                              color: selectedIndex == i
+                                  ? primaryTextColor(context)
+                                  : secondaryTextColor(context),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              items[i].$3,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: selectedIndex == i
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                color: selectedIndex == i
+                                    ? primaryTextColor(context)
+                                    : secondaryTextColor(context),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ScanImportPage extends StatefulWidget {
+  const ScanImportPage({super.key});
+
+  @override
+  State<ScanImportPage> createState() => _ScanImportPageState();
+}
+
+class _ScanImportPageState extends State<ScanImportPage> {
+  final _scanner = MobileScannerController();
+  bool _handled = false;
+
+  @override
+  void dispose() {
+    _scanner.dispose();
+    super.dispose();
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_handled) return;
+    final value = capture.barcodes
+        .map((item) => item.rawValue?.trim() ?? '')
+        .firstWhere((item) => item.isNotEmpty, orElse: () => '');
+    if (value.isEmpty) return;
+    // 只取首个有效结果，避免连续帧重复导入
+    _handled = true;
+    Navigator.pop(context, value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(title: const Text('扫码导入')),
+      body: Stack(
+        alignment: Alignment.center,
+        children: [
+          MobileScanner(controller: _scanner, onDetect: _onDetect),
+          IgnorePointer(
+            child: Container(
+              width: 240,
+              height: 240,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white70, width: 2),
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+          ),
+          const Positioned(
+            left: 24,
+            right: 24,
+            bottom: 48,
+            child: Text(
+              '对准订阅或节点二维码即可自动导入',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white70),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1168,68 +1449,84 @@ class HomePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final hasVpnTunnels = controller.tunnels.any((item) => item.mode == 'vpn');
     return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 8, 18, 18),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 18),
       children: [
-        ConnectionCard(controller: controller),
-        const SizedBox(height: 16),
-        NodeListCard(controller: controller, compact: true),
-      ],
-    );
-  }
-}
-
-class NodesPage extends StatelessWidget {
-  const NodesPage({super.key, required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 8, 18, 18),
-      children: [NodeListCard(controller: controller, compact: false)],
-    );
-  }
-}
-
-class MePage extends StatelessWidget {
-  const MePage({super.key, required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(18, 8, 18, 18),
-      children: [
-        SubscriptionManageCard(controller: controller),
-        const SizedBox(height: 16),
-        QuickActionsCard(controller: controller),
-        const SizedBox(height: 16),
-        LogsPreviewCard(controller: controller),
-      ],
-    );
-  }
-}
-
-class BrandTitle extends StatelessWidget {
-  const BrandTitle({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        const ShieldMark(size: 34),
-        const SizedBox(width: 10),
-        Text(
-          'SafeLink',
-          style: Theme.of(context).textTheme.titleLarge?.copyWith(
-            fontWeight: FontWeight.w900,
-            color: const Color(0xff111827),
+        StatusCard(controller: controller),
+        const SizedBox(height: 2),
+        HomeToolRow(controller: controller),
+        if (hasVpnTunnels) ...[
+          const SizedBox(height: 8),
+          VpnTunnelCard(controller: controller),
+        ],
+        const SizedBox(height: 8),
+        if (controller.subscriptions.isEmpty)
+          const SoftCard(
+            child: EmptyState(
+              icon: Icons.rss_feed_outlined,
+              title: '暂无订阅',
+              subtitle: '点击右上角 + 添加订阅，或左上角扫码导入',
+            ),
+          )
+        else
+          for (final source in controller.subscriptions) ...[
+            SubscriptionGroupCard(controller: controller, source: source),
+            const SizedBox(height: 10),
+          ],
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Text(
+            '点击订阅可以折叠和展开子节点。圆点代表默认节点。',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 12, color: secondaryTextColor(context)),
           ),
         ),
+      ],
+    );
+  }
+}
+
+class DataPage extends StatelessWidget {
+  const DataPage({super.key, required this.controller});
+
+  final AppController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 18),
+      children: [
+        RuntimeStatusCard(controller: controller),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          children: [
+            StatTile(
+              icon: Icons.upload_outlined,
+              label: '上传速度',
+              value: formatSpeed(controller.uploadSpeedBps),
+            ),
+            StatTile(
+              icon: Icons.download_outlined,
+              label: '下载速度',
+              value: formatSpeed(controller.downloadSpeedBps),
+            ),
+            StatTile(
+              icon: Icons.cloud_upload_outlined,
+              label: '上传流量',
+              value: formatBytes(controller.uploadTotalBytes),
+            ),
+            StatTile(
+              icon: Icons.cloud_download_outlined,
+              label: '下载流量',
+              value: formatBytes(controller.downloadTotalBytes),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        LogsPreviewCard(controller: controller),
       ],
     );
   }
@@ -1242,25 +1539,11 @@ class ShieldMark extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xff5f8cff), Color(0xff0058ff)],
-        ),
-        borderRadius: BorderRadius.circular(size * 0.24),
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0xff0b67ff).withValues(alpha: 0.24),
-            blurRadius: size * 0.34,
-            offset: Offset(0, size * 0.12),
-          ),
-        ],
-      ),
-      child: Icon(Icons.check_rounded, color: Colors.white, size: size * 0.58),
+    // 与首页其余条目一致的主题色线条图标
+    return Icon(
+      Icons.link_outlined,
+      size: size * 0.9,
+      color: Theme.of(context).colorScheme.primary,
     );
   }
 }
@@ -1276,110 +1559,144 @@ class SoftCard extends StatelessWidget {
     return Container(
       padding: padding ?? const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: softCardColor(context),
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: const Color(0xff23406f).withValues(alpha: 0.08),
+            color: const Color(
+              0xff23406f,
+            ).withValues(alpha: isDarkMode(context) ? 0.3 : 0.08),
             blurRadius: 28,
             offset: const Offset(0, 14),
           ),
         ],
       ),
-      child: child,
+      // ListTile 的水波纹绘制在最近的 Material 上，透明 Material 避免被背景色遮挡
+      child: Material(type: MaterialType.transparency, child: child),
     );
   }
 }
 
-class ConnectionCard extends StatelessWidget {
-  const ConnectionCard({super.key, required this.controller});
+class StatusCard extends StatelessWidget {
+  const StatusCard({super.key, required this.controller});
 
   final AppController controller;
 
   @override
   Widget build(BuildContext context) {
     final connected = controller.activeSession != null;
-    final node = controller.currentNode;
-    final displayNode = node ?? controller.visibleProxyNodes.firstOrNull;
+    final node = controller.currentNode ?? controller.selectedNode;
+    final accent = Theme.of(context).colorScheme.primary;
     return SoftCard(
-      padding: const EdgeInsets.fromLTRB(20, 24, 20, 20),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
       child: Column(
         children: [
-          const ShieldMark(size: 86),
-          const SizedBox(height: 14),
-          Text(
-            connected ? '已连接' : '未连接',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-              color: connected
-                  ? const Color(0xff16c56f)
-                  : const Color(0xff6b7280),
-              fontWeight: FontWeight.w800,
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Row(
+              children: [
+                const SizedBox(width: 32, child: Center(child: ShieldMark(size: 32))),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        connected ? '已连接' : '未连接',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w800,
+                          fontSize: 15,
+                          color: connected
+                              ? const Color(0xff16c56f)
+                              : primaryTextColor(context),
+                        ),
+                      ),
+                      Text(
+                        node == null
+                            ? '请先添加订阅并选择节点'
+                            : '${flagForNode(node)} ${node.displayName}'
+                                  .trim(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: secondaryTextColor(context),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value: connected,
+                  onChanged: controller.busy
+                      ? null
+                      : (_) => controller.toggleConnection(context),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 10),
-          Text(
-            displayNode == null
-                ? '请选择节点'
-                : '${flagForNode(displayNode)}  ${displayNode.displayName}',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w700,
-              color: const Color(0xff26324a),
-            ),
-          ),
-          const SizedBox(height: 28),
-          Row(
-            children: [
-              Expanded(
-                child: MetricText(
-                  label: '延迟',
-                  value: node?.latencyMs == null
-                      ? '-'
-                      : '${node!.latencyMs} ms',
-                  highlight: true,
-                ),
-              ),
-              const VerticalDivider(width: 1),
-              Expanded(
-                child: MetricText(
-                  label: '速度',
-                  value: connected && controller.downloadSpeedBps > 0
-                      ? formatSpeed(controller.downloadSpeedBps)
-                      : formatMbps(node?.speedMbps),
-                ),
-              ),
-              const VerticalDivider(width: 1),
-              Expanded(
-                child: MetricText(
-                  label: '流量',
-                  value: formatBytes(controller.downloadTotalBytes),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 26),
-          SizedBox(
-            width: double.infinity,
-            height: 52,
-            child: FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xff0d63ff),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-              onPressed: controller.busy
-                  ? null
-                  : connected
-                  ? controller.stopRuntime
-                  : displayNode == null
-                  ? null
-                  : () => controller.startProxyNode(
-                      context,
-                      displayNode,
-                      vpnMode: false,
+          Divider(height: 1, color: subtleBorderColor(context)),
+          InkWell(
+            onTap: controller.busy
+                ? null
+                : () => showProxyModeSheet(context, controller),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 13),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 32,
+                    child: Center(
+                      child: Icon(Icons.explore_outlined, color: accent),
                     ),
-              child: Text(connected ? '断开连接' : '连接节点'),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      '路由模式',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: primaryTextColor(context),
+                      ),
+                    ),
+                  ),
+                  Text(
+                    controller.proxyModeLabel,
+                    style: TextStyle(color: secondaryTextColor(context)),
+                  ),
+                  Icon(Icons.chevron_right, color: secondaryTextColor(context)),
+                ],
+              ),
+            ),
+          ),
+          Divider(height: 1, color: subtleBorderColor(context)),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 32,
+                  child: Center(
+                    child: Icon(Icons.network_check_outlined, color: accent),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    '连通性测试',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      color: primaryTextColor(context),
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: controller.busy
+                      ? null
+                      : controller.testAllProxyNodes,
+                  child: const Text('测试'),
+                ),
+              ],
             ),
           ),
         ],
@@ -1388,60 +1705,149 @@ class ConnectionCard extends StatelessWidget {
   }
 }
 
-class MetricText extends StatelessWidget {
-  const MetricText({
-    super.key,
-    required this.label,
-    required this.value,
-    this.highlight = false,
-  });
+class HomeToolRow extends StatelessWidget {
+  const HomeToolRow({super.key, required this.controller});
 
-  final String label;
-  final String value;
-  final bool highlight;
+  final AppController controller;
 
   @override
   Widget build(BuildContext context) {
-    return Column(
+    final iconColor = secondaryTextColor(context);
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.end,
       children: [
-        Text(
-          label,
-          style: const TextStyle(
-            color: Color(0xff9aa4b5),
-            fontWeight: FontWeight.w700,
-          ),
+        IconButton(
+          tooltip: '自动选择',
+          onPressed: controller.busy
+              ? null
+              : () => controller.autoSelectNode(context),
+          icon: Icon(Icons.alt_route, color: iconColor),
         ),
-        const SizedBox(height: 7),
-        Text(
-          value,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: highlight
-                ? const Color(0xff16c56f)
-                : const Color(0xff26324a),
-            fontWeight: FontWeight.w800,
-          ),
+        IconButton(
+          tooltip: '刷新全部订阅',
+          onPressed: controller.busy
+              ? null
+              : controller.refreshAllSubscriptions,
+          icon: Icon(Icons.refresh, color: iconColor),
+        ),
+        PopupMenuButton<String>(
+          tooltip: '更多',
+          icon: Icon(Icons.more_horiz, color: iconColor),
+          onSelected: (value) {
+            switch (value) {
+              case 'test':
+                controller.testAllProxyNodes();
+              case 'speed':
+                final node = controller.currentNode ?? controller.selectedNode;
+                if (node != null) controller.speedTestProxyNode(node);
+            }
+          },
+          itemBuilder: (context) => const [
+            PopupMenuItem(value: 'test', child: Text('延迟测试')),
+            PopupMenuItem(value: 'speed', child: Text('速度测试')),
+          ],
         ),
       ],
     );
   }
 }
 
-class NodeListCard extends StatelessWidget {
-  const NodeListCard({
-    super.key,
-    required this.controller,
-    required this.compact,
-  });
+Future<void> showProxyModeSheet(
+  BuildContext context,
+  AppController controller,
+) async {
+  const items = [
+    ('rule', '规则模式', '按路由规则智能分流', Icons.rule),
+    ('global', '全局模式', '全部流量走代理', Icons.public),
+    ('direct', '直连模式', '全部流量直连', Icons.link_outlined),
+  ];
+  await showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: softCardColor(context),
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+    ),
+    builder: (sheetContext) {
+      final accent = Theme.of(sheetContext).colorScheme.primary;
+      return SheetFrame(
+        title: '路由模式',
+        children: [
+          for (final item in items)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(12),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  controller.setProxyMode(item.$1);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: controller.proxyMode == item.$1
+                        ? activeRowColor(sheetContext)
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 32,
+                        child: Center(child: Icon(item.$4, color: accent)),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              item.$2,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                fontSize: 15,
+                                color: primaryTextColor(sheetContext),
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              item.$3,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: secondaryTextColor(sheetContext),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (controller.proxyMode == item.$1)
+                        Icon(Icons.check_circle, color: accent),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
+    },
+  );
+}
+
+class VpnTunnelCard extends StatelessWidget {
+  const VpnTunnelCard({super.key, required this.controller});
 
   final AppController controller;
-  final bool compact;
 
   @override
   Widget build(BuildContext context) {
-    final nodes = controller.visibleProxyNodes;
-    final visibleNodes = compact ? nodes.take(7).toList() : nodes;
+    final vpnTunnels = controller.tunnels
+        .where((item) => item.mode == 'vpn')
+        .toList();
+    if (vpnTunnels.isEmpty) {
+      return const SizedBox.shrink();
+    }
     return SoftCard(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 10),
       child: Column(
@@ -1450,84 +1856,288 @@ class NodeListCard extends StatelessWidget {
           Row(
             children: [
               Text(
-                '节点列表',
+                'SafeLink VPN',
                 style: Theme.of(
                   context,
                 ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900),
               ),
               const Spacer(),
-              IconButton(
-                tooltip: '筛选',
-                onPressed: () {},
-                icon: const Icon(Icons.filter_alt_outlined),
-              ),
-              PopupMenuButton<String>(
-                tooltip: '更多',
-                onSelected: (value) {
-                  if (value == 'test') controller.testAllProxyNodes();
-                },
-                itemBuilder: (context) => const [
-                  PopupMenuItem(value: 'test', child: Text('延迟测试')),
-                ],
+              Text(
+                '${vpnTunnels.length} 条线路',
+                style: TextStyle(
+                  color: secondaryTextColor(context),
+                  fontSize: 12,
+                ),
               ),
             ],
           ),
           const SizedBox(height: 8),
-          NodeFilterBar(controller: controller),
-          const SizedBox(height: 8),
-          if (visibleNodes.isEmpty)
-            const EmptyState(
-              icon: Icons.hub_outlined,
-              title: '暂无节点',
-              subtitle: '点击右上角 + 添加订阅',
-            )
-          else
-            for (final node in visibleNodes)
-              NodeRow(
-                node: node,
-                controller: controller,
-                active: controller.currentNode?.name == node.name,
-              ),
+          for (final tunnel in vpnTunnels)
+            VpnTunnelRow(tunnel: tunnel, controller: controller),
         ],
       ),
     );
   }
 }
 
-class NodeFilterBar extends StatelessWidget {
-  const NodeFilterBar({super.key, required this.controller});
+class VpnTunnelRow extends StatelessWidget {
+  const VpnTunnelRow({
+    super.key,
+    required this.tunnel,
+    required this.controller,
+  });
 
+  final TunnelConfig tunnel;
   final AppController controller;
 
   @override
   Widget build(BuildContext context) {
-    const items = [('all', '全部'), ('auto', '自动选择'), ('favorite', '收藏')];
-    return Row(
-      children: [
-        for (final item in items)
+    final session = controller.activeSession;
+    final active =
+        session?.kind == 'safelink-vpn' && session?.name == tunnel.name;
+    final server = tunnel.forward.isNotEmpty ? tunnel.forward : tunnel.sshAddr;
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: active ? activeRowColor(context) : Colors.transparent,
+        border: Border.all(
+          color: active ? const Color(0xff2f6fff) : Colors.transparent,
+        ),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            active ? Icons.shield : Icons.shield_outlined,
+            color: active
+                ? const Color(0xff16c56f)
+                : secondaryTextColor(context),
+          ),
+          const SizedBox(width: 12),
           Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  tunnel.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: primaryTextColor(context),
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if (server.isNotEmpty)
+                  Text(
+                    server,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: secondaryTextColor(context),
+                      fontSize: 12,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          FilledButton.tonal(
+            onPressed: controller.busy
+                ? null
+                : () => active
+                      ? controller.stopRuntime()
+                      : controller.startVpnTunnel(context, tunnel),
+            child: Text(active ? '断开' : '连接'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SubscriptionGroupCard extends StatelessWidget {
+  const SubscriptionGroupCard({
+    super.key,
+    required this.controller,
+    required this.source,
+  });
+
+  final AppController controller;
+  final SubscriptionSource source;
+
+  @override
+  Widget build(BuildContext context) {
+    final nodes = controller.nodesOfSubscription(source);
+    final collapsed = controller.collapsedSubscriptions.contains(source.id);
+    final iconColor = secondaryTextColor(context);
+    return SoftCard(
+      padding: const EdgeInsets.fromLTRB(6, 4, 6, 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: () => controller.toggleSubscriptionCollapsed(source.id),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 3),
-              child: ChoiceChip(
-                selected: controller.nodeFilter == item.$1,
-                label: Center(child: Text(item.$2)),
-                onSelected: (_) => controller.setNodeFilter(item.$1),
-                selectedColor: const Color(0xffe6efff),
-                labelStyle: TextStyle(
-                  color: controller.nodeFilter == item.$1
-                      ? const Color(0xff0d63ff)
-                      : const Color(0xff374151),
-                  fontWeight: FontWeight.w700,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
+              padding: const EdgeInsets.fromLTRB(6, 6, 0, 6),
+              child: Row(
+                children: [
+                  Icon(
+                    collapsed ? Icons.chevron_right : Icons.expand_more,
+                    color: iconColor,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          source.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontWeight: FontWeight.w800,
+                            fontSize: 15,
+                            color: primaryTextColor(context),
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          source.lastError.isNotEmpty
+                              ? source.lastError
+                              : '${nodes.length} 个节点 · 更新 ${source.lastRefresh == null ? '-' : _timeText(source.lastRefresh!)}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: source.lastError.isNotEmpty
+                                ? Theme.of(context).colorScheme.error
+                                : iconColor,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '刷新订阅',
+                    onPressed: controller.busy
+                        ? null
+                        : () => controller.refreshSubscription(source),
+                    icon: Icon(Icons.refresh, color: iconColor),
+                  ),
+                  IconButton(
+                    tooltip: '订阅详情',
+                    onPressed: () =>
+                        showSubscriptionInfoSheet(context, controller, source),
+                    icon: Icon(Icons.info_outline, color: iconColor),
+                  ),
+                ],
               ),
             ),
           ),
-      ],
+          if (!collapsed)
+            if (nodes.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Text(
+                  '该订阅暂无节点，点击刷新重新拉取',
+                  style: TextStyle(fontSize: 12, color: iconColor),
+                ),
+              )
+            else
+              for (final node in nodes)
+                NodeRow(
+                  node: node,
+                  controller: controller,
+                  selected: controller.selectedNode?.id == node.id,
+                  active: controller.currentNode?.name == node.name,
+                ),
+        ],
+      ),
     );
   }
+}
+
+Future<void> showSubscriptionInfoSheet(
+  BuildContext context,
+  AppController controller,
+  SubscriptionSource source,
+) async {
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: softCardColor(context),
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+    ),
+    builder: (sheetContext) {
+      final nodeCount = controller.nodesOfSubscription(source).length;
+      return SheetFrame(
+        title: source.name,
+        children: [
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.link),
+            title: const Text('订阅地址'),
+            subtitle: Text(source.url, maxLines: 2),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.hub_outlined),
+            title: const Text('节点数量'),
+            subtitle: Text('$nodeCount 个'),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.schedule),
+            title: const Text('最后更新'),
+            subtitle: Text(
+              source.lastRefresh == null
+                  ? '-'
+                  : _dateTimeText(source.lastRefresh!),
+            ),
+          ),
+          if (source.lastError.isNotEmpty)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(
+                Icons.error_outline,
+                color: Theme.of(sheetContext).colorScheme.error,
+              ),
+              title: const Text('最近错误'),
+              subtitle: Text(source.lastError, maxLines: 3),
+            ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(sheetContext);
+                    controller.deleteSubscription(source);
+                  },
+                  icon: const Icon(Icons.delete_outline),
+                  label: const Text('删除'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: () {
+                    Navigator.pop(sheetContext);
+                    controller.refreshSubscription(source);
+                  },
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('更新'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      );
+    },
+  );
 }
 
 class NodeRow extends StatelessWidget {
@@ -1535,91 +2145,98 @@ class NodeRow extends StatelessWidget {
     super.key,
     required this.node,
     required this.controller,
+    required this.selected,
     required this.active,
   });
 
   final ProxyNode node;
   final AppController controller;
+  final bool selected;
   final bool active;
 
   @override
   Widget build(BuildContext context) {
+    final accent = Theme.of(context).colorScheme.primary;
     return InkWell(
       borderRadius: BorderRadius.circular(10),
-      onTap: controller.busy
-          ? null
-          : () => controller.startProxyNode(context, node, vpnMode: false),
+      // 点击选为默认节点，连接/测速等操作收在右侧菜单
+      onTap: controller.busy ? null : () => controller.selectNode(node),
       child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 3),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+        margin: const EdgeInsets.symmetric(vertical: 1),
+        padding: const EdgeInsets.fromLTRB(12, 4, 0, 4),
         decoration: BoxDecoration(
-          color: active ? const Color(0xffeef5ff) : Colors.transparent,
-          border: Border.all(
-            color: active ? const Color(0xff2f6fff) : Colors.transparent,
-          ),
+          color: active ? activeRowColor(context) : Colors.transparent,
           borderRadius: BorderRadius.circular(10),
         ),
         child: Row(
           children: [
-            Text(flagForNode(node), style: const TextStyle(fontSize: 20)),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                node.displayName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Color(0xff26324a),
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+              width: 8,
+              height: 8,
               decoration: BoxDecoration(
-                color: const Color(0xfff2f5fa),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                protocolText(node.protocol),
-                style: const TextStyle(fontSize: 11, color: Color(0xff6b7280)),
+                shape: BoxShape.circle,
+                color: selected ? accent : Colors.transparent,
+                border: selected
+                    ? null
+                    : Border.all(color: subtleBorderColor(context)),
               ),
             ),
             const SizedBox(width: 10),
+            if (flagForNode(node).isNotEmpty) ...[
+              Text(flagForNode(node), style: const TextStyle(fontSize: 18)),
+              const SizedBox(width: 8),
+            ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    node.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: primaryTextColor(context),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                    ),
+                  ),
+                  Text(
+                    protocolText(node.protocol),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: secondaryTextColor(context),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (node.favorite)
+              const Padding(
+                padding: EdgeInsets.only(right: 6),
+                child: Icon(Icons.star, size: 16, color: Color(0xffff9f0a)),
+              ),
             Text(
               node.latencyMs == null ? '-' : '${node.latencyMs} ms',
               style: TextStyle(
                 color: latencyColor(node.latencyMs),
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w700,
                 fontSize: 12,
               ),
             ),
             IconButton(
-              tooltip: '收藏',
-              onPressed: () => controller.toggleFavorite(node),
-              icon: Icon(
-                node.favorite ? Icons.star : Icons.star_border,
-                color: const Color(0xff0d63ff),
+              tooltip: '节点信息',
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) =>
+                      NodeDetailPage(node: node, controller: controller),
+                ),
               ),
-            ),
-            PopupMenuButton<String>(
-              tooltip: '节点操作',
-              onSelected: (value) {
-                if (value == 'test') {
-                  controller.testProxyNode(node);
-                }
-                if (value == 'speed') {
-                  controller.speedTestProxyNode(node);
-                }
-                if (value == 'vpn') {
-                  controller.startProxyNode(context, node, vpnMode: true);
-                }
-              },
-              itemBuilder: (context) => const [
-                PopupMenuItem(value: 'test', child: Text('延迟测试')),
-                PopupMenuItem(value: 'speed', child: Text('速度测试')),
-                PopupMenuItem(value: 'vpn', child: Text('全局 VPN')),
-              ],
+              icon: Icon(
+                Icons.info_outline,
+                size: 18,
+                color: secondaryTextColor(context),
+              ),
             ),
           ],
         ),
@@ -1628,202 +2245,169 @@ class NodeRow extends StatelessWidget {
   }
 }
 
-class SubscriptionManageCard extends StatelessWidget {
-  const SubscriptionManageCard({super.key, required this.controller});
+class NodeDetailPage extends StatefulWidget {
+  const NodeDetailPage({
+    super.key,
+    required this.node,
+    required this.controller,
+  });
 
+  final ProxyNode node;
   final AppController controller;
 
   @override
+  State<NodeDetailPage> createState() => _NodeDetailPageState();
+}
+
+class _NodeDetailPageState extends State<NodeDetailPage> {
+  bool _showSecrets = false;
+
+  String get _subscriptionName {
+    for (final source in widget.controller.subscriptions) {
+      if (source.id == widget.node.subscriptionId) {
+        return source.name;
+      }
+    }
+    return '-';
+  }
+
+  String _mask(String value) => _showSecrets ? value : '••••••••';
+
+  Widget _secretToggle(BuildContext context) => IconButton(
+    visualDensity: VisualDensity.compact,
+    tooltip: _showSecrets ? '隐藏敏感信息' : '显示敏感信息',
+    onPressed: () => setState(() => _showSecrets = !_showSecrets),
+    icon: Icon(
+      _showSecrets ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+      size: 18,
+      color: secondaryTextColor(context),
+    ),
+  );
+
+  Widget _card(BuildContext context, List<Widget> rows) => SoftCard(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+    child: Column(
+      children: [
+        for (var i = 0; i < rows.length; i++) ...[
+          if (i > 0) Divider(height: 1, color: subtleBorderColor(context)),
+          rows[i],
+        ],
+      ],
+    ),
+  );
+
+  @override
   Widget build(BuildContext context) {
-    final source = controller.subscriptions.firstOrNull;
-    return SoftCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+    final node = widget.node;
+    final transportType = (node.transport['type']?.toString() ?? '').trim();
+    final tlsEnabled = node.tls.isNotEmpty && node.tls['enabled'] != false;
+    final sni = (node.tls['server_name'] ?? node.tls['sni'] ?? '')
+        .toString()
+        .trim();
+    return Scaffold(
+      appBar: AppBar(title: const Text('节点信息')),
+      body: ListView(
+        padding: const EdgeInsets.all(14),
         children: [
-          Row(
-            children: [
-              Text(
-                '订阅管理',
-                style: Theme.of(
-                  context,
-                ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900),
+          _card(context, [
+            DetailRow(label: '名称', value: node.name),
+            DetailRow(label: '类型', value: protocolText(node.protocol)),
+            DetailRow(label: '所属订阅', value: _subscriptionName),
+          ]),
+          const SizedBox(height: 12),
+          _card(context, [
+            DetailRow(label: '地址', value: node.server),
+            DetailRow(label: '端口', value: '${node.port}'),
+            if (node.method.isNotEmpty)
+              DetailRow(label: '加密方式', value: node.method),
+            if (node.password.isNotEmpty)
+              DetailRow(
+                label: '密码',
+                value: _mask(node.password),
+                trailing: _secretToggle(context),
               ),
-              const Spacer(),
-              TextButton.icon(
-                onPressed: controller.busy
-                    ? null
-                    : () => showSubscriptionSheet(context, controller),
-                icon: const Icon(Icons.add),
-                label: const Text('添加订阅'),
+            if (node.uuid.isNotEmpty)
+              DetailRow(
+                label: 'UUID',
+                value: _mask(node.uuid),
+                trailing: _secretToggle(context),
               ),
-            ],
-          ),
-          const SizedBox(height: 14),
-          if (source == null)
-            const EmptyState(
-              icon: Icons.rss_feed,
-              title: '暂无订阅',
-              subtitle: '添加订阅后自动导入节点',
-            )
-          else
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                border: Border.all(color: const Color(0xffdbe4f0)),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          source.name,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w900,
-                            fontSize: 16,
-                          ),
-                        ),
-                      ),
-                      const Chip(
-                        label: Text('使用中'),
-                        labelStyle: TextStyle(
-                          color: Color(0xff15b66d),
-                          fontWeight: FontWeight.w800,
-                        ),
-                        backgroundColor: Color(0xffe9fbf1),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    source.url,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Color(0xff5f6b82)),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    '最后更新： ${source.lastRefresh == null ? '-' : _dateTimeText(source.lastRefresh!)}',
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    '节点总数： ${controller.proxyNodes.where((item) => item.subscriptionId == source.id).length}',
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      OutlinedButton(
-                        onPressed: controller.busy
-                            ? null
-                            : () => controller.refreshSubscription(source),
-                        child: const Text('更新'),
-                      ),
-                      PopupMenuButton<String>(
-                        onSelected: (value) {
-                          if (value == 'delete') {
-                            controller.deleteSubscription(source);
-                          }
-                        },
-                        itemBuilder: (context) => const [
-                          PopupMenuItem(value: 'delete', child: Text('删除')),
-                        ],
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+            if (node.alterId > 0)
+              DetailRow(label: 'AlterId', value: '${node.alterId}'),
+            if (node.security.isNotEmpty)
+              DetailRow(label: '加密安全', value: node.security),
+            if (node.flow.isNotEmpty)
+              DetailRow(label: '流控', value: node.flow),
+          ]),
+          const SizedBox(height: 12),
+          _card(context, [
+            DetailRow(
+              label: '传输方式',
+              value: transportType.isEmpty ? 'none' : transportType,
             ),
+            DetailRow(label: 'TLS', value: tlsEnabled ? '开启' : '关闭'),
+            if (tlsEnabled && sni.isNotEmpty)
+              DetailRow(label: 'SNI', value: sni),
+            DetailRow(label: 'UDP 转发', value: node.udp ? '开启' : '关闭'),
+          ]),
+          const SizedBox(height: 12),
+          _card(context, [
+            DetailRow(
+              label: '延迟',
+              value: node.latencyMs == null ? '-' : '${node.latencyMs} ms',
+            ),
+            DetailRow(label: '速度', value: formatMbps(node.speedMbps)),
+            DetailRow(label: '收藏', value: node.favorite ? '是' : '否'),
+            if (node.lastTestedAt != null)
+              DetailRow(label: '最后测试', value: _timeText(node.lastTestedAt!)),
+            if (node.lastError.isNotEmpty)
+              DetailRow(label: '最近错误', value: node.lastError),
+          ]),
         ],
       ),
     );
   }
 }
 
-class QuickActionsCard extends StatelessWidget {
-  const QuickActionsCard({super.key, required this.controller});
+class DetailRow extends StatelessWidget {
+  const DetailRow({
+    super.key,
+    required this.label,
+    required this.value,
+    this.trailing,
+  });
 
-  final AppController controller;
+  final String label;
+  final String value;
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
-    final actions = [
-      QuickAction(
-        Icons.rocket_launch_outlined,
-        '自动选择',
-        () => controller.autoSelectNode(context),
-      ),
-      QuickAction(
-        Icons.monitor_heart_outlined,
-        '延迟测试',
-        controller.testAllProxyNodes,
-      ),
-      QuickAction(Icons.speed_outlined, '速度测试', () {
-        final node =
-            controller.currentNode ?? controller.visibleProxyNodes.firstOrNull;
-        if (node != null) controller.speedTestProxyNode(node);
-      }),
-      QuickAction(Icons.share_outlined, '分享应用', controller.shareApp),
-    ];
-    return SoftCard(
-      child: Column(
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            '常用功能',
-            style: Theme.of(
-              context,
-            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900),
+            label,
+            style: TextStyle(
+              fontSize: 14,
+              color: secondaryTextColor(context),
+            ),
           ),
-          const SizedBox(height: 18),
-          Row(
-            children: [
-              for (final action in actions)
-                Expanded(
-                  child: InkWell(
-                    onTap: controller.busy ? null : () => action.onTap(),
-                    borderRadius: BorderRadius.circular(12),
-                    child: Column(
-                      children: [
-                        Container(
-                          width: 50,
-                          height: 50,
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            border: Border.all(color: const Color(0xffdfe7f3)),
-                            borderRadius: BorderRadius.circular(12),
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(
-                                  0xff23406f,
-                                ).withValues(alpha: 0.05),
-                                blurRadius: 12,
-                                offset: const Offset(0, 6),
-                              ),
-                            ],
-                          ),
-                          child: Icon(
-                            action.icon,
-                            color: const Color(0xff27364f),
-                          ),
-                        ),
-                        const SizedBox(height: 9),
-                        Text(
-                          action.label,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w700,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-            ],
+          const SizedBox(width: 24),
+          Expanded(
+            child: Text(
+              value,
+              textAlign: TextAlign.right,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: primaryTextColor(context),
+              ),
+            ),
           ),
+          if (trailing != null) ...[const SizedBox(width: 4), trailing!],
         ],
       ),
     );
@@ -1837,7 +2421,7 @@ class LogsPreviewCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final logs = controller.logs.take(5).toList();
+    final logs = controller.logs.take(30).toList();
     return SoftCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1914,237 +2498,59 @@ class LogsPreviewCard extends StatelessWidget {
   }
 }
 
-class QuickAction {
-  const QuickAction(this.icon, this.label, this.onTap);
-
-  final IconData icon;
-  final String label;
-  final FutureOr<void> Function() onTap;
-}
-
-class SubscriptionsPage extends StatelessWidget {
-  const SubscriptionsPage({super.key, required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        FilledButton.icon(
-          onPressed: controller.busy
-              ? null
-              : () => showSubscriptionSheet(context, controller),
-          icon: const Icon(Icons.add_link),
-          label: const Text('添加订阅'),
-        ),
-        const SizedBox(height: 12),
-        OutlinedButton.icon(
-          onPressed: controller.busy
-              ? null
-              : controller.refreshAllSubscriptions,
-          icon: const Icon(Icons.refresh),
-          label: const Text('刷新全部'),
-        ),
-        const SizedBox(height: 16),
-        if (controller.subscriptions.isEmpty)
-          const EmptyState(
-            icon: Icons.rss_feed_outlined,
-            title: '暂无订阅',
-            subtitle: '支持 SafeLink JSON、sing-box JSON 和常见 URI 列表',
-          ),
-        for (final source in controller.subscriptions)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: RuntimeCard(
-              icon: source.kind == 'vpn'
-                  ? Icons.shield_outlined
-                  : Icons.rss_feed,
-              title: source.name,
-              subtitle: source.url,
-              meta: source.lastError.isEmpty
-                  ? source.kindLabel
-                  : source.lastError,
-              actions: [
-                IconButton(
-                  tooltip: '刷新',
-                  onPressed: controller.busy
-                      ? null
-                      : () => controller.refreshSubscription(source),
-                  icon: const Icon(Icons.refresh),
-                ),
-                IconButton(
-                  tooltip: '删除',
-                  onPressed: controller.busy
-                      ? null
-                      : () => controller.deleteSubscription(source),
-                  icon: const Icon(Icons.delete_outline),
-                ),
-              ],
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-class TunnelsPage extends StatelessWidget {
-  const TunnelsPage({super.key, required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    final sshTunnels = controller.tunnels
-        .where((item) => item.mode != 'vpn')
-        .toList();
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        FilledButton.icon(
-          onPressed: controller.busy
-              ? null
-              : () => showTunnelSheet(context, controller),
-          icon: const Icon(Icons.add),
-          label: const Text('新建 SSH 隧道'),
-        ),
-        const SizedBox(height: 16),
-        if (sshTunnels.isEmpty)
-          const EmptyState(
-            icon: Icons.alt_route_outlined,
-            title: '暂无 SSH 隧道',
-            subtitle: 'local、remote、dynamic 三种模式',
-          ),
-        for (final tunnel in sshTunnels)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: RuntimeCard(
-              icon: Icons.alt_route,
-              title: tunnel.name,
-              subtitle: '${tunnel.mode}  ${tunnel.listen} -> ${tunnel.forward}',
-              meta: tunnel.running ? 'running' : 'stopped',
-              actions: [
-                IconButton(
-                  tooltip: tunnel.running ? '停止' : '启动',
-                  onPressed: controller.busy
-                      ? null
-                      : () => controller.toggleTunnel(tunnel),
-                  icon: Icon(
-                    tunnel.running
-                        ? Icons.stop_circle_outlined
-                        : Icons.play_circle_outline,
-                  ),
-                ),
-                IconButton(
-                  tooltip: '编辑',
-                  onPressed: controller.busy
-                      ? null
-                      : () => showTunnelSheet(
-                          context,
-                          controller,
-                          tunnel: tunnel,
-                        ),
-                  icon: const Icon(Icons.edit_outlined),
-                ),
-                IconButton(
-                  tooltip: '删除',
-                  onPressed: controller.busy
-                      ? null
-                      : () => controller.deleteTunnel(tunnel),
-                  icon: const Icon(Icons.delete_outline),
-                ),
-              ],
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-class TerminalPage extends StatelessWidget {
-  const TerminalPage({super.key, required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        FilledButton.icon(
-          onPressed: controller.busy
-              ? null
-              : () => showSshSheet(context, controller),
-          icon: const Icon(Icons.person_add_alt),
-          label: const Text('保存 SSH 连接'),
-        ),
-        const SizedBox(height: 16),
-        const SectionHeader(title: 'SSH 连接', subtitle: '账号配置'),
-        const SizedBox(height: 8),
-        if (controller.sshConnections.isEmpty)
-          const EmptyState(
-            icon: Icons.terminal_outlined,
-            title: '暂无 SSH 连接',
-            subtitle: '保存连接后可打开终端',
-          ),
-        for (final conn in controller.sshConnections)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: RuntimeCard(
-              icon: Icons.dns_outlined,
-              title: conn.name,
-              subtitle: '${conn.user}@${conn.addr}',
-              actions: [
-                IconButton(
-                  tooltip: '打开',
-                  onPressed: controller.busy
-                      ? null
-                      : () => controller.openTerminal(conn),
-                  icon: const Icon(Icons.open_in_new),
-                ),
-                IconButton(
-                  tooltip: '编辑',
-                  onPressed: controller.busy
-                      ? null
-                      : () => showSshSheet(context, controller, conn: conn),
-                  icon: const Icon(Icons.edit_outlined),
-                ),
-                IconButton(
-                  tooltip: '删除',
-                  onPressed: controller.busy
-                      ? null
-                      : () => controller.deleteSshConnection(conn),
-                  icon: const Icon(Icons.delete_outline),
-                ),
-              ],
-            ),
-          ),
-        if (controller.terminalTabs.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          const SectionHeader(title: '终端', subtitle: '会话'),
-          const SizedBox(height: 8),
-          for (final tab in controller.terminalTabs)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: TerminalCard(controller: controller, tab: tab),
-            ),
-        ],
-      ],
-    );
-  }
-}
-
 class SettingsPage extends StatelessWidget {
   const SettingsPage({super.key, required this.controller});
 
   final AppController controller;
 
+  Widget _sectionLabel(BuildContext context, String text) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 6, 4, 8),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+          color: secondaryTextColor(context),
+        ),
+      ),
+    );
+  }
+
+  void _toast(BuildContext context, String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 18),
       children: [
+        _sectionLabel(context, '通用'),
+        RuntimeCard(
+          icon: Icons.dark_mode_outlined,
+          title: '外观',
+          subtitle: '当前：${AppController.themeModeLabel(controller.themeMode)}',
+          trailing: DropdownButton<String>(
+            value: controller.themeMode,
+            underline: const SizedBox.shrink(),
+            items: const [
+              DropdownMenuItem(value: 'system', child: Text('跟随系统')),
+              DropdownMenuItem(value: 'light', child: Text('浅色')),
+              DropdownMenuItem(value: 'dark', child: Text('深色')),
+            ],
+            onChanged: controller.busy
+                ? null
+                : (value) {
+                    if (value != null) {
+                      controller.setThemeMode(value);
+                    }
+                  },
+          ),
+        ),
+        const SizedBox(height: 12),
         RuntimeCard(
           icon: Icons.verified_user_outlined,
           title: '订阅证书',
@@ -2158,40 +2564,77 @@ class SettingsPage extends StatelessWidget {
                 : controller.setAllowInsecureSubscriptionCerts,
           ),
         ),
-      ],
-    );
-  }
-}
-
-class LogsPage extends StatelessWidget {
-  const LogsPage({super.key, required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        OutlinedButton.icon(
-          onPressed: controller.logs.isEmpty ? null : controller.clearLogs,
-          icon: const Icon(Icons.delete_sweep_outlined),
-          label: const Text('清空日志'),
+        const SizedBox(height: 16),
+        _sectionLabel(context, '维护'),
+        RuntimeCard(
+          icon: Icons.sync_outlined,
+          title: '刷新全部订阅',
+          subtitle: '共 ${controller.subscriptions.length} 个订阅',
+          trailing: FilledButton.tonal(
+            onPressed: controller.busy || controller.subscriptions.isEmpty
+                ? null
+                : () async {
+                    await controller.refreshAllSubscriptions();
+                    if (context.mounted) {
+                      _toast(context, '订阅刷新完成');
+                    }
+                  },
+            child: const Text('刷新'),
+          ),
         ),
         const SizedBox(height: 12),
-        if (controller.logs.isEmpty)
-          const EmptyState(
-            icon: Icons.list_alt_outlined,
-            title: '暂无日志',
-            subtitle: '运行事件会显示在这里',
+        RuntimeCard(
+          icon: Icons.speed_outlined,
+          title: '清除测试结果',
+          subtitle: '重置 ${controller.proxyNodes.length} 个节点的延迟与速度记录',
+          trailing: FilledButton.tonal(
+            onPressed: controller.busy || controller.proxyNodes.isEmpty
+                ? null
+                : () async {
+                    await controller.clearTestResults();
+                    if (context.mounted) {
+                      _toast(context, '测试结果已清除');
+                    }
+                  },
+            child: const Text('清除'),
           ),
-        for (final log in controller.logs)
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(log.levelIcon, color: log.levelColor(context)),
-            title: Text(log.message),
-            subtitle: Text(_timeText(log.at)),
+        ),
+        const SizedBox(height: 12),
+        RuntimeCard(
+          icon: Icons.delete_sweep_outlined,
+          title: '清空连接日志',
+          subtitle: '当前 ${controller.logs.length} 条记录',
+          trailing: FilledButton.tonal(
+            onPressed: controller.busy || controller.logs.isEmpty
+                ? null
+                : () async {
+                    await controller.clearLogs();
+                    if (context.mounted) {
+                      _toast(context, '日志已清空');
+                    }
+                  },
+            child: const Text('清空'),
           ),
+        ),
+        const SizedBox(height: 16),
+        _sectionLabel(context, '关于'),
+        const RuntimeCard(
+          icon: Icons.info_outline,
+          title: '应用版本',
+          subtitle: 'SafeLink 3.0.0',
+        ),
+        const SizedBox(height: 12),
+        RuntimeCard(
+          icon: Icons.memory_outlined,
+          title: '内核版本',
+          subtitle: controller.coreVersionText,
+        ),
+        const SizedBox(height: 12),
+        RuntimeCard(
+          icon: Icons.phone_android_outlined,
+          title: '设备信息',
+          subtitle: controller.deviceInfoText,
+        ),
       ],
     );
   }
@@ -2223,573 +2666,86 @@ class RuntimeStatusCard extends StatelessWidget {
   }
 }
 
-class RouteRulesPanel extends StatelessWidget {
-  const RouteRulesPanel({super.key, required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Card(
-      color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.48),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.route_outlined),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: SectionHeader(
-                    title: '规则路由',
-                    subtitle: '当前模式 ${controller.proxyModeLabel}',
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            SegmentedButton<String>(
-              segments: const [
-                ButtonSegment(
-                  value: 'rule',
-                  icon: Icon(Icons.rule),
-                  label: Text('规则'),
-                ),
-                ButtonSegment(
-                  value: 'global',
-                  icon: Icon(Icons.public),
-                  label: Text('全局'),
-                ),
-                ButtonSegment(
-                  value: 'direct',
-                  icon: Icon(Icons.near_me),
-                  label: Text('直连'),
-                ),
-              ],
-              selected: {controller.proxyMode},
-              onSelectionChanged: controller.busy
-                  ? null
-                  : (value) => controller.setProxyMode(value.first),
-            ),
-            if (controller.proxyMode == 'rule') ...[
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  OutlinedButton.icon(
-                    onPressed: controller.busy
-                        ? null
-                        : () => showRouteRuleSheet(
-                            context,
-                            controller,
-                            outbound: ProxyRule.outboundDirect,
-                          ),
-                    icon: const Icon(Icons.add),
-                    label: const Text('白名单'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: controller.busy
-                        ? null
-                        : () => showRouteRuleSheet(
-                            context,
-                            controller,
-                            outbound: ProxyRule.outboundSelected,
-                          ),
-                    icon: const Icon(Icons.add),
-                    label: const Text('代理规则'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: controller.busy
-                        ? null
-                        : () => showRouteRuleSheet(
-                            context,
-                            controller,
-                            outbound: ProxyRule.outboundBlock,
-                          ),
-                    icon: const Icon(Icons.block),
-                    label: const Text('阻断规则'),
-                  ),
-                  TextButton.icon(
-                    onPressed: controller.busy
-                        ? null
-                        : controller.resetRouteRules,
-                    icon: const Icon(Icons.restore),
-                    label: const Text('恢复默认'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              if (controller.routeRules.isEmpty)
-                const EmptyState(
-                  icon: Icons.route_outlined,
-                  title: '暂无路由规则',
-                  subtitle: '添加白名单或代理规则后会用于规则模式',
-                )
-              else
-                for (final rule in controller.routeRules)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: RouteRuleTile(rule: rule, controller: controller),
-                  ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class RouteRuleTile extends StatelessWidget {
-  const RouteRuleTile({
-    super.key,
-    required this.rule,
-    required this.controller,
-  });
-
-  final ProxyRule rule;
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return RuntimeCard(
-      icon: rule.outboundIcon,
-      title: rule.name,
-      subtitle: '${rule.typeLabel}  ${rule.value}',
-      meta: rule.outboundLabel,
-      trailing: Switch(
-        value: rule.enabled,
-        onChanged: controller.busy
-            ? null
-            : (value) => controller.setRouteRuleEnabled(rule, value),
-      ),
-      actions: [
-        IconButton(
-          tooltip: '编辑',
-          onPressed: controller.busy
-              ? null
-              : () => showRouteRuleSheet(context, controller, rule: rule),
-          icon: const Icon(Icons.edit_outlined),
-        ),
-        IconButton(
-          tooltip: '删除',
-          onPressed: controller.busy
-              ? null
-              : () => controller.removeRouteRule(rule),
-          icon: const Icon(Icons.delete_outline),
-        ),
-      ],
-    );
-  }
-}
-
-class TerminalCard extends StatefulWidget {
-  const TerminalCard({super.key, required this.controller, required this.tab});
-
-  final AppController controller;
-  final TerminalTab tab;
-
-  @override
-  State<TerminalCard> createState() => _TerminalCardState();
-}
-
-class _TerminalCardState extends State<TerminalCard> {
-  final input = TextEditingController();
-
-  @override
-  void dispose() {
-    input.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.terminal),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    widget.tab.title,
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                ),
-                IconButton(
-                  tooltip: '关闭',
-                  onPressed: () => widget.controller.closeTerminal(widget.tab),
-                  icon: const Icon(Icons.close),
-                ),
-              ],
-            ),
-            Container(
-              height: 180,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xff101418),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: SingleChildScrollView(
-                reverse: true,
-                child: Text(
-                  widget.tab.buffer,
-                  style: const TextStyle(
-                    color: Color(0xffd6e2ea),
-                    fontFamily: 'monospace',
-                    fontSize: 13,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: input,
-                    decoration: const InputDecoration(labelText: '输入'),
-                    onSubmitted: _send,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                IconButton.filled(
-                  tooltip: '发送',
-                  onPressed: () => _send(input.text),
-                  icon: const Icon(Icons.send),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _send(String value) {
-    final text = value.trimRight();
-    if (text.isEmpty) return;
-    input.clear();
-    widget.controller.sendTerminalInput(widget.tab, text);
-  }
-}
-
-Future<void> showSubscriptionSheet(
+Future<void> showSubscriptionDialog(
   BuildContext context,
   AppController controller,
 ) async {
-  final name = TextEditingController();
-  final url = TextEditingController();
-  await showModalBottomSheet<void>(
+  await showDialog<void>(
     context: context,
-    isScrollControlled: true,
-    builder: (sheetContext) {
-      return SheetFrame(
-        title: '添加订阅',
-        children: [
-          TextField(
-            controller: name,
-            decoration: const InputDecoration(labelText: '名称'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: url,
-            decoration: const InputDecoration(labelText: 'URL'),
-          ),
-          const SizedBox(height: 16),
-          FilledButton.icon(
-            onPressed: () {
-              Navigator.pop(sheetContext);
-              controller.importSubscription(name.text, url.text);
-            },
-            icon: const Icon(Icons.add_link),
-            label: const Text('导入'),
-          ),
-        ],
-      );
-    },
+    builder: (dialogContext) => _SubscriptionDialog(controller: controller),
   );
-  name.dispose();
-  url.dispose();
 }
 
-Future<void> showRouteRuleSheet(
-  BuildContext context,
-  AppController controller, {
-  ProxyRule? rule,
-  String outbound = ProxyRule.outboundDirect,
-}) async {
-  final draft = rule?.copy() ?? ProxyRule.draft(outbound);
-  final name = TextEditingController(text: draft.name);
-  final value = TextEditingController(text: draft.value);
-  var type = draft.type;
-  var selectedOutbound = draft.outbound;
-  var enabled = draft.enabled;
-  await showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    builder: (sheetContext) {
-      return StatefulBuilder(
-        builder: (context, setSheetState) {
-          return SheetFrame(
-            title: rule == null ? '添加路由规则' : '编辑路由规则',
-            children: [
-              TextField(
-                controller: name,
-                decoration: const InputDecoration(labelText: '名称'),
-              ),
-              const SizedBox(height: 12),
-              DropdownButtonFormField<String>(
-                initialValue: type,
-                decoration: const InputDecoration(labelText: '类型'),
-                items: ProxyRule.typeOptions
-                    .map(
-                      (item) => DropdownMenuItem(
-                        value: item,
-                        child: Text(ProxyRule.typeText(item)),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (next) {
-                  if (next == null) return;
-                  setSheetState(() {
-                    type = next;
-                    if (value.text.isEmpty) {
-                      value.text = ProxyRule.placeholderFor(type);
-                    }
-                  });
-                },
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: value,
-                decoration: InputDecoration(
-                  labelText: '匹配值',
-                  hintText: ProxyRule.placeholderFor(type),
-                ),
-              ),
-              const SizedBox(height: 12),
-              DropdownButtonFormField<String>(
-                initialValue: selectedOutbound,
-                decoration: const InputDecoration(labelText: '动作'),
-                items: ProxyRule.outboundOptions
-                    .map(
-                      (item) => DropdownMenuItem(
-                        value: item,
-                        child: Text(ProxyRule.outboundText(item)),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (next) => setSheetState(
-                  () => selectedOutbound = next ?? selectedOutbound,
-                ),
-              ),
-              const SizedBox(height: 8),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('启用'),
-                value: enabled,
-                onChanged: (next) => setSheetState(() => enabled = next),
-              ),
-              const SizedBox(height: 8),
-              FilledButton.icon(
-                onPressed: () {
-                  final match = value.text.trim();
-                  if (match.isEmpty) {
-                    ScaffoldMessenger.of(
-                      sheetContext,
-                    ).showSnackBar(const SnackBar(content: Text('请填写匹配值')));
-                    return;
-                  }
-                  Navigator.pop(sheetContext);
-                  controller.saveRouteRule(
-                    ProxyRule(
-                      id: draft.id,
-                      name: name.text.trim().isEmpty
-                          ? ProxyRule.outboundText(selectedOutbound)
-                          : name.text.trim(),
-                      type: type,
-                      value: match,
-                      outbound: selectedOutbound,
-                      enabled: enabled,
-                    ),
-                  );
-                },
-                icon: const Icon(Icons.save_outlined),
-                label: const Text('保存'),
-              ),
-            ],
-          );
-        },
-      );
-    },
-  );
-  name.dispose();
-  value.dispose();
+class _SubscriptionDialog extends StatefulWidget {
+  const _SubscriptionDialog({required this.controller});
+
+  final AppController controller;
+
+  @override
+  State<_SubscriptionDialog> createState() => _SubscriptionDialogState();
 }
 
-Future<void> showTunnelSheet(
-  BuildContext context,
-  AppController controller, {
-  TunnelConfig? tunnel,
-}) async {
-  final name = TextEditingController(text: tunnel?.name ?? '');
-  final listen = TextEditingController(
-    text: tunnel?.listen ?? '127.0.0.1:1080',
-  );
-  final forward = TextEditingController(text: tunnel?.forward ?? '');
-  final sshAddr = TextEditingController(text: tunnel?.sshAddr ?? '');
-  final sshUser = TextEditingController(text: tunnel?.sshUser ?? '');
-  final password = TextEditingController(text: tunnel?.password ?? '');
-  var mode = tunnel?.mode == 'vpn' ? 'local' : (tunnel?.mode ?? 'local');
-  await showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    builder: (sheetContext) {
-      return StatefulBuilder(
-        builder: (context, setSheetState) {
-          return SheetFrame(
-            title: tunnel == null ? '新建 SSH 隧道' : '编辑 SSH 隧道',
-            children: [
-              TextField(
-                controller: name,
-                decoration: const InputDecoration(labelText: '名称'),
-              ),
-              const SizedBox(height: 12),
-              DropdownButtonFormField<String>(
-                initialValue: mode,
-                decoration: const InputDecoration(labelText: '模式'),
-                items: const [
-                  DropdownMenuItem(value: 'local', child: Text('local')),
-                  DropdownMenuItem(value: 'remote', child: Text('remote')),
-                  DropdownMenuItem(value: 'dynamic', child: Text('dynamic')),
-                ],
-                onChanged: (value) =>
-                    setSheetState(() => mode = value ?? 'local'),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: listen,
-                decoration: const InputDecoration(labelText: '监听'),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: forward,
-                decoration: const InputDecoration(labelText: '目标'),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: sshAddr,
-                decoration: const InputDecoration(labelText: 'SSH 地址'),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: sshUser,
-                decoration: const InputDecoration(labelText: 'SSH 用户'),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: password,
-                obscureText: true,
-                decoration: const InputDecoration(labelText: '密码'),
-              ),
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: () {
-                  Navigator.pop(sheetContext);
-                  controller.saveTunnel(
-                    TunnelConfig(
-                      id: tunnel?.id ?? _id(),
-                      name: name.text,
-                      mode: mode,
-                      listen: listen.text,
-                      forward: forward.text,
-                      sshAddr: sshAddr.text,
-                      sshUser: sshUser.text,
-                      password: password.text,
-                    ),
-                  );
-                },
-                icon: const Icon(Icons.save_outlined),
-                label: const Text('保存'),
-              ),
-            ],
-          );
-        },
-      );
-    },
-  );
-  for (final item in [name, listen, forward, sshAddr, sshUser, password]) {
-    item.dispose();
+class _SubscriptionDialogState extends State<_SubscriptionDialog> {
+  // 控制器由 State 持有，待弹窗退场动画结束后随组件一起释放，
+  // 避免关闭瞬间提前 dispose 触发框架断言（_dependents.isEmpty）
+  final _url = TextEditingController();
+
+  @override
+  void dispose() {
+    _url.dispose();
+    super.dispose();
   }
-}
 
-Future<void> showSshSheet(
-  BuildContext context,
-  AppController controller, {
-  SshConnection? conn,
-}) async {
-  final name = TextEditingController(text: conn?.name ?? '');
-  final addr = TextEditingController(text: conn?.addr ?? '');
-  final user = TextEditingController(text: conn?.user ?? '');
-  final password = TextEditingController(text: conn?.password ?? '');
-  await showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    builder: (sheetContext) {
-      return SheetFrame(
-        title: conn == null ? '保存 SSH 连接' : '编辑 SSH 连接',
-        children: [
-          TextField(
-            controller: name,
-            decoration: const InputDecoration(labelText: '名称'),
+  void _download() {
+    final url = _url.text.trim();
+    if (url.isEmpty) return;
+    Navigator.pop(context);
+    widget.controller.importSubscription(url);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      title: const Text(
+        '从给定的 URL 下载配置…',
+        textAlign: TextAlign.center,
+        style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
+      ),
+      content: TextField(
+        controller: _url,
+        autofocus: true,
+        keyboardType: TextInputType.url,
+        onSubmitted: (_) => _download(),
+        decoration: InputDecoration(
+          hintText: 'URL',
+          filled: true,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide.none,
           ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: addr,
-            decoration: const InputDecoration(labelText: '地址'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: user,
-            decoration: const InputDecoration(labelText: '用户'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: password,
-            obscureText: true,
-            decoration: const InputDecoration(labelText: '密码'),
-          ),
-          const SizedBox(height: 16),
-          FilledButton.icon(
-            onPressed: () {
-              Navigator.pop(sheetContext);
-              controller.saveSshConnection(
-                SshConnection(
-                  id: conn?.id ?? _id(),
-                  name: name.text,
-                  addr: addr.text,
-                  user: user.text,
-                  password: password.text,
-                ),
-              );
+          suffixIcon: IconButton(
+            tooltip: '粘贴',
+            icon: const Icon(Icons.content_paste),
+            onPressed: () async {
+              final clip = await Clipboard.getData(Clipboard.kTextPlain);
+              final text = clip?.text?.trim();
+              if (text != null && text.isNotEmpty) {
+                _url.text = text;
+              }
             },
-            icon: const Icon(Icons.save_outlined),
-            label: const Text('保存'),
           ),
-        ],
-      );
-    },
-  );
-  for (final item in [name, addr, user, password]) {
-    item.dispose();
+        ),
+      ),
+      actionsAlignment: MainAxisAlignment.spaceEvenly,
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(onPressed: _download, child: const Text('下载')),
+      ],
+    );
   }
 }
 
@@ -2813,7 +2769,13 @@ class SheetFrame extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(title, style: Theme.of(context).textTheme.titleLarge),
+            Text(
+              title,
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.w800,
+                color: primaryTextColor(context),
+              ),
+            ),
             const SizedBox(height: 16),
             ...children,
           ],
@@ -2843,45 +2805,56 @@ class RuntimeCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      color: Theme.of(
-        context,
-      ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.48),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Row(
-          children: [
-            Icon(icon),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.titleMedium,
+    final accent = Theme.of(context).colorScheme.primary;
+    return SoftCard(
+      padding: const EdgeInsets.all(14),
+      child: Row(
+        children: [
+          Icon(icon, color: accent),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 15,
+                    color: primaryTextColor(context),
                   ),
-                  const SizedBox(height: 2),
-                  Text(subtitle, maxLines: 2, overflow: TextOverflow.ellipsis),
-                  if (meta != null && meta!.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 4),
-                      child: Text(
-                        meta!,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  subtitle,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: secondaryTextColor(context),
+                  ),
+                ),
+                if (meta != null && meta!.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      meta!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: secondaryTextColor(context),
                       ),
                     ),
-                ],
-              ),
+                  ),
+              ],
             ),
-            ?trailing,
-            if (actions.isNotEmpty) ...actions,
-          ],
-        ),
+          ),
+          ?trailing,
+          if (actions.isNotEmpty) ...actions,
+        ],
       ),
     );
   }
@@ -2902,50 +2875,42 @@ class StatTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: (MediaQuery.sizeOf(context).width - 44) / 2,
-      child: Card(
-        color: Theme.of(context).colorScheme.secondaryContainer,
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Row(
-            children: [
-              Icon(icon),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      value,
-                      style: Theme.of(context).textTheme.headlineSmall,
+      width: (MediaQuery.sizeOf(context).width - 41) / 2,
+      child: SoftCard(
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          children: [
+            Icon(icon, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    value,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800,
+                      color: primaryTextColor(context),
                     ),
-                    Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  ],
-                ),
+                  ),
+                  Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: secondaryTextColor(context),
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
-    );
-  }
-}
-
-class SectionHeader extends StatelessWidget {
-  const SectionHeader({super.key, required this.title, required this.subtitle});
-
-  final String title;
-  final String subtitle;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(title, style: Theme.of(context).textTheme.headlineSmall),
-        const SizedBox(height: 2),
-        Text(subtitle, style: Theme.of(context).textTheme.bodyMedium),
-      ],
     );
   }
 }
@@ -3521,56 +3486,6 @@ class TunnelConfig {
   }
 }
 
-class SshConnection {
-  SshConnection({
-    required this.id,
-    required this.name,
-    required this.addr,
-    required this.user,
-    required this.password,
-  });
-
-  final String id;
-  String name;
-  String addr;
-  String user;
-  String password;
-
-  Map<String, dynamic> toJson() => {
-    'id': id,
-    'name': name,
-    'addr': addr,
-    'user': user,
-    'password': password,
-  };
-
-  static SshConnection fromJson(Map<String, dynamic> json) => SshConnection(
-    id: json['id'] as String? ?? _id(),
-    name: json['name'] as String? ?? '',
-    addr: json['addr'] as String? ?? '',
-    user: json['user'] as String? ?? '',
-    password: json['password'] as String? ?? '',
-  );
-}
-
-class TerminalTab {
-  TerminalTab({
-    required this.id,
-    required this.sessionId,
-    required this.title,
-    required this.connection,
-    required this.buffer,
-    required this.connected,
-  });
-
-  final String id;
-  final String sessionId;
-  final String title;
-  final SshConnection connection;
-  String buffer;
-  bool connected;
-}
-
 class RuntimeSession {
   RuntimeSession({
     required this.kind,
@@ -3721,6 +3636,10 @@ Color latencyColor(int? value) {
 }
 
 String flagForNode(ProxyNode node) {
+  // 节点名自带旗帜 emoji 时不再重复追加
+  if (RegExp(r'[\u{1F1E6}-\u{1F1FF}]', unicode: true).hasMatch(node.name)) {
+    return '';
+  }
   final text = '${node.name} ${node.server}'.toLowerCase();
   if (text.contains('sg') ||
       text.contains('singapore') ||

@@ -35,6 +35,10 @@ func TestImportFetchesAndImportsVPNTunnels(t *testing.T) {
 	}
 
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.UserAgent(); got != "ClashVerge/2.4.1" {
+			t.Fatalf("User-Agent = %q, want ClashVerge/2.4.1", got)
+		}
+		w.Header().Set("subscription-userinfo", "upload=1024; download=2048; total=10240; expire=1800000000")
 		_, _ = w.Write(body)
 	}))
 	t.Cleanup(httpSrv.Close)
@@ -53,6 +57,9 @@ func TestImportFetchesAndImportsVPNTunnels(t *testing.T) {
 	}
 	if subs[0].Format != subscription.FormatSafeLinkJSON || subs[0].TunnelCount != 1 || subs[0].LastRefresh == "" || !subs[0].Enabled {
 		t.Fatalf("subscription metadata not updated: %+v", subs[0])
+	}
+	if subs[0].UsageUpload != 1024 || subs[0].UsageDownload != 2048 || subs[0].UsageTotal != 10240 || subs[0].UsageExpire != 1800000000 {
+		t.Fatalf("subscription usage not captured: %+v", subs[0])
 	}
 
 	statuses := mgr.List()
@@ -76,6 +83,7 @@ proxies:
 `)
 
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("subscription-userinfo", "upload=1024; download=2048; total=10240; expire=1800000000")
 		_, _ = w.Write(body)
 	}))
 	t.Cleanup(httpSrv.Close)
@@ -90,6 +98,9 @@ proxies:
 	}
 	if !result.Source.Enabled {
 		t.Fatalf("imported subscription should be enabled by default: %+v", result.Source)
+	}
+	if result.Source.UsageUpload != 1024 || result.Source.UsageDownload != 2048 || result.Source.UsageTotal != 10240 || result.Source.UsageExpire != 1800000000 {
+		t.Fatalf("subscription usage not captured: %+v", result.Source)
 	}
 
 	nodes, err := st.LoadProxyNodes()

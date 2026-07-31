@@ -836,6 +836,18 @@ button:disabled {
   margin-bottom: 14px;
 }
 
+.home-node-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.home-usage {
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .home-node-section .list-empty {
   min-height: 116px;
   border: 1px dashed #d9e3f1;

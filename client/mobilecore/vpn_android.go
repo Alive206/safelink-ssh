@@ -119,15 +119,22 @@ func (c *Core) vpnStatus(data map[string]any) string {
 	if c.vpn == nil {
 		return ok(map[string]any{"state": "stopped"})
 	}
+	bytesIn, bytesOut, downloadBps, uploadBps := c.vpn.sampleTraffic(time.Now())
 	return ok(map[string]any{
-		"name":        c.vpn.name,
-		"kind":        c.vpn.kind,
-		"state":       c.vpn.state,
-		"last_error":  c.vpn.lastError,
-		"started_at":  c.vpn.startedAt.Format(time.RFC3339),
-		"bytes_in":    c.vpn.bytesIn,
-		"bytes_out":   c.vpn.bytesOut,
-		"uptime_secs": int64(time.Since(c.vpn.startedAt).Seconds()),
+		"name":       c.vpn.name,
+		"kind":       c.vpn.kind,
+		"state":      c.vpn.state,
+		"last_error": c.vpn.lastError,
+		"started_at": c.vpn.startedAt.Format(time.RFC3339),
+		"bytes_in":   bytesIn,
+		"bytes_out":  bytesOut,
+		// 上行=写出隧道，下行=从隧道读入；与 sing-box 那条链路的字段名保持一致，
+		// Dart 侧才能用同一套 key 解析两种 VPN。
+		"upload_total_bytes":   bytesOut,
+		"download_total_bytes": bytesIn,
+		"upload_speed_bps":     uploadBps,
+		"download_speed_bps":   downloadBps,
+		"uptime_secs":          int64(time.Since(c.vpn.startedAt).Seconds()),
 	})
 }
 
@@ -272,7 +279,7 @@ func pipeAndroidTUNToQUIC(ctx context.Context, vpn *mobileVPN, tun *os.File, str
 				}
 			}
 		}
-		vpn.bytesOut += uint64(n)
+		vpn.bytesOut.Add(uint64(n))
 	}
 }
 
@@ -298,7 +305,7 @@ func pipeQUICToAndroidTUN(ctx context.Context, vpn *mobileVPN, stream quic.Strea
 		if _, err := tun.Write(buf[:pktLen]); err != nil {
 			return
 		}
-		vpn.bytesIn += uint64(pktLen)
+		vpn.bytesIn.Add(uint64(pktLen))
 	}
 }
 

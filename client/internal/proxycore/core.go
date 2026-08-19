@@ -10,10 +10,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +32,26 @@ const (
 
 	DefaultTestURL = "http://www.gstatic.com/generate_204"
 
+	// 每个测速操作都要单独拉起一个 sing-box 进程，进程级并发保持保守
 	defaultNodeTestConcurrency = 8
+
+	// 批量测速里所有节点共用同一个 sing-box，worker 只是并发查 Clash API，
+	// 属于纯 I/O 等待，可以比进程级并发开大很多
+	defaultBatchTestConcurrency = 32
+
+	// TCP 握手测试不用拉进程，纯网络等待，并发可以再开大一些
+	defaultTCPTestConcurrency = 64
+
+	// 单次 TCP 握手容易受瞬时抖动影响，多量几次取最小值
+	defaultTCPTestAttempts = 2
+
+	// hysteria v1 refuses to start without bandwidth hints
+	defaultHysteriaMbps = 100
+
+	// sing-box 的 REALITY 客户端必须开 uTLS，链接里没给 fp 时用这个默认指纹
+	defaultUTLSFingerprint = "chrome"
+	// vmess/vless 的 UDP 封装默认用 xudp：机场服务端多为 Xray，不开的话 UDP 转发会异常
+	defaultPacketEncoding = proxysubscription.PacketEncodingXUDP
 
 	ProxyModeRule   = "rule"
 	ProxyModeGlobal = "global"
@@ -53,6 +75,12 @@ var testURLs = []string{
 	"http://www.msftconnecttest.com/connecttest.txt",
 }
 
+// dnsDirectTag 是配置里直连 DNS 服务器的 tag，同时用作 default_domain_resolver。
+const dnsDirectTag = "dns-direct"
+
+// 系统没给出可用 DNS 时的兜底，公共 DNS 在部分园区网会被拦，所以优先用系统下发的。
+var fallbackDNSServers = []string{"223.5.5.5", "119.29.29.29"}
+
 var fastTestURLs = []string{
 	"http://cp.cloudflare.com/generate_204",
 	"http://www.gstatic.com/generate_204",
@@ -67,6 +95,9 @@ type Options struct {
 	ClashAPIAddr  string
 	Mode          string
 	RuleModeRules []config.ProxyRule
+	// DNSServers 是解析节点服务器域名用的 DNS。Android 上没有 /etc/resolv.conf，
+	// sing-box 默认的 local DNS 会退化成查 127.0.0.1:53 直接失败，必须显式给出。
+	DNSServers []string
 }
 
 type Status struct {
@@ -376,6 +407,9 @@ func emitTestResult(onResult func(TestResult), result TestResult) {
 	}
 }
 
+// TestNode 测单个节点的延迟。TCP 协议的节点直接量 TCP 握手耗时（tcping）：不用拉起
+// sing-box，也不依赖 generate_204 这类探测域名，探测站点被墙时不会把好节点判成不可用。
+// hysteria/tuic 这类跑在 QUIC(UDP) 上的节点没有 TCP 端口可握手，仍旧交给 core 探测。
 func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Options, timeout time.Duration) TestResult {
 	if ctx == nil {
 		ctx = context.Background()
@@ -390,6 +424,79 @@ func TestNode(ctx context.Context, node proxysubscription.ProxyNode, opts Option
 	}
 	if timeout <= 0 {
 		timeout = 5 * time.Second
+	}
+	if !tcpHandshakeProtocol(node.Protocol) {
+		return testNodeWithCore(ctx, node, opts, timeout)
+	}
+	latency, err := testTCPHandshake(ctx, node, timeout)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.OK = true
+	result.LatencyMS = latency
+	return result
+}
+
+// tcpHandshakeProtocol 判断协议是不是跑在 TCP 上。hysteria/hysteria2/tuic 只监听 UDP，
+// 对它们做 TCP 握手必然失败，不能用 tcping 判断可用性。
+func tcpHandshakeProtocol(protocol string) bool {
+	switch protocol {
+	case proxysubscription.ProtocolShadowsocks, proxysubscription.ProtocolVMess,
+		proxysubscription.ProtocolVLESS, proxysubscription.ProtocolTrojan,
+		proxysubscription.ProtocolAnyTLS:
+		return true
+	default:
+		return false
+	}
+}
+
+// testTCPHandshake 连续量几次 TCP 握手取最小值：第一次会带上 DNS 解析耗时，
+// 取最小值能把解析开销和瞬时抖动抹掉。
+func testTCPHandshake(ctx context.Context, node proxysubscription.ProxyNode, timeout time.Duration) (int64, error) {
+	addr := net.JoinHostPort(node.Server, strconv.Itoa(node.Port))
+	var best int64
+	var lastErr error
+	for attempt := 0; attempt < defaultTCPTestAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			lastErr = err
+			break
+		}
+		latency, err := dialTCPLatency(ctx, addr, timeout)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if best == 0 || latency < best {
+			best = latency
+		}
+	}
+	if best > 0 {
+		return best, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no tcp handshake attempt succeeded")
+	}
+	return 0, fmt.Errorf("tcp connect %s failed: %w", addr, lastErr)
+}
+
+func dialTCPLatency(ctx context.Context, addr string, timeout time.Duration) (int64, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	latency := time.Since(start)
+	_ = conn.Close()
+	return max(latency.Milliseconds(), 1), nil
+}
+
+func testNodeWithCore(ctx context.Context, node proxysubscription.ProxyNode, opts Options, timeout time.Duration) TestResult {
+	result := TestResult{
+		NodeName: node.Name,
+		TestedAt: time.Now().Format(time.RFC3339),
 	}
 	opts = normalizeOptions(opts)
 	if opts.CorePath == "" {
@@ -620,6 +727,22 @@ func SpeedTestNode(ctx context.Context, node proxysubscription.ProxyNode, opts O
 		return result
 	}
 
+	// 顺带量一次延迟，测速成功后列表可以直接显示延迟。口径和 TestNode 保持一致：
+	// TCP 协议量握手耗时，QUIC 协议才走 core 探测。
+	delayTimeout := timeout
+	if delayTimeout > 5*time.Second {
+		delayTimeout = 5 * time.Second
+	}
+	if tcpHandshakeProtocol(node.Protocol) {
+		if latency, delayErr := testTCPHandshake(testCtx, node, delayTimeout); delayErr == nil {
+			result.LatencyMS = latency
+		}
+	} else if latency, delayErr := testCoreDelay(testCtx, clashAPIAddr, delayTimeout); delayErr == nil {
+		result.LatencyMS = latency
+	} else if latency, delayErr := testHTTPInboundDelay(testCtx, httpAddr, delayTimeout); delayErr == nil {
+		result.LatencyMS = latency
+	}
+
 	dialTimeout := timeout
 	if dialTimeout <= 0 || dialTimeout > 3*time.Second {
 		dialTimeout = 3 * time.Second
@@ -657,6 +780,8 @@ type batchTestAttempt struct {
 	result TestResult
 }
 
+// TestNodes 批量测延迟：先按协议分流，TCP 协议的节点并发量 TCP 握手（不用拉 sing-box），
+// 只有 QUIC 协议的节点才共用一个 core 进程去探测。
 func TestNodes(ctx context.Context, nodes []proxysubscription.ProxyNode, opts Options, timeout time.Duration, onResult func(TestResult)) []TestResult {
 	if ctx == nil {
 		ctx = context.Background()
@@ -665,6 +790,81 @@ func TestNodes(ctx context.Context, nodes []proxysubscription.ProxyNode, opts Op
 		timeout = 5 * time.Second
 	}
 
+	testedAt := time.Now().Format(time.RFC3339)
+	results := make([]TestResult, len(nodes))
+	for i, node := range nodes {
+		results[i] = TestResult{
+			NodeName: node.Name,
+			TestedAt: testedAt,
+		}
+	}
+	if len(nodes) == 0 {
+		return results
+	}
+
+	tcpIndexes := make([]int, 0, len(nodes))
+	coreIndexes := make([]int, 0, len(nodes))
+	coreNodes := make([]proxysubscription.ProxyNode, 0, len(nodes))
+	for i, node := range nodes {
+		switch {
+		case node.Server == "" || node.Port <= 0:
+			results[i].Error = "proxy node has invalid server or port"
+			emitTestResult(onResult, results[i])
+		case tcpHandshakeProtocol(node.Protocol):
+			tcpIndexes = append(tcpIndexes, i)
+		default:
+			coreIndexes = append(coreIndexes, i)
+			coreNodes = append(coreNodes, node)
+		}
+	}
+
+	if len(tcpIndexes) > 0 {
+		testTCPNodes(ctx, nodes, tcpIndexes, results, timeout, onResult)
+	}
+	if len(coreNodes) > 0 {
+		for i, result := range testNodesWithCore(ctx, coreNodes, opts, timeout, onResult) {
+			results[coreIndexes[i]] = result
+		}
+	}
+	return results
+}
+
+// testTCPNodes 并发跑 TCP 握手测试，结果写回 results 对应下标。
+func testTCPNodes(ctx context.Context, nodes []proxysubscription.ProxyNode, indexes []int, results []TestResult, timeout time.Duration, onResult func(TestResult)) {
+	jobs := make(chan int)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < min(defaultTCPTestConcurrency, len(indexes)); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				node := nodes[index]
+				result := TestResult{
+					NodeName: node.Name,
+					TestedAt: time.Now().Format(time.RFC3339),
+				}
+				if latency, err := testTCPHandshake(ctx, node, timeout); err != nil {
+					result.Error = err.Error()
+				} else {
+					result.OK = true
+					result.LatencyMS = latency
+				}
+				mu.Lock()
+				results[index] = result
+				emitTestResult(onResult, result)
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, index := range indexes {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func testNodesWithCore(ctx context.Context, nodes []proxysubscription.ProxyNode, opts Options, timeout time.Duration, onResult func(TestResult)) []TestResult {
 	testedAt := time.Now().Format(time.RFC3339)
 	results := make([]TestResult, len(nodes))
 	for i, node := range nodes {
@@ -714,7 +914,7 @@ func TestNodes(ctx context.Context, nodes []proxysubscription.ProxyNode, opts Op
 		return results
 	}
 
-	workerCount := min(defaultNodeTestConcurrency, len(outbounds))
+	workerCount := min(defaultBatchTestConcurrency, len(outbounds))
 	batchTimeout := 5*time.Second + timeout*time.Duration((len(outbounds)+workerCount-1)/workerCount)
 	testCtx, cancel := context.WithTimeout(ctx, batchTimeout)
 	defer cancel()
@@ -751,9 +951,8 @@ func TestNodes(ctx context.Context, nodes []proxysubscription.ProxyNode, opts Op
 	if err := os.WriteFile(configPath, cfg, 0o600); err != nil {
 		return finishPendingTestResults(results, fmt.Errorf("write test config: %v", err), onResult)
 	}
-	if err := checkCoreConfig(testCtx, opts.CorePath, configPath, testDir); err != nil {
-		return finishPendingTestResults(results, err, onResult)
-	}
+	// 这份配置由 buildBatchTestConfig 自己生成，不再额外跑一次 sing-box check：
+	// 配置有问题时 core 会启动失败，错误信息同样会通过 coreOutput 带出来。
 
 	runCtx, stopCore := context.WithCancel(testCtx)
 	defer stopCore()
@@ -925,6 +1124,27 @@ func testCoreDelayForTag(ctx context.Context, clashAPIAddr, proxyTag string, tim
 	if len(urls) == 0 {
 		return 0, errors.New("no delay test URL available")
 	}
+	if len(urls) == 1 {
+		return raceCoreDelayURLs(ctx, clashAPIAddr, proxyTag, timeout, urls)
+	}
+	// 先只打首选 URL，节点正常时一次请求就够；失败了再用剩下的预算并发补测其余 URL。
+	// 批量测速时穿过代理的请求数因此从 len(urls) 降到 1，节点多的时候差别很明显。
+	primaryTimeout := timeout / 2
+	delay, primaryErr := raceCoreDelayURLs(ctx, clashAPIAddr, proxyTag, primaryTimeout, urls[:1])
+	if primaryErr == nil {
+		return delay, nil
+	}
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	delay, err := raceCoreDelayURLs(ctx, clashAPIAddr, proxyTag, timeout-primaryTimeout, urls[1:])
+	if err != nil {
+		return 0, fmt.Errorf("%v; %v", primaryErr, err)
+	}
+	return delay, nil
+}
+
+func raceCoreDelayURLs(ctx context.Context, clashAPIAddr, proxyTag string, timeout time.Duration, urls []string) (int64, error) {
 	testCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	client := &http.Client{Timeout: timeout}
@@ -1154,6 +1374,7 @@ func BuildConfig(node proxysubscription.ProxyNode, opts Options) ([]byte, error)
 		},
 		"route": route,
 	}
+	applyDNSConfig(cfg, route, opts)
 	experimental := make(map[string]any)
 	if _, ok := route["rule_set"]; ok {
 		experimental["cache_file"] = map[string]any{
@@ -1185,6 +1406,9 @@ func buildBatchTestConfig(nodes []batchTestOutbound, opts Options) ([]byte, erro
 		map[string]any{"type": "direct", "tag": "direct"},
 		map[string]any{"type": "block", "tag": "block"},
 	)
+	route := map[string]any{
+		"final": nodes[0].tag,
+	}
 	cfg := map[string]any{
 		"log": map[string]any{
 			"level": "warn",
@@ -1194,9 +1418,7 @@ func buildBatchTestConfig(nodes []batchTestOutbound, opts Options) ([]byte, erro
 			buildInbound("http-in", "http", opts.HTTPAddr),
 		},
 		"outbounds": outbounds,
-		"route": map[string]any{
-			"final": nodes[0].tag,
-		},
+		"route":     route,
 		"experimental": map[string]any{
 			"clash_api": map[string]any{
 				"external_controller": opts.ClashAPIAddr,
@@ -1204,7 +1426,66 @@ func buildBatchTestConfig(nodes []batchTestOutbound, opts Options) ([]byte, erro
 			},
 		},
 	}
+	applyDNSConfig(cfg, route, opts)
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// applyDNSConfig 给配置补上 dns 段和 default_domain_resolver。缺了这两个，
+// Android 上节点域名一个都解析不出来，测延迟和连接会全部失败。
+func applyDNSConfig(cfg map[string]any, route map[string]any, opts Options) {
+	server := firstDNSServer(opts.DNSServers)
+	if server == "" {
+		return
+	}
+	cfg["dns"] = map[string]any{
+		"servers": []map[string]any{
+			{"type": "udp", "tag": dnsDirectTag, "server": server},
+		},
+		"final":    dnsDirectTag,
+		"strategy": "prefer_ipv4",
+	}
+	route["default_domain_resolver"] = map[string]any{"server": dnsDirectTag}
+}
+
+func firstDNSServer(servers []string) string {
+	for _, server := range servers {
+		if addr := strings.TrimSpace(server); addr != "" {
+			return addr
+		}
+	}
+	return ""
+}
+
+// normalizeDNSServers 只保留能直接喂给 sing-box 的 IP：链路本地和带 zone 的地址（fe80::1%wlan0）
+// 用不了，先剔掉；再把 IPv4 排到前面，IPv6-only 的环境才会用到 v6。
+// Android 上拿不到系统 DNS 时用公共 DNS 兜底；其他平台（Windows 等）的 local DNS
+// 本身可用，不注入 dns 段以保持原有行为。
+func normalizeDNSServers(servers []string) []string {
+	v4 := make([]string, 0, len(servers))
+	v6 := make([]string, 0, len(servers))
+	for _, server := range servers {
+		addr := strings.TrimSpace(server)
+		if addr == "" {
+			continue
+		}
+		ip, err := netip.ParseAddr(addr)
+		if err != nil || !ip.IsValid() || ip.IsLoopback() || ip.IsUnspecified() {
+			continue
+		}
+		if ip.Zone() != "" || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			continue
+		}
+		if ip.Is4() || ip.Is4In6() {
+			v4 = append(v4, ip.Unmap().String())
+			continue
+		}
+		v6 = append(v6, ip.String())
+	}
+	normalized := append(v4, v6...)
+	if len(normalized) == 0 && runtime.GOOS == "android" {
+		return append(normalized, fallbackDNSServers...)
+	}
+	return normalized
 }
 
 func buildRoute(mode string, rules []config.ProxyRule) (map[string]any, error) {
@@ -1314,19 +1595,33 @@ func buildOutbound(node proxysubscription.ProxyNode) (map[string]any, error) {
 		if node.AlterID > 0 {
 			out["alter_id"] = node.AlterID
 		}
+		if encoding := packetEncodingFor(node.PacketEncoding); encoding != "" {
+			out["packet_encoding"] = encoding
+		}
 	case proxysubscription.ProtocolVLESS:
 		out["uuid"] = node.UUID
 		if node.Flow != "" {
 			out["flow"] = node.Flow
 		}
-	case proxysubscription.ProtocolTrojan, proxysubscription.ProtocolHysteria, proxysubscription.ProtocolHysteria2, proxysubscription.ProtocolAnyTLS:
+		if encoding := packetEncodingFor(node.PacketEncoding); encoding != "" {
+			out["packet_encoding"] = encoding
+		}
+	case proxysubscription.ProtocolTrojan, proxysubscription.ProtocolHysteria2, proxysubscription.ProtocolAnyTLS:
 		out["password"] = node.Password
+	case proxysubscription.ProtocolHysteria:
+		// hysteria v1 uses auth_str and requires both bandwidth hints
+		out["auth_str"] = node.Password
+		out["up_mbps"] = defaultHysteriaMbps
+		out["down_mbps"] = defaultHysteriaMbps
 	case proxysubscription.ProtocolTUIC:
 		out["uuid"] = node.UUID
 		out["password"] = node.Password
 	}
 	if node.TLS != nil && node.TLS.Enabled {
 		out["tls"] = buildTLS(node.TLS)
+	} else if alwaysTLSProtocol(node.Protocol) {
+		// hysteria/tuic/anytls 链接经常不带 security/sni，不补 tls 段 sing-box 会报 "TLS required"
+		out["tls"] = buildTLS(&proxysubscription.TLSOptions{Enabled: true})
 	}
 	if supportsOutboundTransport(node.Protocol) && normalizedTransportType(node.Transport.Type) != "" {
 		out["transport"] = buildTransport(node.Transport)
@@ -1345,33 +1640,77 @@ func buildTLS(tls *proxysubscription.TLSOptions) map[string]any {
 	if len(tls.ALPN) > 0 {
 		out["alpn"] = tls.ALPN
 	}
+	fingerprint := tls.Fingerprint
 	if tls.PublicKey != "" {
 		out["reality"] = map[string]any{
 			"enabled":    true,
 			"public_key": tls.PublicKey,
 			"short_id":   tls.ShortID,
 		}
+		// sing-box 的 REALITY 客户端必须配 uTLS（否则报 "uTLS is required by reality client"），
+		// 而很多机场的 vless+reality 链接不带 fp 参数，这里给个默认值。
+		fingerprint = firstNonEmpty(fingerprint, defaultUTLSFingerprint)
 	}
-	if tls.Fingerprint != "" {
+	if fingerprint != "" {
 		out["utls"] = map[string]any{
 			"enabled":     true,
-			"fingerprint": tls.Fingerprint,
+			"fingerprint": fingerprint,
 		}
 	}
 	return out
 }
 
+func alwaysTLSProtocol(protocol string) bool {
+	switch protocol {
+	case proxysubscription.ProtocolHysteria, proxysubscription.ProtocolHysteria2,
+		proxysubscription.ProtocolTUIC, proxysubscription.ProtocolAnyTLS:
+		return true
+	default:
+		return false
+	}
+}
+
 func buildTransport(transport proxysubscription.TransportOptions) map[string]any {
-	out := map[string]any{"type": normalizedTransportType(transport.Type)}
+	transportType := normalizedTransportType(transport.Type)
+	out := map[string]any{"type": transportType}
+	switch transportType {
+	case "grpc":
+		// gRPC only accepts service_name, path/headers are rejected by sing-box
+		if service := strings.TrimPrefix(strings.TrimSpace(transport.Path), "/"); service != "" {
+			out["service_name"] = service
+		}
+		return out
+	case "quic":
+		return out
+	}
 	if transport.Path != "" {
 		out["path"] = transport.Path
 	}
 	if transport.Host != "" {
-		out["headers"] = map[string]string{"Host": transport.Host}
+		if transportType == "http" {
+			out["host"] = []string{transport.Host}
+		} else {
+			out["headers"] = map[string]string{"Host": transport.Host}
+		}
 	} else if len(transport.Headers) > 0 {
 		out["headers"] = transport.Headers
 	}
 	return out
+}
+
+// packetEncodingFor 决定 vmess/vless 的 UDP 封装方式。机场链接基本不带这个参数，
+// 而服务端多数是 Xray，默认上 xudp 游戏/语音这类 UDP 流量才能转发。
+// 节点显式写了 none 的情况下不写该字段，交给内核用自己的默认行为。
+func packetEncodingFor(nodeValue string) string {
+	encoding := proxysubscription.NormalizePacketEncoding(nodeValue)
+	switch encoding {
+	case proxysubscription.PacketEncodingDisabled:
+		return ""
+	case "":
+		return defaultPacketEncoding
+	default:
+		return encoding
+	}
 }
 
 func supportsOutboundTransport(protocol string) bool {
@@ -1432,6 +1771,7 @@ func normalizeOptions(opts Options) Options {
 	}
 	opts.Mode = NormalizeMode(opts.Mode)
 	opts.RuleModeRules = normalizeRuleModeRules(opts.RuleModeRules)
+	opts.DNSServers = normalizeDNSServers(opts.DNSServers)
 	return opts
 }
 

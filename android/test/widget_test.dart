@@ -33,7 +33,10 @@ void main() {
     expect(find.text('路由模式'), findsOneWidget);
     expect(find.text('连通性测试'), findsOneWidget);
     expect(find.text('暂无订阅'), findsOneWidget);
-    expect(find.text('点击订阅可以折叠和展开子节点。圆点代表默认节点。'), findsOneWidget);
+    expect(
+      find.text('点击订阅可以折叠和展开子节点。圆点代表默认节点，连接中点击其他节点会直接切换。'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('proxy mode sheet opens from status card', (tester) async {
@@ -77,9 +80,27 @@ void main() {
     expect(find.text('下载速度'), findsOneWidget);
     expect(find.text('上传流量'), findsOneWidget);
     expect(find.text('下载流量'), findsOneWidget);
-    await tester.drag(find.byType(ListView), const Offset(0, -400));
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -400));
     await tester.pumpAndSettle();
     expect(find.text('连接日志'), findsOneWidget);
+    expect(find.text('暂无日志'), findsOneWidget);
+  });
+
+  testWidgets('empty log card fills the remaining viewport height', (
+    tester,
+  ) async {
+    // 默认 800x600 的测试画布放不下日志卡片，这里用手机尺寸验证拉伸效果
+    tester.view.physicalSize = const Size(1080, 2400);
+    tester.view.devicePixelRatio = 3;
+    addTearDown(tester.view.reset);
+
+    await openTab(tester, '数据');
+
+    final card = tester.getRect(find.byType(LogsPreviewCard));
+    final viewport = tester.getRect(find.byType(CustomScrollView));
+    // 空日志时日志卡片一直拉通到页面底部，只留下卡片自身的外边距
+    expect(card.bottom, closeTo(viewport.bottom - 18, 1));
+    expect(card.height, greaterThan(300));
   });
 
   testWidgets('settings tab switches theme mode', (tester) async {

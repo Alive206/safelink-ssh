@@ -125,6 +125,8 @@ func TestCoreDelayReturnsFirstHealthyProbe(t *testing.T) {
 	}
 }
 
+// TestNodeDoesNotUseTCPConnectFallbackForProxyDelay 盯的是仍然走 core 探测的 QUIC 协议：
+// hysteria2 的端口能 TCP 连上也不代表代理可用（它跑在 UDP 上），不能拿 TCP 握手兜底。
 func TestNodeDoesNotUseTCPConnectFallbackForProxyDelay(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -143,10 +145,9 @@ func TestNodeDoesNotUseTCPConnectFallbackForProxyDelay(t *testing.T) {
 
 	result := TestNode(t.Context(), proxysubscription.ProxyNode{
 		Name:     "tcp-is-not-proxy-delay",
-		Protocol: proxysubscription.ProtocolShadowsocks,
+		Protocol: proxysubscription.ProtocolHysteria2,
 		Server:   "127.0.0.1",
 		Port:     port,
-		Method:   "aes-128-gcm",
 		Password: "secret",
 	}, Options{
 		CorePath: writeFailingDelayCore(t),
@@ -166,10 +167,9 @@ func TestNodeDoesNotUseTCPConnectFallbackForProxyDelay(t *testing.T) {
 func TestNodeFallsBackToHTTPProxyWhenCoreDelayFails(t *testing.T) {
 	result := TestNode(t.Context(), proxysubscription.ProxyNode{
 		Name:     "http-proxy-fallback",
-		Protocol: proxysubscription.ProtocolShadowsocks,
+		Protocol: proxysubscription.ProtocolHysteria2,
 		Server:   "198.51.100.10",
 		Port:     8388,
-		Method:   "aes-128-gcm",
 		Password: "secret",
 	}, Options{
 		CorePath: writeDelayFailingHTTPProxyCore(t),
@@ -186,19 +186,17 @@ func TestNodeFallsBackToHTTPProxyWhenCoreDelayFails(t *testing.T) {
 func TestNodesMeasureDelayThroughOneBatchCore(t *testing.T) {
 	nodes := []proxysubscription.ProxyNode{
 		{
-			Name:     "ss-hk",
-			Protocol: proxysubscription.ProtocolShadowsocks,
+			Name:     "hy2-hk",
+			Protocol: proxysubscription.ProtocolHysteria2,
 			Server:   "198.51.100.10",
 			Port:     8388,
-			Method:   "aes-128-gcm",
 			Password: "secret",
 		},
 		{
-			Name:     "ss-sg",
-			Protocol: proxysubscription.ProtocolShadowsocks,
+			Name:     "hy2-sg",
+			Protocol: proxysubscription.ProtocolHysteria2,
 			Server:   "198.51.100.11",
 			Port:     8389,
-			Method:   "aes-128-gcm",
 			Password: "secret",
 		},
 	}

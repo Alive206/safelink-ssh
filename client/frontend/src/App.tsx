@@ -103,6 +103,19 @@ const TUNNEL_POLL_INTERVAL_MS = 350
 const TUNNEL_START_TIMEOUT_MS = 20000
 const TUNNEL_STOP_TIMEOUT_MS = 8000
 const SSH_TERMINAL_ENABLED = true
+// Traffic chart: one sample per second over a rolling 10 minute window.
+const TRAFFIC_SAMPLE_INTERVAL_MS = 1000
+const TRAFFIC_WINDOW_MS = 10 * 60 * 1000
+const TRAFFIC_HISTORY_MAX = Math.round(TRAFFIC_WINDOW_MS / TRAFFIC_SAMPLE_INTERVAL_MS)
+const TRAFFIC_MIN_SCALE_BPS = 32 * 1024
+const TRAFFIC_CHART_HEIGHT = 152
+const TRAFFIC_CHART_MIN_WIDTH = 320
+
+type TrafficSample = {
+  t: number
+  up: number
+  down: number
+}
 
 type ProxyTestProgressEvent = {
   batch_id?: string
@@ -321,6 +334,7 @@ function App() {
   const [subscriptions, setSubscriptions] = useState<store.SubscriptionSource[]>([])
   const [proxyNodes, setProxyNodes] = useState<proxysubscription.ProxyNode[]>([])
   const [proxyStatus, setProxyStatus] = useState<proxycore.Status | null>(null)
+  const [trafficSamples, setTrafficSamples] = useState<TrafficSample[]>([])
   const [clientSettings, setClientSettings] = useState<store.ClientSettings>(defaultClientSettings)
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>('general')
   const [routeRules, setRouteRules] = useState<config.ProxyRule[]>(() => cloneRouteRules(defaultRouteRules))
@@ -361,12 +375,11 @@ function App() {
     }
 
     try {
-      const [nextVersion, nextTunnels, nextSubscriptions, nextProxyNodes, nextProxyStatus, nextSettings, nextSSHConnections, nextMachineInfo, nextLogs] = await Promise.all([
+      const [nextVersion, nextTunnels, nextSubscriptions, nextProxyNodes, nextSettings, nextSSHConnections, nextMachineInfo, nextLogs] = await Promise.all([
         GetVersion(),
         ListTunnels(),
         ListSubscriptions(),
         ListProxyNodes(),
-        ProxyStatus(),
         GetClientSettings(),
         ListSSHConnections(),
         GetMachineInfo(),
@@ -376,7 +389,6 @@ function App() {
       setTunnels(nextTunnels ?? [])
       setSubscriptions(nextSubscriptions ?? [])
       setProxyNodes(nextProxyNodes ?? [])
-      setProxyStatus(nextProxyStatus ?? null)
       const mergedSettings = mergeClientSettings(nextSettings)
       setClientSettings(mergedSettings)
       if (!routeRulesDirtyRef.current) {
@@ -398,6 +410,33 @@ function App() {
     const timer = window.setInterval(refresh, 3000)
     return () => window.clearInterval(timer)
   }, [refresh])
+
+  // ProxyStatus derives speeds from the delta between two consecutive calls, so it
+  // stays on its own fixed-interval poll that also feeds the traffic chart.
+  useEffect(() => {
+    if (!backendReady) {
+      return
+    }
+    let closed = false
+    const sample = async () => {
+      try {
+        const nextProxyStatus = await ProxyStatus()
+        if (closed) {
+          return
+        }
+        setProxyStatus(nextProxyStatus ?? null)
+        setTrafficSamples((current) => appendTrafficSample(current, nextProxyStatus ?? null))
+      } catch {
+        // Keep the last known status; the next tick retries.
+      }
+    }
+    void sample()
+    const timer = window.setInterval(sample, TRAFFIC_SAMPLE_INTERVAL_MS)
+    return () => {
+      closed = true
+      window.clearInterval(timer)
+    }
+  }, [backendReady])
 
   useEffect(() => {
     if (!SSH_TERMINAL_ENABLED && activeNav === 'terminal') {
@@ -1220,6 +1259,18 @@ function App() {
           </div>
         </section>
 
+        <section className="card traffic-card">
+          <PanelTitle
+            title="流量统计"
+            action={<div className="traffic-legend">
+              <span className="traffic-window">10 分钟</span>
+              <span className="traffic-legend-item up" title={`累计上传 ${formatBytes(uploadTotalBytes)}`}><i />上传 {formatByteRate(uploadSpeedBps)}</span>
+              <span className="traffic-legend-item down" title={`累计下载 ${formatBytes(downloadTotalBytes)}`}><i />下载 {formatByteRate(downloadSpeedBps)}</span>
+            </div>}
+          />
+          <TrafficChart samples={trafficSamples} />
+        </section>
+
         <section className="card home-node-section">
           <PanelTitle
             title="节点概览"
@@ -1452,7 +1503,7 @@ function App() {
                 </> : <InfoPair label="套餐用量" value="服务商未提供" faded />}
               </div>
               <div className="subscription-actions">
-                <button className={`big-switch ${item.enabled ? 'on' : ''}`} disabled={Boolean(busy)} onClick={() => toggleSub(item)} title={item.enabled ? '停用订阅' : '启用订阅'} type="button"><i /></button>
+                <button className={`big-switch ${item.enabled ? 'on' : ''}`} disabled={Boolean(busy)} onClick={() => toggleSub(item)} title={item.enabled ? '停用订阅' : '启用订阅（将停用其他订阅）'} type="button"><i /></button>
                 <button className="small-outline" disabled={Boolean(busy)} onClick={() => refreshSub(item)} type="button">更新</button>
                 <button className="small-outline" onClick={() => openSubscriptionForm(item)} type="button">编辑</button>
                 <button className="ellipsis" onClick={() => deleteSub(item)} type="button">删除</button>
@@ -1993,6 +2044,129 @@ function MetricBlock({ label, value, icon, title }: { label: string; value: stri
     <div className="metric-block" title={title}>
       <p>{label}</p>
       <strong><MetricIcon name={icon} />{value}</strong>
+    </div>
+  )
+}
+
+function TrafficChart({ samples }: { samples: TrafficSample[] }) {
+  const gradientID = useId()
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+  const [wrapWidth, setWrapWidth] = useState(TRAFFIC_CHART_MIN_WIDTH)
+  const [hoverAt, setHoverAt] = useState(0)
+
+  useEffect(() => {
+    const wrap = wrapRef.current
+    if (!wrap || typeof ResizeObserver === 'undefined') {
+      return
+    }
+    const observer = new ResizeObserver((entries) => {
+      const next = Math.round(entries[0]?.contentRect.width ?? 0)
+      if (next > 0) {
+        setWrapWidth(next)
+      }
+    })
+    observer.observe(wrap)
+    return () => observer.disconnect()
+  }, [])
+
+  const width = Math.max(TRAFFIC_CHART_MIN_WIDTH, wrapWidth)
+  const height = TRAFFIC_CHART_HEIGHT
+  const left = 58
+  const top = 12
+  const right = Math.max(left + 60, width - 14)
+  const bottom = height - 22
+  const plotWidth = right - left
+  const plotHeight = bottom - top
+
+  const endAt = samples.length > 0 ? samples[samples.length - 1].t : Date.now()
+  const startAt = endAt - TRAFFIC_WINDOW_MS
+  const visible = samples.filter((item) => item.t >= startAt)
+  const scale = niceRateScale(visible.reduce((max, item) => Math.max(max, item.up, item.down), 0))
+  const axisX = (at: number) => left + ((at - startAt) / TRAFFIC_WINDOW_MS) * plotWidth
+  const axisY = (value: number) => bottom - Math.min(1, value / scale) * plotHeight
+  const closeArea = (line: string) =>
+    visible.length < 2 ? '' : `${line} L ${axisX(endAt).toFixed(1)} ${bottom.toFixed(1)} L ${axisX(visible[0].t).toFixed(1)} ${bottom.toFixed(1)} Z`
+
+  const upLine = trafficLinePath(visible, (item) => item.up, axisX, axisY)
+  const downLine = trafficLinePath(visible, (item) => item.down, axisX, axisY)
+  const gridRows = [
+    { value: scale, y: top },
+    { value: scale / 2, y: bottom - plotHeight / 2 },
+    { value: 0, y: bottom },
+  ]
+  const ticks = minuteTicks(startAt, endAt)
+  const tickLabelStep = plotWidth < 560 ? 2 : 1
+  const hovered = hoverAt > 0 ? visible.find((item) => item.t === hoverAt) : undefined
+  const tipHalfWidth = 58
+  const tipLeft = hovered ? Math.min(Math.max(axisX(hovered.t), tipHalfWidth), Math.max(tipHalfWidth, width - tipHalfWidth)) : 0
+
+  return (
+    <div className="traffic-chart" ref={wrapRef}>
+      <svg
+        className="traffic-svg"
+        height={height}
+        width={width}
+        onMouseLeave={() => setHoverAt(0)}
+        onMouseMove={(event) => {
+          const bounds = event.currentTarget.getBoundingClientRect()
+          const offsetX = event.clientX - bounds.left
+          if (offsetX < left || offsetX > right) {
+            setHoverAt(0)
+            return
+          }
+          const nearest = nearestTrafficSample(visible, startAt + ((offsetX - left) / plotWidth) * TRAFFIC_WINDOW_MS)
+          setHoverAt(nearest ? nearest.t : 0)
+        }}
+      >
+        <defs>
+          <linearGradient id={`${gradientID}-up`} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#ef8a1b" stopOpacity="0.3" />
+            <stop offset="100%" stopColor="#ef8a1b" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id={`${gradientID}-down`} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor="#2d72ef" stopOpacity="0.3" />
+            <stop offset="100%" stopColor="#2d72ef" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+
+        {gridRows.map((row) => (
+          <g key={row.y}>
+            <line className={row.value === 0 ? 'traffic-grid' : 'traffic-grid dashed'} x1={left} x2={right} y1={row.y} y2={row.y} />
+            <text className="traffic-axis-text" textAnchor="end" x={left - 8} y={row.y + 3}>{formatRateTick(row.value)}</text>
+          </g>
+        ))}
+
+        {ticks.map((tick, index) => (
+          <g key={tick}>
+            <line className="traffic-grid dashed" x1={axisX(tick)} x2={axisX(tick)} y1={top} y2={bottom} />
+            {index % tickLabelStep === 0 && (
+              <text className="traffic-axis-text" textAnchor="middle" x={axisX(tick)} y={height - 6}>{formatClockLabel(tick)}</text>
+            )}
+          </g>
+        ))}
+
+        {downLine && <path d={closeArea(downLine)} fill={`url(#${gradientID}-down)`} />}
+        {upLine && <path d={closeArea(upLine)} fill={`url(#${gradientID}-up)`} />}
+        {downLine && <path className="traffic-line down" d={downLine} />}
+        {upLine && <path className="traffic-line up" d={upLine} />}
+
+        {hovered && (
+          <g>
+            <line className="traffic-cursor" x1={axisX(hovered.t)} x2={axisX(hovered.t)} y1={top} y2={bottom} />
+            <circle className="traffic-dot down" cx={axisX(hovered.t)} cy={axisY(hovered.down)} r={2.8} />
+            <circle className="traffic-dot up" cx={axisX(hovered.t)} cy={axisY(hovered.up)} r={2.8} />
+          </g>
+        )}
+      </svg>
+
+      {hovered && (
+        <div className="traffic-tip" style={{ left: tipLeft }}>
+          <span className="traffic-tip-time">{formatClockLabel(hovered.t, true)}</span>
+          <span className="up">↑ {formatByteRate(hovered.up)}</span>
+          <span className="down">↓ {formatByteRate(hovered.down)}</span>
+        </div>
+      )}
+      {visible.length === 0 && <span className="traffic-empty">等待流量数据…</span>}
     </div>
   )
 }
@@ -2817,6 +2991,82 @@ function formatBytes(value: number) {
 
 function formatByteRate(value: number) {
   return `${formatBytes(value)}/s`
+}
+
+function appendTrafficSample(current: TrafficSample[], status: proxycore.Status | null): TrafficSample[] {
+  const running = status?.state === 'running'
+  const next = current.concat({
+    t: Date.now(),
+    up: running ? status?.upload_speed_bps ?? 0 : 0,
+    down: running ? status?.download_speed_bps ?? 0 : 0,
+  })
+  return next.length > TRAFFIC_HISTORY_MAX ? next.slice(next.length - TRAFFIC_HISTORY_MAX) : next
+}
+
+function trafficLinePath(
+  samples: TrafficSample[],
+  pick: (sample: TrafficSample) => number,
+  axisX: (at: number) => number,
+  axisY: (value: number) => number,
+) {
+  return samples
+    .map((item, index) => `${index === 0 ? 'M' : 'L'} ${axisX(item.t).toFixed(1)} ${axisY(pick(item)).toFixed(1)}`)
+    .join(' ')
+}
+
+// Doubling steps keep both the top and the middle axis label on round binary units.
+function niceRateScale(peak: number) {
+  let scale = TRAFFIC_MIN_SCALE_BPS
+  if (!Number.isFinite(peak) || peak <= scale) {
+    return scale
+  }
+  while (scale < peak) {
+    scale *= 2
+  }
+  return scale
+}
+
+function minuteTicks(startAt: number, endAt: number) {
+  const step = 60 * 1000
+  const ticks: number[] = []
+  for (let tick = Math.ceil(startAt / step) * step; tick <= endAt; tick += step) {
+    ticks.push(tick)
+  }
+  return ticks
+}
+
+function nearestTrafficSample(samples: TrafficSample[], at: number) {
+  let nearest: TrafficSample | undefined
+  let distance = Number.POSITIVE_INFINITY
+  for (const item of samples) {
+    const gap = Math.abs(item.t - at)
+    if (gap < distance) {
+      distance = gap
+      nearest = item
+    }
+  }
+  return nearest
+}
+
+function formatRateTick(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0'
+  }
+  const units = ['B', 'KB', 'MB', 'GB']
+  let size = value
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024
+    unit += 1
+  }
+  return `${Number.isInteger(size) ? size : size.toFixed(1)}${units[unit]}/s`
+}
+
+function formatClockLabel(at: number, withSeconds = false) {
+  const date = new Date(at)
+  const pad = (part: number) => String(part).padStart(2, '0')
+  const label = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return withSeconds ? `${label}:${pad(date.getSeconds())}` : label
 }
 
 function formatLatency(node?: DashboardNode) {

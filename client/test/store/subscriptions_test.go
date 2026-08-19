@@ -43,6 +43,110 @@ func TestLoadActiveProxyNodesOnlyReturnsEnabledSubscriptionNodes(t *testing.T) {
 	}
 }
 
+func TestSetSubscriptionEnabledDisablesOtherProxySubscriptions(t *testing.T) {
+	st := store.New(t.TempDir())
+	first := store.SubscriptionSource{ID: "sub-first", Name: "first", Kind: store.SubscriptionKindProxy, Enabled: true}
+	second := store.SubscriptionSource{ID: "sub-second", Name: "second", Kind: store.SubscriptionKindProxy, Enabled: false}
+	if err := st.SaveSubscriptions([]store.SubscriptionSource{first, second}); err != nil {
+		t.Fatalf("SaveSubscriptions: %v", err)
+	}
+	if err := st.SaveProxyNodes([]proxysubscription.ProxyNode{
+		{Name: "first-node", Protocol: proxysubscription.ProtocolShadowsocks, Server: "first.example.com", Port: 8388, Password: "secret", SubscriptionID: first.ID},
+		{Name: "second-node", Protocol: proxysubscription.ProtocolShadowsocks, Server: "second.example.com", Port: 8388, Password: "secret", SubscriptionID: second.ID},
+	}); err != nil {
+		t.Fatalf("SaveProxyNodes: %v", err)
+	}
+
+	if _, err := st.SetSubscriptionEnabled(second.ID, true); err != nil {
+		t.Fatalf("SetSubscriptionEnabled: %v", err)
+	}
+	sources, err := st.LoadSubscriptions()
+	if err != nil {
+		t.Fatalf("LoadSubscriptions: %v", err)
+	}
+	for _, src := range sources {
+		want := src.ID == second.ID
+		if src.Enabled != want {
+			t.Fatalf("subscription %q enabled = %v, want %v", src.ID, src.Enabled, want)
+		}
+	}
+	nodes, err := st.LoadActiveProxyNodes()
+	if err != nil {
+		t.Fatalf("LoadActiveProxyNodes: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "second-node" {
+		t.Fatalf("active nodes = %+v, want only second-node", nodes)
+	}
+}
+
+func TestSetSubscriptionEnabledKeepsOtherKindsEnabled(t *testing.T) {
+	st := store.New(t.TempDir())
+	vpn := store.SubscriptionSource{ID: "sub-vpn", Name: "vpn", Kind: store.SubscriptionKindVPN, Enabled: true}
+	proxy := store.SubscriptionSource{ID: "sub-proxy", Name: "proxy", Kind: store.SubscriptionKindProxy, Enabled: false}
+	if err := st.SaveSubscriptions([]store.SubscriptionSource{vpn, proxy}); err != nil {
+		t.Fatalf("SaveSubscriptions: %v", err)
+	}
+
+	if _, err := st.SetSubscriptionEnabled(proxy.ID, true); err != nil {
+		t.Fatalf("SetSubscriptionEnabled: %v", err)
+	}
+	sources, err := st.LoadSubscriptions()
+	if err != nil {
+		t.Fatalf("LoadSubscriptions: %v", err)
+	}
+	for _, src := range sources {
+		if !src.Enabled {
+			t.Fatalf("subscription %q disabled, want both kinds enabled: %+v", src.ID, sources)
+		}
+	}
+}
+
+func TestAddSubscriptionStaysDisabledWhenAnotherIsEnabled(t *testing.T) {
+	st := store.New(t.TempDir())
+	if err := st.AddSubscription(store.SubscriptionSource{ID: "sub-first", Name: "first", Kind: store.SubscriptionKindProxy, Enabled: true}); err != nil {
+		t.Fatalf("AddSubscription first: %v", err)
+	}
+	if err := st.AddSubscription(store.SubscriptionSource{ID: "sub-second", Name: "second", Kind: store.SubscriptionKindProxy, Enabled: true}); err != nil {
+		t.Fatalf("AddSubscription second: %v", err)
+	}
+	sources, err := st.LoadSubscriptions()
+	if err != nil {
+		t.Fatalf("LoadSubscriptions: %v", err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("sources = %+v, want two", sources)
+	}
+	if !sources[0].Enabled || sources[1].Enabled {
+		t.Fatalf("enabled flags = %v/%v, want only the first source enabled", sources[0].Enabled, sources[1].Enabled)
+	}
+}
+
+func TestNormalizeEnabledSubscriptionsKeepsFirstPerKind(t *testing.T) {
+	st := store.New(t.TempDir())
+	if err := st.SaveSubscriptions([]store.SubscriptionSource{
+		{ID: "sub-a", Name: "a", Kind: store.SubscriptionKindProxy, Enabled: true},
+		{ID: "sub-b", Name: "b", Kind: store.SubscriptionKindProxy, Enabled: true},
+		{ID: "sub-c", Name: "c", Kind: store.SubscriptionKindVPN, Enabled: true},
+	}); err != nil {
+		t.Fatalf("SaveSubscriptions: %v", err)
+	}
+
+	if err := st.NormalizeEnabledSubscriptions(); err != nil {
+		t.Fatalf("NormalizeEnabledSubscriptions: %v", err)
+	}
+	sources, err := st.LoadSubscriptions()
+	if err != nil {
+		t.Fatalf("LoadSubscriptions: %v", err)
+	}
+	enabled := map[string]bool{}
+	for _, src := range sources {
+		enabled[src.ID] = src.Enabled
+	}
+	if !enabled["sub-a"] || enabled["sub-b"] || !enabled["sub-c"] {
+		t.Fatalf("enabled state = %v, want sub-a and sub-c only", enabled)
+	}
+}
+
 func TestSettingsMigrationAddsRuleSetsOnce(t *testing.T) {
 	st := store.New(t.TempDir())
 	oldRules := []config.ProxyRule{

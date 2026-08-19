@@ -149,6 +149,8 @@ func (a *App) startup(ctx context.Context) {
 	_ = os.MkdirAll(dataDir, 0o755)
 
 	a.store = store.New(dataDir)
+	// Data saved before the single-source rule may hold several enabled subscriptions.
+	_ = a.store.NormalizeEnabledSubscriptions()
 	settings, _ := a.store.LoadSettings()
 	a.proxy = proxycore.New(proxycore.Options{
 		CorePath:      proxycore.FindCorePath(filepath.Dir(os.Args[0])),
@@ -458,17 +460,16 @@ func (a *App) UpdateSubscription(id, name, url string, autoRefresh bool, interva
 }
 
 // ToggleSubscription enables or disables a subscription as an active node source.
+// Enabling one source disables the others, so the running node may lose its source here.
 func (a *App) ToggleSubscription(id string, enabled bool) error {
 	src, err := a.store.SetSubscriptionEnabled(id, enabled)
 	if err != nil {
 		a.recordLog("error", "订阅", fmt.Sprintf("切换订阅：%s", id), err)
 		return err
 	}
-	if !enabled {
-		if err := a.stopProxyIfSubscriptionDisabled(id); err != nil {
-			a.recordLog("error", "订阅", fmt.Sprintf("停用订阅：%s", src.Name), err)
-			return err
-		}
+	if err := a.stopProxyIfNodeSourceInactive(); err != nil {
+		a.recordLog("error", "订阅", fmt.Sprintf("切换订阅：%s", src.Name), err)
+		return err
 	}
 	state := "停用"
 	if enabled {
@@ -915,21 +916,23 @@ func proxyModeLabel(mode string) string {
 	}
 }
 
-func (a *App) stopProxyIfSubscriptionDisabled(subscriptionID string) error {
+// stopProxyIfNodeSourceInactive stops the proxy when the running node no longer belongs
+// to an enabled subscription, whether the user disabled it or enabling another one did.
+func (a *App) stopProxyIfNodeSourceInactive() error {
 	status := a.proxy.Status()
 	if status.State != proxycore.StateRunning || status.NodeName == "" {
 		return nil
 	}
-	nodes, err := a.store.LoadProxyNodes()
+	nodes, err := a.store.LoadActiveProxyNodes()
 	if err != nil {
 		return err
 	}
 	for _, node := range nodes {
-		if node.Name == status.NodeName && node.SubscriptionID == subscriptionID {
-			return a.StopProxy()
+		if node.Name == status.NodeName {
+			return nil
 		}
 	}
-	return nil
+	return a.StopProxy()
 }
 
 // --- Driver Status ---

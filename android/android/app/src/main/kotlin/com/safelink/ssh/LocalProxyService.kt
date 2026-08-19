@@ -5,25 +5,43 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import androidx.core.content.ContextCompat
+import java.util.concurrent.Executors
 
 class LocalProxyService : Service() {
+    // 启动内核要 exec 一个将近 60MB 的二进制并等端口就绪，不能占着主线程。
+    private val worker = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "safelink-proxy-worker")
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> stop()
-            else -> start(intent)
+        when {
+            // 系统重拉服务时 intent 为空，拿不到配置，直接收尾。
+            intent == null -> worker.execute { stop() }
+            intent.action == ACTION_STOP -> worker.execute { stop() }
+            else -> {
+                // 前台通知必须在 onStartCommand 返回前就位，否则会被系统当成启动超时杀掉。
+                startForeground(
+                    NotificationHelper.PROXY_NOTIFICATION_ID,
+                    NotificationHelper.runtimeNotification(
+                        this,
+                        "SafeLink local proxy",
+                        "Local SOCKS/HTTP proxy mode is active",
+                    ),
+                )
+                worker.execute { start(intent) }
+            }
         }
-        return START_STICKY
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        worker.shutdown()
+        super.onDestroy()
     }
 
     private fun start(intent: Intent?) {
-        val notification = NotificationHelper.runtimeNotification(
-            this,
-            "SafeLink local proxy",
-            "Local SOCKS/HTTP proxy mode is active",
-        )
-        startForeground(NotificationHelper.PROXY_NOTIFICATION_ID, notification)
         val configJson = intent?.getStringExtra(EXTRA_CONFIG_JSON)
         if (configJson.isNullOrBlank()) {
             EventBus.emit("proxy.status", mapOf("state" to "error", "message" to "missing sing-box config"))

@@ -384,8 +384,149 @@ button:disabled {
   min-width: 0;
   min-height: 100%;
   align-content: start;
-  grid-template-rows: auto auto minmax(214px, 1fr);
+  grid-template-rows: auto auto auto minmax(214px, 1fr);
   gap: 12px;
+}
+
+.traffic-card {
+  min-width: 0;
+  padding: 14px 16px 6px;
+  overflow: hidden;
+}
+
+.traffic-legend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.traffic-window {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.traffic-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.traffic-legend-item i {
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.traffic-legend-item.up {
+  color: #ef8a1b;
+}
+
+.traffic-legend-item.down {
+  color: #2d72ef;
+}
+
+.traffic-chart {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.traffic-svg {
+  display: block;
+  width: 100%;
+}
+
+.traffic-grid {
+  stroke: #dde6f2;
+  stroke-width: 1;
+}
+
+.traffic-grid.dashed {
+  stroke-dasharray: 3 4;
+}
+
+.traffic-axis-text {
+  fill: #98a2b3;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.traffic-line {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.traffic-line.up {
+  stroke: #ef8a1b;
+}
+
+.traffic-line.down {
+  stroke: #2d72ef;
+}
+
+.traffic-cursor {
+  stroke: #93a3bb;
+  stroke-dasharray: 3 3;
+  stroke-width: 1;
+}
+
+.traffic-dot.up {
+  fill: #ef8a1b;
+}
+
+.traffic-dot.down {
+  fill: #2d72ef;
+}
+
+.traffic-tip {
+  position: absolute;
+  top: 6px;
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-strong);
+  box-shadow: 0 6px 16px rgba(17, 86, 126, 0.12);
+  color: #1d2939;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.traffic-tip-time {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.traffic-tip .up {
+  color: #ef8a1b;
+}
+
+.traffic-tip .down {
+  color: #2d72ef;
+}
+
+.traffic-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #98a2b3;
+  font-size: 12px;
+  pointer-events: none;
 }
 
 .top-grid {
@@ -3179,7 +3320,7 @@ button:disabled {
   }
 
   .home-page {
-    grid-template-rows: auto auto auto;
+    grid-template-rows: auto auto auto auto;
   }
 
   .hero-card {

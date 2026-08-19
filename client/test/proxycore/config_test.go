@@ -1,10 +1,13 @@
 package proxycore_test
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -225,6 +228,177 @@ func TestBuildConfigOmitsAnyTLSTransportAndKeepsUTLSFingerprint(t *testing.T) {
 	}
 }
 
+func TestBuildConfigAddsDefaultUTLSFingerprintForReality(t *testing.T) {
+	node := proxysubscription.ProxyNode{
+		Name:     "vless-reality",
+		Protocol: proxysubscription.ProtocolVLESS,
+		Server:   "reality.example.com",
+		Port:     443,
+		UUID:     "11111111-1111-1111-1111-111111111111",
+		TLS: &proxysubscription.TLSOptions{
+			Enabled:    true,
+			ServerName: "www.microsoft.com",
+			PublicKey:  "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
+			ShortID:    "1234",
+		},
+	}
+
+	data, err := proxycore.BuildConfig(node, proxycore.Options{})
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+	}
+	tls := cfg["outbounds"].([]any)[0].(map[string]any)["tls"].(map[string]any)
+	if tls["reality"].(map[string]any)["enabled"] != true {
+		t.Fatalf("reality was not enabled: %+v", tls)
+	}
+	utls, ok := tls["utls"].(map[string]any)
+	if !ok || utls["fingerprint"] == "" {
+		t.Fatalf("reality client requires a uTLS fingerprint: %+v", tls)
+	}
+}
+
+func TestBuildConfigEnablesTLSForProtocolsThatRequireIt(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+	}{
+		{name: "hysteria2", protocol: proxysubscription.ProtocolHysteria2},
+		{name: "tuic", protocol: proxysubscription.ProtocolTUIC},
+		{name: "anytls", protocol: proxysubscription.ProtocolAnyTLS},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := proxysubscription.ProxyNode{
+				Name:     tt.name,
+				Protocol: tt.protocol,
+				Server:   "node.example.com",
+				Port:     443,
+				UUID:     "11111111-1111-1111-1111-111111111111",
+				Password: "secret",
+			}
+			data, err := proxycore.BuildConfig(node, proxycore.Options{})
+			if err != nil {
+				t.Fatalf("BuildConfig returned error: %v", err)
+			}
+			var cfg map[string]any
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+			}
+			selected := cfg["outbounds"].([]any)[0].(map[string]any)
+			tls, ok := selected["tls"].(map[string]any)
+			if !ok || tls["enabled"] != true {
+				t.Fatalf("%s outbound without TLS fails to start: %+v", tt.protocol, selected)
+			}
+		})
+	}
+}
+
+// TestBuildConfigForAirportURIsPassesCoreCheck 把机场里常见的链接写法喂给解析器，
+// 再交给真实 sing-box check：内核对 REALITY、TLS 的硬性要求只有它能验出来。
+func TestBuildConfigForAirportURIsPassesCoreCheck(t *testing.T) {
+	vmessJSON := `{"v":"2","ps":"vmess-ws-tls","add":"vmess.example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","type":"none","host":"vmess.example.com","path":"/ray","tls":"tls","sni":"vmess.example.com"}`
+	uris := strings.Join([]string{
+		"vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=reality&sni=www.microsoft.com&flow=xtls-rprx-vision&pbk=jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0&sid=1234&type=tcp#reality-no-fp",
+		"vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=tls&sni=a.example.com&type=ws&host=a.example.com&path=%2Fws#香港 01 IEPL",
+		"vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&security=reality&pbk=jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0&type=grpc&serviceName=grpcsvc#reality-grpc",
+		"vmess://" + base64.StdEncoding.EncodeToString([]byte(vmessJSON)),
+		"hysteria2://pass@example.com:443?insecure=1#hy2-no-sni",
+		"tuic://11111111-1111-1111-1111-111111111111:pass@example.com:443#tuic-no-sni",
+		"anytls://pass@example.com:443#anytls-no-sni",
+	}, "\n")
+
+	nodes, _, err := proxysubscription.Parse([]byte(uris), proxysubscription.FormatURIList)
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if len(nodes) != 7 {
+		t.Fatalf("len(nodes) = %d, want 7", len(nodes))
+	}
+	if nodes[1].Name != "香港 01 IEPL" {
+		t.Fatalf("node name with spaces was truncated: %q", nodes[1].Name)
+	}
+
+	corePath := locateRealCore(t)
+	for _, node := range nodes {
+		data, err := proxycore.BuildConfig(node, proxycore.Options{CorePath: corePath, WorkDir: t.TempDir()})
+		if err != nil {
+			t.Errorf("%s: BuildConfig returned error: %v", node.Name, err)
+			continue
+		}
+		configPath := filepath.Join(t.TempDir(), "sing-box.json")
+		if err := os.WriteFile(configPath, data, 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		if output, err := exec.Command(corePath, "check", "-c", configPath).CombinedOutput(); err != nil {
+			t.Errorf("%s: sing-box check failed: %v: %s", node.Name, err, strings.TrimSpace(string(output)))
+		}
+	}
+}
+
+// TestBuildConfigSetsPacketEncodingForVMessAndVLESS 盯的是 UDP 转发：机场链接基本不带
+// packetEncoding，而服务端多为 Xray，不默认上 xudp 游戏/语音这类流量会出问题。
+func TestBuildConfigSetsPacketEncodingForVMessAndVLESS(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		node     string
+		want     any
+	}{
+		{name: "vless default", protocol: proxysubscription.ProtocolVLESS, want: "xudp"},
+		{name: "vmess default", protocol: proxysubscription.ProtocolVMess, want: "xudp"},
+		{name: "node overrides", protocol: proxysubscription.ProtocolVLESS, node: "packetaddr", want: "packetaddr"},
+		{name: "node disables", protocol: proxysubscription.ProtocolVLESS, node: proxysubscription.PacketEncodingDisabled, want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := proxycore.BuildConfig(proxysubscription.ProxyNode{
+				Name:           tt.name,
+				Protocol:       tt.protocol,
+				Server:         "node.example.com",
+				Port:           443,
+				UUID:           "11111111-1111-1111-1111-111111111111",
+				PacketEncoding: tt.node,
+			}, proxycore.Options{})
+			if err != nil {
+				t.Fatalf("BuildConfig returned error: %v", err)
+			}
+			var cfg map[string]any
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+			}
+			selected := cfg["outbounds"].([]any)[0].(map[string]any)
+			if got := selected["packet_encoding"]; got != tt.want {
+				t.Fatalf("packet_encoding = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildConfigOmitsPacketEncodingForOtherProtocols(t *testing.T) {
+	data, err := proxycore.BuildConfig(proxysubscription.ProxyNode{
+		Name:     "trojan-us",
+		Protocol: proxysubscription.ProtocolTrojan,
+		Server:   "trojan.example.com",
+		Port:     443,
+		Password: "secret",
+	}, proxycore.Options{})
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+	}
+	selected := cfg["outbounds"].([]any)[0].(map[string]any)
+	if _, ok := selected["packet_encoding"]; ok {
+		t.Fatalf("packet_encoding only applies to vmess/vless: %+v", selected)
+	}
+}
+
 func TestFindCorePathReturnsAbsolutePath(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "sing-box.exe")
@@ -243,14 +417,15 @@ func TestFindCorePathReturnsAbsolutePath(t *testing.T) {
 	}
 }
 
+// TestNodeMeasuresDelayThroughCoreAPI 盯的是 QUIC 协议的探测路径：hysteria2 只监听 UDP，
+// 没有 TCP 端口可握手，只能拉起 core 用 Clash API 量延迟。
 func TestNodeMeasuresDelayThroughCoreAPI(t *testing.T) {
 	helper := writeHelperCore(t)
 	node := proxysubscription.ProxyNode{
-		Name:     "ss-hk",
-		Protocol: proxysubscription.ProtocolShadowsocks,
+		Name:     "hy2-jp",
+		Protocol: proxysubscription.ProtocolHysteria2,
 		Server:   "198.51.100.10",
 		Port:     8388,
-		Method:   "aes-128-gcm",
 		Password: "secret",
 	}
 
@@ -264,6 +439,164 @@ func TestNodeMeasuresDelayThroughCoreAPI(t *testing.T) {
 	if result.LatencyMS <= 0 {
 		t.Fatalf("LatencyMS = %d, want > 0", result.LatencyMS)
 	}
+}
+
+// TestNodeMeasuresTCPHandshakeWithoutCore 要求 TCP 协议的测速不拉 core：
+// CorePath 指向一个不存在的文件，能测出延迟就证明走的是 tcping 分支。
+func TestNodeMeasuresTCPHandshakeWithoutCore(t *testing.T) {
+	host, port := listenLocalTCP(t)
+	node := proxysubscription.ProxyNode{
+		Name:     "vless-local",
+		Protocol: proxysubscription.ProtocolVLESS,
+		Server:   host,
+		Port:     port,
+		UUID:     "11111111-1111-1111-1111-111111111111",
+	}
+
+	result := proxycore.TestNode(t.Context(), node, proxycore.Options{
+		CorePath: filepath.Join(t.TempDir(), "missing-core.exe"),
+		WorkDir:  t.TempDir(),
+	}, 2*time.Second)
+	if !result.OK {
+		t.Fatalf("TestNode failed: %+v", result)
+	}
+	if result.LatencyMS <= 0 {
+		t.Fatalf("LatencyMS = %d, want > 0", result.LatencyMS)
+	}
+}
+
+func TestNodeReportsErrorWhenTCPPortIsClosed(t *testing.T) {
+	host, port := reserveClosedTCPPort(t)
+	node := proxysubscription.ProxyNode{
+		Name:     "vless-dead",
+		Protocol: proxysubscription.ProtocolVLESS,
+		Server:   host,
+		Port:     port,
+		UUID:     "11111111-1111-1111-1111-111111111111",
+	}
+
+	result := proxycore.TestNode(t.Context(), node, proxycore.Options{WorkDir: t.TempDir()}, 2*time.Second)
+	if result.OK {
+		t.Fatalf("TestNode should fail on a closed port: %+v", result)
+	}
+	if !strings.Contains(result.Error, "tcp connect") {
+		t.Fatalf("Error = %q, want a tcp connect failure", result.Error)
+	}
+}
+
+// TestNodesSplitsTCPAndCoreProtocols 验证批量测速的分流：TCP 协议自己握手，
+// QUIC 协议仍然交给 core（这里 core 缺失，所以错误不会是 tcp connect）。
+func TestNodesSplitsTCPAndCoreProtocols(t *testing.T) {
+	host, port := listenLocalTCP(t)
+	nodes := []proxysubscription.ProxyNode{
+		{
+			Name:     "vless-local",
+			Protocol: proxysubscription.ProtocolVLESS,
+			Server:   host,
+			Port:     port,
+			UUID:     "11111111-1111-1111-1111-111111111111",
+		},
+		{
+			Name:     "no-port",
+			Protocol: proxysubscription.ProtocolVLESS,
+			Server:   host,
+		},
+		{
+			Name:     "hy2-jp",
+			Protocol: proxysubscription.ProtocolHysteria2,
+			Server:   "198.51.100.10",
+			Port:     8388,
+			Password: "secret",
+		},
+	}
+
+	var emitted int
+	results := proxycore.TestNodes(t.Context(), nodes, proxycore.Options{
+		CorePath: filepath.Join(t.TempDir(), "missing-core.exe"),
+		WorkDir:  t.TempDir(),
+	}, 2*time.Second, func(proxycore.TestResult) { emitted++ })
+	if len(results) != len(nodes) {
+		t.Fatalf("len(results) = %d, want %d", len(results), len(nodes))
+	}
+	if emitted != len(nodes) {
+		t.Fatalf("onResult called %d times, want %d", emitted, len(nodes))
+	}
+	if !results[0].OK || results[0].LatencyMS <= 0 {
+		t.Fatalf("tcp node was not measured: %+v", results[0])
+	}
+	if results[1].OK || !strings.Contains(results[1].Error, "invalid server or port") {
+		t.Fatalf("invalid node should be rejected: %+v", results[1])
+	}
+	if results[2].OK || strings.Contains(results[2].Error, "tcp connect") {
+		t.Fatalf("quic node should go through the core path: %+v", results[2])
+	}
+}
+
+func listenLocalTCP(t *testing.T) (string, int) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	host, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse listener port: %v", err)
+	}
+	return host, port
+}
+
+// reserveClosedTCPPort 占一个端口再立刻释放，得到一个肯定没人监听的地址。
+func reserveClosedTCPPort(t *testing.T) (string, int) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	host, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		_ = listener.Close()
+		t.Fatalf("split listener address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		_ = listener.Close()
+		t.Fatalf("parse listener port: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	return host, port
+}
+
+// locateRealCore 找真实的 sing-box，没有就跳过（CI 上不一定带内核二进制）。
+func locateRealCore(t *testing.T) string {
+	t.Helper()
+	if corePath := proxycore.FindCorePath(""); corePath != "" {
+		return corePath
+	}
+	corePath := filepath.Join("..", "..", "build", "bin", "sing-box.exe")
+	if _, err := os.Stat(corePath); err != nil {
+		t.Skip("sing-box executable not found, skip core check")
+	}
+	abs, err := filepath.Abs(corePath)
+	if err != nil {
+		t.Fatalf("resolve core path: %v", err)
+	}
+	return abs
 }
 
 func routeRulesContainRuleSet(rules []any, tag, outbound string) bool {

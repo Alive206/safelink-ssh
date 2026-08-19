@@ -402,7 +402,9 @@ func (s *Store) UpsertProxyNodes(incoming []proxysubscription.ProxyNode) (import
 	return imported, skipped, errs
 }
 
-// AddSubscription appends a new subscription and saves.
+// AddSubscription appends a new subscription and saves. Because only one subscription
+// per kind may feed nodes, a new source stays disabled when another one is already
+// enabled: importing must never silently switch the source behind a running node.
 func (s *Store) AddSubscription(src SubscriptionSource) error {
 	sources, err := s.LoadSubscriptions()
 	if err != nil {
@@ -413,6 +415,14 @@ func (s *Store) AddSubscription(src SubscriptionSource) error {
 	}
 	if src.Kind == "" {
 		src.Kind = SubscriptionKindVPN
+	}
+	if src.Enabled {
+		for _, existing := range sources {
+			if existing.Enabled && subscriptionKind(existing) == src.Kind {
+				src.Enabled = false
+				break
+			}
+		}
 	}
 	sources = append(sources, src)
 	return s.SaveSubscriptions(sources)
@@ -440,21 +450,72 @@ func (s *Store) UpdateSubscription(src SubscriptionSource) error {
 }
 
 // SetSubscriptionEnabled updates whether a subscription contributes nodes to the UI.
+// Enabling a source disables every other source of the same kind, so the node list is
+// always fed by a single subscription instead of a merged pool.
 func (s *Store) SetSubscriptionEnabled(id string, enabled bool) (SubscriptionSource, error) {
 	sources, err := s.LoadSubscriptions()
 	if err != nil {
 		return SubscriptionSource{}, err
 	}
+	target := -1
 	for i := range sources {
 		if sources[i].ID == id {
-			sources[i].Enabled = enabled
-			if err := s.SaveSubscriptions(sources); err != nil {
-				return SubscriptionSource{}, err
-			}
-			return sources[i], nil
+			target = i
+			break
 		}
 	}
-	return SubscriptionSource{}, fmt.Errorf("subscription %q not found", id)
+	if target < 0 {
+		return SubscriptionSource{}, fmt.Errorf("subscription %q not found", id)
+	}
+	sources[target].Enabled = enabled
+	if enabled {
+		kind := subscriptionKind(sources[target])
+		for i := range sources {
+			if i != target && subscriptionKind(sources[i]) == kind {
+				sources[i].Enabled = false
+			}
+		}
+	}
+	if err := s.SaveSubscriptions(sources); err != nil {
+		return SubscriptionSource{}, err
+	}
+	return sources[target], nil
+}
+
+// NormalizeEnabledSubscriptions keeps at most one enabled subscription per kind, dropping
+// the extras that data written before the single-source rule may still contain.
+func (s *Store) NormalizeEnabledSubscriptions() error {
+	sources, err := s.LoadSubscriptions()
+	if err != nil {
+		return err
+	}
+	kept := make(map[string]bool, 2)
+	changed := false
+	for i := range sources {
+		if !sources[i].Enabled {
+			continue
+		}
+		kind := subscriptionKind(sources[i])
+		if kept[kind] {
+			sources[i].Enabled = false
+			changed = true
+			continue
+		}
+		kept[kind] = true
+	}
+	if !changed {
+		return nil
+	}
+	return s.SaveSubscriptions(sources)
+}
+
+// subscriptionKind reports the kind of a source, treating records saved without a kind
+// as VPN to match AddSubscription's default.
+func subscriptionKind(src SubscriptionSource) string {
+	if src.Kind == "" {
+		return SubscriptionKindVPN
+	}
+	return src.Kind
 }
 
 // DeleteSubscription removes a subscription by ID and saves.

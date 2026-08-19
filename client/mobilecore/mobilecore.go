@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/safelink/client/internal/proxycore"
@@ -54,8 +55,48 @@ type mobileVPN struct {
 	state     string
 	lastError string
 	startedAt time.Time
-	bytesIn   uint64
-	bytesOut  uint64
+	// 收发字节由转发协程累加、由 vpnStatus 读取，必须原子操作。
+	bytesIn  atomic.Uint64
+	bytesOut atomic.Uint64
+
+	// 速率靠相邻两次 vpnStatus 采样的字节差算出，只在持有 vpnMu 时访问。
+	sampledAt    time.Time
+	sampledIn    uint64
+	sampledOut   uint64
+	downSpeedBps uint64
+	upSpeedBps   uint64
+}
+
+// sampleTraffic 返回累计字节数与最近一次采样区间的速率（字节/秒）。
+// 调用方必须持有 c.vpnMu：采样点会被就地推进。
+func (v *mobileVPN) sampleTraffic(now time.Time) (bytesIn, bytesOut, downloadBps, uploadBps uint64) {
+	bytesIn = v.bytesIn.Load()
+	bytesOut = v.bytesOut.Load()
+	if v.sampledAt.IsZero() {
+		v.sampledAt = now
+		v.sampledIn = bytesIn
+		v.sampledOut = bytesOut
+		return bytesIn, bytesOut, 0, 0
+	}
+	// 采样间隔太短时差值噪声会把速率放大几个数量级，保留上一轮结果等下次轮询。
+	elapsed := now.Sub(v.sampledAt).Seconds()
+	if elapsed < 0.2 {
+		return bytesIn, bytesOut, v.downSpeedBps, v.upSpeedBps
+	}
+	v.downSpeedBps = uint64(float64(diffBytes(bytesIn, v.sampledIn)) / elapsed)
+	v.upSpeedBps = uint64(float64(diffBytes(bytesOut, v.sampledOut)) / elapsed)
+	v.sampledAt = now
+	v.sampledIn = bytesIn
+	v.sampledOut = bytesOut
+	return bytesIn, bytesOut, v.downSpeedBps, v.upSpeedBps
+}
+
+// diffBytes 防御计数器被重置（重连换 mobileVPN 实例之外的意外回退）导致的下溢。
+func diffBytes(current, previous uint64) uint64 {
+	if current < previous {
+		return 0
+	}
+	return current - previous
 }
 
 type mobileVPNCloser interface {
@@ -211,6 +252,7 @@ func (c *Core) buildProxyConfig(data map[string]any) string {
 		HTTPAddr:      asStringDefault(data, "http_addr", "127.0.0.1:10809"),
 		ClashAPIAddr:  asString(data, "clash_api_addr"),
 		RuleModeRules: rules,
+		DNSServers:    asStringSlice(data, "dns_servers"),
 	})
 	if err != nil {
 		return fail("build_proxy_config", err)
@@ -262,7 +304,25 @@ func (c *Core) proxyOptions(data map[string]any) proxycore.Options {
 		HTTPAddr:      asStringDefault(data, "http_addr", "127.0.0.1:10809"),
 		ClashAPIAddr:  asString(data, "clash_api_addr"),
 		RuleModeRules: rules,
+		DNSServers:    asStringSlice(data, "dns_servers"),
 	}
+}
+
+func asStringSlice(data map[string]any, key string) []string {
+	if data == nil {
+		return nil
+	}
+	raw, ok := data[key].([]any)
+	if !ok {
+		return nil
+	}
+	values := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if value, ok := item.(string); ok && value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
 }
 
 func timeoutFromPayload(data map[string]any, fallback time.Duration) time.Duration {

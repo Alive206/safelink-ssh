@@ -74,6 +74,8 @@ ThemeData buildAppTheme(Brightness brightness) {
       foregroundColor: Colors.white,
       elevation: 0,
       centerTitle: true,
+      // 蓝色标题栏压矮一点，避免顶部一整块蓝色过于抢眼
+      toolbarHeight: 46,
     ),
     cardTheme: const CardThemeData(
       elevation: 0,
@@ -208,6 +210,7 @@ class AppController extends ChangeNotifier {
   StreamSubscription<Map<String, dynamic>>? _eventSub;
   Timer? _runtimePoll;
   bool _pollingRuntime = false;
+  String _lastTrafficError = '';
 
   bool loaded = false;
   bool busy = false;
@@ -291,7 +294,12 @@ class AppController extends ChangeNotifier {
           );
         logs
           ..clear()
-          ..addAll(_list(data['logs']).map(LogEntry.fromJson));
+          // 旧版本把内核日志也写进了本地存储，升级后仍会显示，读取时一并滤掉。
+          ..addAll(
+            _list(data['logs'])
+                .map(LogEntry.fromJson)
+                .where((item) => !item.message.startsWith('sing-box:')),
+          );
       } catch (error) {
         _log('error', '读取本地数据失败: $error');
       }
@@ -390,10 +398,17 @@ class AppController extends ChangeNotifier {
   List<ProxyNode> nodesOfSubscription(SubscriptionSource source) =>
       proxyNodes.where((item) => item.subscriptionId == source.id).toList();
 
-  Future<void> selectNode(ProxyNode node) async {
+  Future<void> selectNode(BuildContext context, ProxyNode node) async {
     selectedNodeId = node.id;
     notifyListeners();
     await save();
+    final session = activeSession;
+    if (session == null || session.name == node.name) return;
+    // 连接开着时切换节点要把运行中的会话一起切过去，
+    // 否则 activeSession 还指着旧节点，行高亮和状态卡都留在原处
+    if (session.kind != 'proxy-vpn' && session.kind != 'local-proxy') return;
+    // ignore: use_build_context_synchronously
+    await startProxyNode(context, node, vpnMode: session.kind == 'proxy-vpn');
   }
 
   void toggleSubscriptionCollapsed(String id) {
@@ -479,6 +494,16 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _restoreActiveSession() async {
+    // 上次运行时内核可能已经崩了，而 VPN 服务还持着 tun，全机流量被引向死隧道。
+    // 恢复会话状态之前先跟原生对一次账，把残留的隧道拆掉。
+    try {
+      final result = await native.call('reconcileRuntime');
+      if (result['stale_tunnel_cleared'] == true) {
+        _log('warn', '检测到内核已退出但隧道仍在，已清理');
+      }
+    } catch (error) {
+      _log('warn', '运行状态对账失败: $error');
+    }
     try {
       final vpnResp = await native.coreCall('vpnStatus');
       if (vpnResp != null && vpnResp['ok'] == true) {
@@ -662,7 +687,8 @@ class AppController extends ChangeNotifier {
       () async {
         final result = await _coreTestResult('speedTestProxyNode', node);
         _applyTestResult(node, result);
-        _log('info', '${node.name} 速度 ${formatMbps(node.speedMbps)}');
+        final latency = node.latencyMs == null ? '' : '，延迟 ${node.latencyMs} ms';
+        _log('info', '${node.name} 速度 ${formatMbps(node.speedMbps)}$latency');
         await save();
         notifyListeners();
       },
@@ -686,6 +712,9 @@ class AppController extends ChangeNotifier {
       }
       final data = Map<String, dynamic>.from(response['data'] as Map? ?? {});
       final results = (data['results'] as List? ?? const []).whereType<Map>();
+      var succeeded = 0;
+      var failed = 0;
+      String firstError = '';
       for (final raw in results) {
         final result = Map<String, dynamic>.from(raw);
         final name =
@@ -695,9 +724,23 @@ class AppController extends ChangeNotifier {
         final node = proxyNodes.where((item) => item.name == name).firstOrNull;
         if (node != null) {
           _applyTestResult(node, result);
+          if (node.lastError.isEmpty) {
+            succeeded++;
+          } else {
+            failed++;
+            if (firstError.isEmpty) {
+              firstError = node.lastError;
+            }
+          }
         }
       }
-      _log('info', '节点延迟测试完成');
+      if (failed > 0 && succeeded == 0) {
+        _log('error', '节点延迟测试全部失败: $firstError');
+      } else if (failed > 0) {
+        _log('warn', '节点延迟测试完成，成功 $succeeded 个，失败 $failed 个');
+      } else {
+        _log('info', '节点延迟测试完成，成功 $succeeded 个');
+      }
       await save();
       notifyListeners();
     });
@@ -824,6 +867,7 @@ class AppController extends ChangeNotifier {
               status['download_total_bytes'] = proxy['download_total_bytes'];
               status['upload_speed_bps'] = proxy['upload_speed_bps'];
               status['download_speed_bps'] = proxy['download_speed_bps'];
+              status['traffic_error'] = proxy['traffic_error'];
             } else {
               status['state'] = 'stopped';
               final proxyError = proxy['last_error'] as String? ?? '';
@@ -843,6 +887,7 @@ class AppController extends ChangeNotifier {
       );
       uploadSpeedBps = _int(status?['upload_speed_bps']);
       downloadSpeedBps = _int(status?['download_speed_bps']);
+      _reportTrafficError(status?['traffic_error'] as String? ?? '');
       if (state == 'stopped' || state == 'error') {
         // 启动窗口内容忍 stopped：服务尚未完成初始化时不误判为断开
         final starting =
@@ -868,6 +913,16 @@ class AppController extends ChangeNotifier {
       notifyListeners();
     } finally {
       _pollingRuntime = false;
+    }
+  }
+
+  // 流量取不到时界面只会一直显示 0，看不出是没跑流量还是统计接口坏了。
+  // 原因变化时记一条日志，同一个原因不重复刷屏。
+  void _reportTrafficError(String error) {
+    if (error == _lastTrafficError) return;
+    _lastTrafficError = error;
+    if (error.isNotEmpty) {
+      _log('warn', '流量统计接口异常: $error');
     }
   }
 
@@ -967,7 +1022,8 @@ class AppController extends ChangeNotifier {
     return false;
   }
 
-  Future<({String body, String title})> _fetchSubscription(String url) async {
+  Future<({String body, String title, SubscriptionUsage usage})>
+  _fetchSubscription(String url) async {
     final uri = Uri.parse(url);
     final client = HttpClient();
     if (allowInsecureSubscriptionCerts) {
@@ -977,6 +1033,8 @@ class AppController extends ChangeNotifier {
       final request = await client
           .getUrl(uri)
           .timeout(const Duration(seconds: 20));
+      // 部分机场只对已知客户端返回 Clash 约定的套餐用量头
+      request.headers.set(HttpHeaders.userAgentHeader, _subscriptionUserAgent);
       final response = await request.close().timeout(
         const Duration(seconds: 20),
       );
@@ -984,7 +1042,13 @@ class AppController extends ChangeNotifier {
         throw HttpException('HTTP ${response.statusCode}', uri: uri);
       }
       final body = await response.transform(utf8.decoder).join();
-      return (body: body, title: _subscriptionTitle(response.headers));
+      return (
+        body: body,
+        title: _subscriptionTitle(response.headers),
+        usage: SubscriptionUsage.fromHeader(
+          response.headers.value('subscription-userinfo'),
+        ),
+      );
     } on HandshakeException catch (error) {
       if (allowInsecureSubscriptionCerts) {
         rethrow;
@@ -1110,11 +1174,7 @@ class AppController extends ChangeNotifier {
     final type = event['type'] as String? ?? '';
     final payload = Map<String, dynamic>.from(event['payload'] as Map? ?? {});
     if (type == 'proxy.log') {
-      final line = payload['line'] as String? ?? '';
-      if (line.isNotEmpty) {
-        _log('info', 'sing-box: $line');
-        notifyListeners();
-      }
+      // sing-box 内核日志只留在原生层做失败诊断，不进连接日志。
       return;
     }
     if (type == 'vpn.status' || type == 'proxy.status') {
@@ -1122,7 +1182,9 @@ class AppController extends ChangeNotifier {
       if (state == 'running' || state == 'starting') {
         _syncSessionFromStatus(type, payload);
       } else if (state == 'error') {
+        final kind = activeSession?.kind;
         activeSession = null;
+        _releaseStaleTunnel(kind);
       } else if (state == 'stopped') {
         // stopped 事件无法归因到具体会话，新会话启动窗口内忽略，
         // 避免停止旧服务时延迟到达的事件误清新会话
@@ -1132,7 +1194,9 @@ class AppController extends ChangeNotifier {
             DateTime.now().difference(current.startedAt) <
                 const Duration(seconds: 15);
         if (!starting) {
+          final kind = current?.kind;
           activeSession = null;
+          _releaseStaleTunnel(kind);
         }
       }
       final message =
@@ -1145,6 +1209,18 @@ class AppController extends ChangeNotifier {
       );
       notifyListeners();
     }
+  }
+
+  // 内核挂掉时界面会变成“未连接”，但 tun 还在把全机流量往死隧道里灌，
+  // 所以清掉会话的同时必须把原生的 VPN 服务也停掉。
+  void _releaseStaleTunnel(String? kind) {
+    if (kind != 'proxy-vpn' && kind != 'safelink-vpn') {
+      return;
+    }
+    native.call('stopVpnSession').catchError((Object error) {
+      _log('warn', '清理残留隧道失败: $error');
+      return <String, dynamic>{};
+    });
   }
 
   void _syncSessionFromStatus(String type, Map<String, dynamic> payload) {
@@ -1477,7 +1553,7 @@ class HomePage extends StatelessWidget {
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 8),
           child: Text(
-            '点击订阅可以折叠和展开子节点。圆点代表默认节点。',
+            '点击订阅可以折叠和展开子节点。圆点代表默认节点，连接中点击其他节点会直接切换。',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 12, color: secondaryTextColor(context)),
           ),
@@ -1494,39 +1570,53 @@ class DataPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(14, 12, 14, 18),
-      children: [
-        RuntimeStatusCard(controller: controller),
-        const SizedBox(height: 12),
-        Wrap(
-          spacing: 12,
-          runSpacing: 12,
-          children: [
-            StatTile(
-              icon: Icons.upload_outlined,
-              label: '上传速度',
-              value: formatSpeed(controller.uploadSpeedBps),
-            ),
-            StatTile(
-              icon: Icons.download_outlined,
-              label: '下载速度',
-              value: formatSpeed(controller.downloadSpeedBps),
-            ),
-            StatTile(
-              icon: Icons.cloud_upload_outlined,
-              label: '上传流量',
-              value: formatBytes(controller.uploadTotalBytes),
-            ),
-            StatTile(
-              icon: Icons.cloud_download_outlined,
-              label: '下载流量',
-              value: formatBytes(controller.downloadTotalBytes),
-            ),
-          ],
+    return CustomScrollView(
+      slivers: [
+        SliverPadding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+          sliver: SliverList(
+            delegate: SliverChildListDelegate.fixed([
+              RuntimeStatusCard(controller: controller),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  StatTile(
+                    icon: Icons.upload_outlined,
+                    label: '上传速度',
+                    value: formatSpeed(controller.uploadSpeedBps),
+                  ),
+                  StatTile(
+                    icon: Icons.download_outlined,
+                    label: '下载速度',
+                    value: formatSpeed(controller.downloadSpeedBps),
+                  ),
+                  StatTile(
+                    icon: Icons.cloud_upload_outlined,
+                    label: '上传流量',
+                    value: formatBytes(controller.uploadTotalBytes),
+                  ),
+                  StatTile(
+                    icon: Icons.cloud_download_outlined,
+                    label: '下载流量',
+                    value: formatBytes(controller.downloadTotalBytes),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+            ]),
+          ),
         ),
-        const SizedBox(height: 12),
-        LogsPreviewCard(controller: controller),
+        // 日志卡片占满剩余高度，日志为空或很少时不会在下方留出大片空白，
+        // 日志变长后按内容自然增高并继续滚动
+        SliverFillRemaining(
+          hasScrollBody: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 18),
+            child: LogsPreviewCard(controller: controller),
+          ),
+        ),
       ],
     );
   }
@@ -1670,33 +1760,39 @@ class StatusCard extends StatelessWidget {
             ),
           ),
           Divider(height: 1, color: subtleBorderColor(context)),
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 4),
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 32,
-                  child: Center(
-                    child: Icon(Icons.network_check_outlined, color: accent),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    '连通性测试',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      color: primaryTextColor(context),
+          InkWell(
+            onTap: controller.busy ? null : controller.testAllProxyNodes,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 13),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 32,
+                    child: Center(
+                      child: Icon(Icons.network_check_outlined, color: accent),
                     ),
                   ),
-                ),
-                TextButton(
-                  onPressed: controller.busy
-                      ? null
-                      : controller.testAllProxyNodes,
-                  child: const Text('测试'),
-                ),
-              ],
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      '连通性测试',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: primaryTextColor(context),
+                      ),
+                    ),
+                  ),
+                  Text(
+                    '测试',
+                    style: TextStyle(
+                      color: controller.busy
+                          ? secondaryTextColor(context)
+                          : accent,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -2073,62 +2169,93 @@ Future<void> showSubscriptionInfoSheet(
     ),
     builder: (sheetContext) {
       final nodeCount = controller.nodesOfSubscription(source).length;
+      final errorColor = Theme.of(sheetContext).colorScheme.error;
       return SheetFrame(
         title: source.name,
         children: [
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.link),
-            title: const Text('订阅地址'),
-            subtitle: Text(source.url, maxLines: 2),
-          ),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.hub_outlined),
-            title: const Text('节点数量'),
-            subtitle: Text('$nodeCount 个'),
-          ),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.schedule),
-            title: const Text('最后更新'),
-            subtitle: Text(
-              source.lastRefresh == null
-                  ? '-'
-                  : _dateTimeText(source.lastRefresh!),
+          SheetInfoRow(
+            icon: Icons.link,
+            label: '订阅地址',
+            value: source.url,
+            maxLines: 2,
+            trailing: IconButton(
+              tooltip: '复制地址',
+              visualDensity: VisualDensity.compact,
+              icon: Icon(
+                Icons.copy_all_outlined,
+                size: 18,
+                color: secondaryTextColor(sheetContext),
+              ),
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: source.url));
+                if (!sheetContext.mounted) return;
+                ScaffoldMessenger.of(sheetContext)
+                  ..hideCurrentSnackBar()
+                  ..showSnackBar(
+                    const SnackBar(content: Text('订阅地址已复制')),
+                  );
+              },
             ),
           ),
+          SheetInfoRow(
+            icon: Icons.hub_outlined,
+            label: '节点数量',
+            value: '$nodeCount 个',
+          ),
+          SheetInfoRow(
+            icon: Icons.schedule,
+            label: '最后更新',
+            value: source.lastRefresh == null
+                ? '尚未更新'
+                : _dateTimeText(source.lastRefresh!),
+          ),
           if (source.lastError.isNotEmpty)
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(
-                Icons.error_outline,
-                color: Theme.of(sheetContext).colorScheme.error,
-              ),
-              title: const Text('最近错误'),
-              subtitle: Text(source.lastError, maxLines: 3),
+            SheetInfoRow(
+              icon: Icons.error_outline,
+              label: '最近错误',
+              value: source.lastError,
+              maxLines: 3,
+              valueColor: errorColor,
             ),
           const SizedBox(height: 8),
           Row(
             children: [
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () {
-                    Navigator.pop(sheetContext);
-                    controller.deleteSubscription(source);
-                  },
-                  icon: const Icon(Icons.delete_outline),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: errorColor,
+                    side: BorderSide(color: subtleBorderColor(sheetContext)),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  onPressed: controller.busy
+                      ? null
+                      : () {
+                          Navigator.pop(sheetContext);
+                          controller.deleteSubscription(source);
+                        },
+                  icon: const Icon(Icons.delete_outline, size: 18),
                   label: const Text('删除'),
                 ),
               ),
               const SizedBox(width: 12),
               Expanded(
                 child: FilledButton.icon(
-                  onPressed: () {
-                    Navigator.pop(sheetContext);
-                    controller.refreshSubscription(source);
-                  },
-                  icon: const Icon(Icons.refresh),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  onPressed: controller.busy
+                      ? null
+                      : () {
+                          Navigator.pop(sheetContext);
+                          controller.refreshSubscription(source);
+                        },
+                  icon: const Icon(Icons.refresh, size: 18),
                   label: const Text('更新'),
                 ),
               ),
@@ -2138,6 +2265,72 @@ Future<void> showSubscriptionInfoSheet(
       );
     },
   );
+}
+
+class SheetInfoRow extends StatelessWidget {
+  const SheetInfoRow({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.value,
+    this.maxLines = 1,
+    this.valueColor,
+    this.trailing,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+  final int maxLines;
+  final Color? valueColor;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = valueColor ?? Theme.of(context).colorScheme.primary;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      decoration: BoxDecoration(
+        color: chipBackgroundColor(context),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(width: 32, child: Icon(icon, size: 20, color: accent)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: secondaryTextColor(context),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  value,
+                  maxLines: maxLines,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.4,
+                    fontWeight: FontWeight.w700,
+                    color: valueColor ?? primaryTextColor(context),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (trailing != null) ...[const SizedBox(width: 8), trailing!],
+        ],
+      ),
+    );
+  }
 }
 
 class NodeRow extends StatelessWidget {
@@ -2159,8 +2352,10 @@ class NodeRow extends StatelessWidget {
     final accent = Theme.of(context).colorScheme.primary;
     return InkWell(
       borderRadius: BorderRadius.circular(10),
-      // 点击选为默认节点，连接/测速等操作收在右侧菜单
-      onTap: controller.busy ? null : () => controller.selectNode(node),
+      // 点击选为默认节点；连接中则直接把会话切到该节点
+      onTap: controller.busy
+          ? null
+          : () => controller.selectNode(context, node),
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 1),
         padding: const EdgeInsets.fromLTRB(12, 4, 0, 4),
@@ -2360,8 +2555,6 @@ class _NodeDetailPageState extends State<NodeDetailPage> {
             DetailRow(label: '收藏', value: node.favorite ? '是' : '否'),
             if (node.lastTestedAt != null)
               DetailRow(label: '最后测试', value: _timeText(node.lastTestedAt!)),
-            if (node.lastError.isNotEmpty)
-              DetailRow(label: '最近错误', value: node.lastError),
           ]),
         ],
       ),
@@ -2445,57 +2638,135 @@ class LogsPreviewCard extends StatelessWidget {
           ),
           const Divider(height: 22),
           if (logs.isEmpty)
-            const EmptyState(
-              icon: Icons.list_alt_outlined,
-              title: '暂无日志',
-              subtitle: '运行事件会显示在这里',
+            // 卡片由外层撑满剩余高度，占位内容在空白区域内居中
+            const Expanded(
+              child: Center(
+                child: EmptyState(
+                  icon: Icons.list_alt_outlined,
+                  title: '暂无日志',
+                  subtitle: '运行事件会显示在这里',
+                ),
+              ),
             )
           else
             for (final log in logs)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: Row(
-                  children: [
-                    Text(
-                      '•',
-                      style: TextStyle(
-                        color: log.levelColor(context),
-                        fontSize: 18,
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    SizedBox(
-                      width: 128,
-                      child: Text(
-                        _dateTimeText(log.at),
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                    ),
-                    SizedBox(
-                      width: 42,
-                      child: Text(
-                        log.levelLabel,
+              InkWell(
+                onTap: () => showLogDetailSheet(context, log),
+                borderRadius: BorderRadius.circular(8),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Row(
+                    children: [
+                      Text(
+                        '•',
                         style: TextStyle(
                           color: log.levelColor(context),
-                          fontWeight: FontWeight.w800,
-                          fontSize: 12,
+                          fontSize: 18,
                         ),
                       ),
-                    ),
-                    Expanded(
-                      child: Text(
-                        log.message,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
+                      const SizedBox(width: 4),
+                      SizedBox(
+                        width: 128,
+                        child: Text(
+                          _dateTimeText(log.at),
+                          style: const TextStyle(fontSize: 12),
+                        ),
                       ),
-                    ),
-                  ],
+                      SizedBox(
+                        width: 42,
+                        child: Text(
+                          log.levelLabel,
+                          style: TextStyle(
+                            color: log.levelColor(context),
+                            fontWeight: FontWeight.w800,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: Text(
+                          log.message,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
         ],
       ),
     );
   }
+}
+
+Future<void> showLogDetailSheet(BuildContext context, LogEntry log) async {
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: softCardColor(context),
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+    ),
+    builder: (sheetContext) {
+      return SheetFrame(
+        title: '日志详情',
+        children: [
+          Row(
+            children: [
+              Text(
+                log.levelLabel,
+                style: TextStyle(
+                  color: log.levelColor(sheetContext),
+                  fontWeight: FontWeight.w800,
+                  fontSize: 13,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                _dateTimeText(log.at),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: secondaryTextColor(sheetContext),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: chipBackgroundColor(sheetContext),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: SelectableText(
+              log.message,
+              style: TextStyle(
+                fontSize: 13,
+                height: 1.5,
+                color: primaryTextColor(sheetContext),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton.tonalIcon(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: log.message));
+                if (sheetContext.mounted) {
+                  Navigator.of(sheetContext).pop();
+                }
+              },
+              icon: const Icon(Icons.copy_all_outlined, size: 18),
+              label: const Text('复制内容'),
+            ),
+          ),
+        ],
+      );
+    },
+  );
 }
 
 class SettingsPage extends StatelessWidget {
@@ -2648,13 +2919,20 @@ class RuntimeStatusCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final session = controller.activeSession;
+    final node = controller.currentNode ?? controller.selectedNode;
     return RuntimeCard(
       icon: session == null ? Icons.power_settings_new : Icons.check_circle,
       title: session?.name ?? '运行状态',
       subtitle: session?.kindLabel ?? '未连接',
       meta: session == null
-          ? 'SafeLink 就绪'
+          ? (node == null
+                ? 'SafeLink 就绪，请先添加订阅并选择节点'
+                : '点击卡片连接 ${node.displayName}')
           : '当前模式 ${controller.proxyModeLabel}',
+      // 未连接时整张卡片充当开关，已连接时只保留右侧停止按钮，避免误触断开
+      onTap: session != null || controller.busy
+          ? null
+          : () => controller.toggleConnection(context),
       trailing: session == null
           ? null
           : FilledButton.tonalIcon(
@@ -2794,6 +3072,7 @@ class RuntimeCard extends StatelessWidget {
     this.meta,
     this.trailing,
     this.actions = const [],
+    this.onTap,
   });
 
   final IconData icon;
@@ -2802,11 +3081,13 @@ class RuntimeCard extends StatelessWidget {
   final String? meta;
   final Widget? trailing;
   final List<Widget> actions;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
-    return SoftCard(
+    // 内边距挪进 InkWell 内部，水波纹才能铺满整张卡片
+    final content = Padding(
       padding: const EdgeInsets.all(14),
       child: Row(
         children: [
@@ -2856,6 +3137,16 @@ class RuntimeCard extends StatelessWidget {
           if (actions.isNotEmpty) ...actions,
         ],
       ),
+    );
+    return SoftCard(
+      padding: EdgeInsets.zero,
+      child: onTap == null
+          ? content
+          : InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(16),
+              child: content,
+            ),
     );
   }
 }
@@ -2944,6 +3235,75 @@ class EmptyState extends StatelessWidget {
   }
 }
 
+// 机场按 Clash 约定用 subscription-userinfo 响应头返回套餐用量，各字段单位为字节，
+// expire 是秒级 Unix 时间戳；服务商没给这个头时全部为 0。
+class SubscriptionUsage {
+  const SubscriptionUsage({
+    this.upload = 0,
+    this.download = 0,
+    this.total = 0,
+    this.expire = 0,
+  });
+
+  static const empty = SubscriptionUsage();
+
+  final int upload;
+  final int download;
+  final int total;
+  final int expire;
+
+  bool get hasQuota => total > 0;
+  int get used => upload + download;
+  int get remaining => total > used ? total - used : 0;
+  DateTime? get expireAt =>
+      expire > 0 ? DateTime.fromMillisecondsSinceEpoch(expire * 1000) : null;
+
+  static SubscriptionUsage fromHeader(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return empty;
+    var upload = 0;
+    var download = 0;
+    var total = 0;
+    var expire = 0;
+    for (final field in raw.split(';')) {
+      final index = field.indexOf('=');
+      if (index <= 0) continue;
+      final value = num.tryParse(field.substring(index + 1).trim())?.toInt();
+      if (value == null || value < 0) continue;
+      switch (field.substring(0, index).trim().toLowerCase()) {
+        case 'upload':
+          upload = value;
+        case 'download':
+          download = value;
+        case 'total':
+          total = value;
+        case 'expire':
+          expire = value;
+      }
+    }
+    return SubscriptionUsage(
+      upload: upload,
+      download: download,
+      total: total,
+      expire: expire,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'usage_upload': upload,
+    'usage_download': download,
+    'usage_total': total,
+    'usage_expire': expire,
+  };
+
+  static SubscriptionUsage fromJson(Map<String, dynamic> json) =>
+      SubscriptionUsage(
+        upload: _int(json['usage_upload']),
+        download: _int(json['usage_download']),
+        total: _int(json['usage_total']),
+        expire: _int(json['usage_expire']),
+      );
+}
+
 class SubscriptionSource {
   SubscriptionSource({
     required this.id,
@@ -2953,6 +3313,7 @@ class SubscriptionSource {
     this.enabled = true,
     this.lastError = '',
     this.lastRefresh,
+    this.usage = SubscriptionUsage.empty,
   });
 
   final String id;
@@ -2962,6 +3323,7 @@ class SubscriptionSource {
   bool enabled;
   String lastError;
   DateTime? lastRefresh;
+  SubscriptionUsage usage;
 
   String get kindLabel => kind == 'vpn' ? 'SafeLink VPN' : '代理订阅';
 
@@ -2973,6 +3335,7 @@ class SubscriptionSource {
     'enabled': enabled,
     'last_error': lastError,
     'last_refresh': lastRefresh?.toIso8601String(),
+    ...usage.toJson(),
   };
 
   static SubscriptionSource fromJson(Map<String, dynamic> json) =>
@@ -2984,6 +3347,7 @@ class SubscriptionSource {
         enabled: json['enabled'] as bool? ?? true,
         lastError: json['last_error'] as String? ?? '',
         lastRefresh: DateTime.tryParse(json['last_refresh'] as String? ?? ''),
+        usage: SubscriptionUsage.fromJson(json),
       );
 }
 

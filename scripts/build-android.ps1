@@ -1,8 +1,14 @@
 param(
     [string]$FlutterRoot = "D:\env\flutter",
-    [string]$AndroidSdk = "D:\env\android-sdk",
-    [string]$AndroidNdk = "D:\env\android-sdk\ndk\28.2.13676358",
+    [string]$AndroidSdk = "D:\env\Androidsdk",
+    [string]$AndroidNdk = "D:\env\Androidsdk\ndk\28.2.13676358",
     [string]$SingBoxVersion = "v1.13.14",
+    # Mirrors sing-box's release/DEFAULT_BUILD_TAGS_OTHERS, which is the default
+    # TAGS value of the upstream Makefile on non-Windows targets. Enables the
+    # full protocol/feature set (QUIC-based hysteria/hysteria2/tuic, uTLS
+    # fingerprints, WireGuard, Clash API, gVisor stack, ...).
+    # 1.13 已将 with_reality_server 合入 with_utls，不能再单独传。
+    [string]$SingBoxTags = "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0",
     [switch]$RebuildSingBox
 )
 
@@ -41,7 +47,11 @@ if ($RebuildSingBox -or -not (Test-Path $SingBoxLibPath)) {
         $env:GOARCH = "arm64"
         $env:CGO_ENABLED = "1"
         $env:CC = Join-Path $AndroidNdk "toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android29-clang.cmd"
-        go build -trimpath -ldflags="-s -w" -o $SingBoxLibPath github.com/sagernet/sing-box/cmd/sing-box
+        # The badlinkname / tfogo_checklinkname0 tags require -checklinkname=0,
+        # and the multipathtcp default mirrors sing-box's release/LDFLAGS.
+        $SingBoxLdflags = "-X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -X github.com/sagernet/sing-box/constant.Version=$($SingBoxVersion.TrimStart('v')) -s -w -buildid="
+        go build -trimpath -tags "$SingBoxTags" -ldflags "$SingBoxLdflags" -o $SingBoxLibPath github.com/sagernet/sing-box/cmd/sing-box
+        if ($LASTEXITCODE -ne 0) { throw "sing-box build failed with exit code $LASTEXITCODE" }
     } finally {
         if ($null -eq $OldGOOS) { Remove-Item Env:GOOS -ErrorAction SilentlyContinue } else { $env:GOOS = $OldGOOS }
         if ($null -eq $OldGOARCH) { Remove-Item Env:GOARCH -ErrorAction SilentlyContinue } else { $env:GOARCH = $OldGOARCH }
@@ -58,6 +68,7 @@ Write-Host "Building SafeLink mobilecore AAR..."
 Push-Location $ClientDir
 try {
     gomobile bind -target=android/arm64 -androidapi 29 -o $AARPath github.com/example/safelink/client/mobilecore
+    if ($LASTEXITCODE -ne 0) { throw "gomobile bind failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
 }
@@ -66,7 +77,9 @@ Write-Host "Building SafeLink Android arm64 APK..."
 Push-Location $AndroidDir
 try {
     flutter pub get
+    if ($LASTEXITCODE -ne 0) { throw "flutter pub get failed with exit code $LASTEXITCODE" }
     flutter build apk --release --target-platform android-arm64
+    if ($LASTEXITCODE -ne 0) { throw "flutter build apk failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
 }

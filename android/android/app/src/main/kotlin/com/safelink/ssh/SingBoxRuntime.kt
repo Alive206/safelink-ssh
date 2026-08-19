@@ -11,6 +11,11 @@ import org.json.JSONObject
 
 object SingBoxRuntime {
     private val lock = Any()
+
+    // 流量计数单独上锁：clash API 查询要走网络，最长 1.4s，
+    // 占着 lock 会把内核启停一起拖住。
+    private val trafficLock = Any()
+    private val ansiPattern = Regex("\u001B\\[[0-9;]*[a-zA-Z]")
     private var process: Process? = null
     private var nodeName: String = ""
     private var mode: String = ""
@@ -22,6 +27,29 @@ object SingBoxRuntime {
     private var lastDownloadTotal: Long = 0L
     private var uploadSpeed: Long = 0L
     private var downloadSpeed: Long = 0L
+    private var trafficError: String = ""
+
+    private data class Traffic(
+        val uploadTotal: Long,
+        val downloadTotal: Long,
+        val uploadSpeed: Long,
+        val downloadSpeed: Long,
+        val error: String,
+    )
+
+    // 内核失败时的原因只在它自己的输出里，留一段滑动窗口给错误提示用。
+    private val recentLogs = ArrayDeque<String>()
+
+    // sing-box 意外退出时的回调。tun 的 fd 已经交给 tun2socks，内核死了隧道还在，
+    // 0.0.0.0/0 会一直指向一条死隧道导致整机断网，所以必须联动把 VPN 服务停掉。
+    @Volatile
+    private var exitListener: (() -> Unit)? = null
+
+    fun setExitListener(listener: (() -> Unit)?) {
+        exitListener = listener
+    }
+
+    fun isRunning(): Boolean = synchronized(lock) { process?.isAlive == true }
 
     fun start(
         context: Context,
@@ -31,6 +59,11 @@ object SingBoxRuntime {
         socksAddr: String,
         clashAddr: String,
     ): Map<String, Any?> {
+        // 本地代理和 VPN 共用这一个内核实例，抢占前先让旧持有者收尾，
+        // 否则 stopLocked 静默杀掉旧进程，VPN 服务毫不知情，留下一条没人接流量的隧道。
+        val preempted = exitListener
+        exitListener = null
+        preempted?.invoke()
         synchronized(lock) {
             stopLocked(emitEvent = false)
             val appContext = context.applicationContext
@@ -46,8 +79,7 @@ object SingBoxRuntime {
             binary.setExecutable(true, false)
 
             try {
-                runCheck(binary, configFile, workDir)
-
+                synchronized(recentLogs) { recentLogs.clear() }
                 val next = ProcessBuilder(binary.absolutePath, "run", "-c", configFile.absolutePath)
                     .directory(workDir)
                     .redirectErrorStream(true)
@@ -58,11 +90,7 @@ object SingBoxRuntime {
                 clashAPIAddr = clashAddr
                 startedAt = System.currentTimeMillis()
                 lastError = ""
-                lastTrafficAt = 0L
-                lastUploadTotal = 0L
-                lastDownloadTotal = 0L
-                uploadSpeed = 0L
-                downloadSpeed = 0L
+                resetTraffic()
 
                 pumpLogs(next)
                 monitor(next)
@@ -90,13 +118,21 @@ object SingBoxRuntime {
     }
 
     fun status(): Map<String, Any?> {
-        synchronized(lock) {
+        val addr = synchronized(lock) {
             val current = process
-            val state = if (current != null && current.isAlive) "running" else {
+            if (current != null && current.isAlive) {
+                clashAPIAddr
+            } else {
                 process = null
-                "stopped"
+                null
             }
-            return statusLocked(state)
+        }
+        // 刷新流量必须在 lock 之外：这是一次真实的 HTTP 请求。
+        if (!addr.isNullOrBlank()) {
+            refreshTraffic(addr)
+        }
+        synchronized(lock) {
+            return statusLocked(if (process?.isAlive == true) "running" else "stopped")
         }
     }
 
@@ -114,42 +150,63 @@ object SingBoxRuntime {
         mode = ""
         clashAPIAddr = ""
         startedAt = 0L
-        lastTrafficAt = 0L
-        lastUploadTotal = 0L
-        lastDownloadTotal = 0L
-        uploadSpeed = 0L
-        downloadSpeed = 0L
+        resetTraffic()
         if (emitEvent) {
             EventBus.emit("proxy.status", statusLocked("stopped"))
         }
     }
 
     private fun statusLocked(state: String): Map<String, Any?> {
-        val traffic = if (state == "running") queryTraffic() else null
+        val traffic = if (state == "running") trafficSnapshot() else Traffic(0L, 0L, 0L, 0L, "")
         return mapOf(
             "state" to state,
             "node" to nodeName,
             "mode" to mode,
             "started_at" to startedAt,
             "last_error" to lastError,
-            "upload_total_bytes" to (traffic?.first ?: lastUploadTotal),
-            "download_total_bytes" to (traffic?.second ?: lastDownloadTotal),
-            "upload_speed_bps" to uploadSpeed,
-            "download_speed_bps" to downloadSpeed,
+            "upload_total_bytes" to traffic.uploadTotal,
+            "download_total_bytes" to traffic.downloadTotal,
+            "upload_speed_bps" to traffic.uploadSpeed,
+            "download_speed_bps" to traffic.downloadSpeed,
+            "traffic_error" to traffic.error,
         )
     }
 
-    private fun queryTraffic(): Pair<Long, Long>? {
-        val addr = clashAPIAddr
-        if (addr.isBlank()) return null
-        return runCatching {
+    private fun trafficSnapshot(): Traffic = synchronized(trafficLock) {
+        Traffic(lastUploadTotal, lastDownloadTotal, uploadSpeed, downloadSpeed, trafficError)
+    }
+
+    private fun resetTraffic() {
+        synchronized(trafficLock) {
+            lastTrafficAt = 0L
+            lastUploadTotal = 0L
+            lastDownloadTotal = 0L
+            uploadSpeed = 0L
+            downloadSpeed = 0L
+            trafficError = ""
+        }
+    }
+
+    // clash API 的 /connections 带全局累计量，速率由相邻两次采样的差值算出。
+    private fun refreshTraffic(addr: String) {
+        val json = runCatching {
             val conn = URL("http://$addr/connections").openConnection() as HttpURLConnection
             conn.connectTimeout = 700
             conn.readTimeout = 700
             conn.requestMethod = "GET"
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
-            conn.disconnect()
-            val json = JSONObject(body)
+            val body = try {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            } finally {
+                conn.disconnect()
+            }
+            JSONObject(body)
+        }.getOrElse { error ->
+            synchronized(trafficLock) {
+                trafficError = error.message ?: error.javaClass.simpleName
+            }
+            return
+        }
+        synchronized(trafficLock) {
             val upload = json.optLong("uploadTotal", lastUploadTotal)
             val download = json.optLong("downloadTotal", lastDownloadTotal)
             val now = System.currentTimeMillis()
@@ -161,37 +218,25 @@ object SingBoxRuntime {
             lastTrafficAt = now
             lastUploadTotal = upload
             lastDownloadTotal = download
-            upload to download
-        }.getOrNull()
+            trafficError = ""
+        }
     }
 
-    private fun runCheck(binary: File, configFile: File, workDir: File) {
-        val check = ProcessBuilder(binary.absolutePath, "check", "-c", configFile.absolutePath)
-            .directory(workDir)
-            .redirectErrorStream(true)
-            .start()
-        if (!check.waitFor(8, TimeUnit.SECONDS)) {
-            check.destroyForcibly()
-            lastError = "sing-box config check timed out"
-            throw IllegalStateException(lastError)
-        }
-        val output = check.inputStream.bufferedReader().readText().trim()
-        if (check.exitValue() != 0) {
-            lastError = if (output.isEmpty()) {
-                "sing-box config check failed"
-            } else {
-                output.take(4000)
-            }
-            throw IllegalStateException(lastError)
-        }
+    private fun describeFailure(fallback: String): String {
+        val lines = synchronized(recentLogs) { recentLogs.toList() }
+        val cleaned = lines.map { ansiPattern.replace(it, "").trim() }.filter { it.isNotEmpty() }
+        val reason = cleaned.firstOrNull { it.contains("FATAL") || it.contains("ERROR") }
+            ?: return fallback
+        return reason.substringAfter("] ", reason).take(1000)
     }
 
     private fun waitForReady(process: Process, socksAddr: String) {
         val parsed = parseHostPort(socksAddr) ?: return
-        val deadline = System.currentTimeMillis() + 5000
+        // sing-box 二进制将近 60MB，冷启动光 exec 就可能好几秒，窗口太短会把本来能起来的内核误判为超时。
+        val deadline = System.currentTimeMillis() + 30000
         while (System.currentTimeMillis() < deadline) {
             if (!process.isAlive) {
-                lastError = "sing-box exited before SOCKS listener became ready"
+                lastError = describeFailure("sing-box exited before SOCKS listener became ready")
                 throw IllegalStateException(lastError)
             }
             runCatching {
@@ -203,7 +248,7 @@ object SingBoxRuntime {
             }
             Thread.sleep(80)
         }
-        lastError = "timed out waiting for sing-box SOCKS listener $socksAddr"
+        lastError = describeFailure("timed out waiting for sing-box SOCKS listener $socksAddr")
         throw IllegalStateException(lastError)
     }
 
@@ -217,13 +262,21 @@ object SingBoxRuntime {
         return host to port
     }
 
+    // 内核日志只进 recentLogs 供失败诊断使用，不再逐行推给界面：
+    // sing-box 一秒能刷几十行，灌进连接日志会把真正的运行事件顶掉。
+    // 管道仍必须读干，否则 stdout 缓冲区满了内核会被阻塞住。
     private fun pumpLogs(process: Process) {
         Thread({
             runCatching {
                 process.inputStream.bufferedReader().useLines { lines ->
                     lines.forEach { line ->
                         if (line.isNotBlank()) {
-                            EventBus.emit("proxy.log", mapOf("line" to line.take(1000)))
+                            synchronized(recentLogs) {
+                                if (recentLogs.size >= 60) {
+                                    recentLogs.removeFirst()
+                                }
+                                recentLogs.addLast(line)
+                            }
                         }
                     }
                 }
@@ -234,16 +287,21 @@ object SingBoxRuntime {
     private fun monitor(process: Process) {
         Thread({
             val exitCode = runCatching { process.waitFor() }.getOrDefault(-1)
+            var unexpected = false
             synchronized(lock) {
-                if (this.process !== process) {
-                    return@synchronized
+                if (this.process === process) {
+                    this.process = null
+                    val state = if (exitCode == 0) "stopped" else "error"
+                    if (exitCode != 0 && lastError.isEmpty()) {
+                        lastError = "sing-box exited with code $exitCode"
+                    }
+                    EventBus.emit("proxy.status", statusLocked(state))
+                    unexpected = true
                 }
-                this.process = null
-                val state = if (exitCode == 0) "stopped" else "error"
-                if (exitCode != 0 && lastError.isEmpty()) {
-                    lastError = "sing-box exited with code $exitCode"
-                }
-                EventBus.emit("proxy.status", statusLocked(state))
+            }
+            // 主动 stop 时 stopLocked 已经把 process 置空，走不到这里，只有真的崩了才回调。
+            if (unexpected) {
+                runCatching { exitListener?.invoke() }
             }
         }, "safelink-sing-box-monitor").start()
     }

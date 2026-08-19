@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCoreParsesSafeLinkSubscription(t *testing.T) {
@@ -82,5 +83,40 @@ func TestCoreBatchProxyTestMethodDecodesNodes(t *testing.T) {
 	}
 	if !resp.OK || len(resp.Data.Results) != 1 || resp.Data.Results[0].OK || resp.Data.Results[0].Error == "" {
 		t.Fatalf("Call(testProxyNodes) = %s", got)
+	}
+}
+
+func TestMobileVPNSampleTrafficComputesSpeed(t *testing.T) {
+	vpn := &mobileVPN{}
+	start := time.Now()
+
+	// 第一次采样只落基准点，速率无从计算。
+	if _, _, down, up := vpn.sampleTraffic(start); down != 0 || up != 0 {
+		t.Fatalf("first sample speeds = %d/%d, want 0/0", down, up)
+	}
+
+	vpn.bytesIn.Add(4096)
+	vpn.bytesOut.Add(2048)
+	in, out, down, up := vpn.sampleTraffic(start.Add(2 * time.Second))
+	if in != 4096 || out != 2048 {
+		t.Fatalf("totals = %d/%d, want 4096/2048", in, out)
+	}
+	if down != 2048 || up != 1024 {
+		t.Fatalf("speeds = %d/%d, want 2048/1024", down, up)
+	}
+
+	// 间隔过短时沿用上一轮速率，别让几毫秒的差值把数字放大几个数量级。
+	vpn.bytesIn.Add(1)
+	if _, _, down, up = vpn.sampleTraffic(start.Add(2*time.Second + 10*time.Millisecond)); down != 2048 || up != 1024 {
+		t.Fatalf("speeds after short interval = %d/%d, want 2048/1024", down, up)
+	}
+
+	// 空闲区间速率归零，累计量继续保留。
+	in, out, down, up = vpn.sampleTraffic(start.Add(4 * time.Second))
+	if down != 0 || up != 0 {
+		t.Fatalf("idle speeds = %d/%d, want 0/0", down, up)
+	}
+	if in != 4097 || out != 2048 {
+		t.Fatalf("totals = %d/%d, want 4097/2048", in, out)
 	}
 }

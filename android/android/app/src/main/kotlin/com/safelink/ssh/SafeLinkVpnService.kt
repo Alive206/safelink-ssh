@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import androidx.core.content.ContextCompat
+import java.util.concurrent.Executors
 import org.json.JSONObject
 
 class SafeLinkVpnService : VpnService() {
@@ -12,16 +13,36 @@ class SafeLinkVpnService : VpnService() {
     private var currentKind: String = ""
     private val core by lazy { CoreHolder.get(this) }
 
+    // sing-box 二进制接近 60MB，冷启动 exec 加上等端口就绪要好几秒，
+    // 放在 onStartCommand 的主线程上必然 ANR，所以启停都排到单线程队列里执行。
+    private val worker = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "safelink-vpn-worker")
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> stopVpn()
-            else -> startVpn(intent)
+        when {
+            // 系统重拉服务时 intent 为空，没有任何配置，起隧道只会得到一条无人接流量的空隧道。
+            intent == null -> worker.execute { stopVpn() }
+            intent.action == ACTION_STOP -> worker.execute { stopVpn() }
+            else -> {
+                // 前台通知必须在 onStartCommand 返回前就位，不能等到 worker 线程里才补。
+                startForeground(
+                    NotificationHelper.VPN_NOTIFICATION_ID,
+                    NotificationHelper.runtimeNotification(
+                        this,
+                        "SafeLink VPN",
+                        "${intent.getStringExtra(EXTRA_SESSION_NAME) ?: "SafeLink"} is active",
+                    ),
+                )
+                worker.execute { startVpn(intent) }
+            }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         stopVpn()
+        worker.shutdown()
         super.onDestroy()
     }
 
@@ -34,6 +55,15 @@ class SafeLinkVpnService : VpnService() {
         val configJson = intent?.getStringExtra(EXTRA_CONFIG_JSON)
         val socksAddr = intent?.getStringExtra(EXTRA_SOCKS_ADDR) ?: DEFAULT_SOCKS_ADDR
         val clashAPIAddr = intent?.getStringExtra(EXTRA_CLASH_API_ADDR) ?: DEFAULT_CLASH_API_ADDR
+        // 连接开着时切换节点会再来一次 start，必须先就地拆掉旧隧道：
+        // 否则 SingBoxRuntime.start 抢占旧内核时会回调退出监听，把刚建好的新隧道又停掉。
+        if (isRunning) {
+            SingBoxRuntime.setExitListener(null)
+            isRunning = false
+            runCatching { core.call("stopVPN", "{}") }
+            tun?.close()
+            tun = null
+        }
         currentKind = kind
 
         val notification = NotificationHelper.runtimeNotification(
@@ -101,6 +131,13 @@ class SafeLinkVpnService : VpnService() {
                 stopSelf()
                 return
             }
+            // sing-box 启动后可能再崩或被本地代理抢占，而 tun 已经交给 tun2socks，
+            // 必须联动拆隧道，否则 0.0.0.0/0 仍指向死隧道，UI 显示未连接但整机断网。
+            // 抢占场景下新内核已经在跑，所以不能连带停内核。
+            SingBoxRuntime.setExitListener {
+                worker.execute { stopVpn(stopCore = false) }
+            }
+            isRunning = true
             EventBus.emit(
                 "vpn.status",
                 mapOf("state" to "running", "kind" to kind, "session" to sessionName, "core" to response),
@@ -128,21 +165,25 @@ class SafeLinkVpnService : VpnService() {
                 stopSelf()
                 return
             }
+            isRunning = true
             EventBus.emit(
                 "vpn.status",
                 mapOf("state" to "starting", "kind" to kind, "session" to sessionName, "core" to response),
             )
             return
         }
+        isRunning = true
         EventBus.emit(
             "vpn.status",
             mapOf("state" to "running", "kind" to kind, "session" to sessionName),
         )
     }
 
-    private fun stopVpn() {
+    private fun stopVpn(stopCore: Boolean = true) {
+        SingBoxRuntime.setExitListener(null)
+        isRunning = false
         runCatching { core.call("stopVPN", "{}") }
-        if (currentKind == "proxy-vpn") {
+        if (stopCore && currentKind == "proxy-vpn") {
             SingBoxRuntime.stop()
         }
         currentKind = ""
@@ -173,6 +214,11 @@ class SafeLinkVpnService : VpnService() {
     }
 
     companion object {
+        // 服务是否正在持有隧道。App 重启后靠它跟内核状态对账，拆掉残留的死隧道。
+        @Volatile
+        var isRunning = false
+            private set
+
         private const val ACTION_STOP = "com.safelink.ssh.vpn.STOP"
         private const val EXTRA_KIND = "kind"
         private const val EXTRA_SESSION_NAME = "session_name"

@@ -15,6 +15,9 @@ class SecureJsonStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences("secure_json_store", Context.MODE_PRIVATE)
 
+    @Volatile
+    private var cachedKey: SecretKey? = null
+
     fun read(key: String): String? {
         val encoded = prefs.getString(key, null) ?: return null
         return decrypt(encoded)
@@ -45,6 +48,15 @@ class SecureJsonStore(context: Context) {
     }
 
     private fun getOrCreateKey(): SecretKey {
+        cachedKey?.let { return it }
+        // 每次读写都去翻 AndroidKeyStore 是一次跟 keystore 守护进程的 IPC，
+        // 订阅节点这种成批写入的场景下开销很可观，密钥本身不变，缓一份就好。
+        return synchronized(this) {
+            cachedKey ?: loadOrGenerateKey().also { cachedKey = it }
+        }
+    }
+
+    private fun loadOrGenerateKey(): SecretKey {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         val existing = keyStore.getKey(KEY_ALIAS, null)
         if (existing is SecretKey) {

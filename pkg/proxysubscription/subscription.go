@@ -32,6 +32,29 @@ const (
 	ProtocolAnyTLS      = "anytls"
 )
 
+// vmess/vless 的 UDP 封装方式。sing-box 只认 xudp 和 packetaddr，写其他值会直接启动失败，
+// 所以订阅里的写法得先归一。PacketEncodingDisabled 是节点显式要求不开的内部标记。
+const (
+	PacketEncodingXUDP       = "xudp"
+	PacketEncodingPacketAddr = "packetaddr"
+	PacketEncodingDisabled   = "none"
+)
+
+// NormalizePacketEncoding 把订阅里的各种写法收拢成 sing-box 能接受的取值，
+// 认不出来的值当成“没指定”，留给上层决定默认值。
+func NormalizePacketEncoding(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case PacketEncodingXUDP:
+		return PacketEncodingXUDP
+	case PacketEncodingPacketAddr, "packet-addr", "packet_addr":
+		return PacketEncodingPacketAddr
+	case PacketEncodingDisabled, "disabled", "false":
+		return PacketEncodingDisabled
+	default:
+		return ""
+	}
+}
+
 type ProxyNode struct {
 	ID             string           `json:"id,omitempty" yaml:"id,omitempty"`
 	SubscriptionID string           `json:"subscription_id,omitempty" yaml:"subscription_id,omitempty"`
@@ -46,6 +69,7 @@ type ProxyNode struct {
 	Security       string           `json:"security,omitempty" yaml:"security,omitempty"`
 	Flow           string           `json:"flow,omitempty" yaml:"flow,omitempty"`
 	UDP            bool             `json:"udp,omitempty" yaml:"udp,omitempty"`
+	PacketEncoding string           `json:"packet_encoding,omitempty" yaml:"packet_encoding,omitempty"`
 	TLS            *TLSOptions      `json:"tls,omitempty" yaml:"tls,omitempty"`
 	Transport      TransportOptions `json:"transport,omitempty" yaml:"transport,omitempty"`
 }
@@ -72,27 +96,32 @@ type clashDocument struct {
 }
 
 type clashProxy struct {
-	Name       string       `yaml:"name"`
-	Type       string       `yaml:"type"`
-	Server     string       `yaml:"server"`
-	Port       int          `yaml:"port"`
-	Cipher     string       `yaml:"cipher"`
-	Password   string       `yaml:"password"`
-	UUID       string       `yaml:"uuid"`
-	AlterID    int          `yaml:"alterId"`
-	Security   string       `yaml:"security"`
-	TLS        bool         `yaml:"tls"`
-	ServerName string       `yaml:"servername"`
-	SNI        string       `yaml:"sni"`
-	Network    string       `yaml:"network"`
-	Flow       string       `yaml:"flow"`
-	UDP        bool         `yaml:"udp"`
-	WSOpts     clashWSOpts  `yaml:"ws-opts"`
-	Reality    clashReality `yaml:"reality-opts"`
-	ALPN       stringList   `yaml:"alpn"`
-	AuthStr    string       `yaml:"auth-str"`
-	Up         string       `yaml:"up"`
-	Down       string       `yaml:"down"`
+	Name              string        `yaml:"name"`
+	Type              string        `yaml:"type"`
+	Server            string        `yaml:"server"`
+	Port              flexibleInt   `yaml:"port"`
+	Cipher            string        `yaml:"cipher"`
+	Password          string        `yaml:"password"`
+	UUID              string        `yaml:"uuid"`
+	AlterID           flexibleInt   `yaml:"alterId"`
+	Security          string        `yaml:"security"`
+	TLS               bool          `yaml:"tls"`
+	ServerName        string        `yaml:"servername"`
+	SNI               string        `yaml:"sni"`
+	Network           string        `yaml:"network"`
+	Flow              string        `yaml:"flow"`
+	UDP               bool          `yaml:"udp"`
+	PacketEncoding    string        `yaml:"packet-encoding"`
+	XUDP              bool          `yaml:"xudp"`
+	SkipCertVerify    bool          `yaml:"skip-cert-verify"`
+	ClientFingerprint string        `yaml:"client-fingerprint"`
+	WSOpts            clashWSOpts   `yaml:"ws-opts"`
+	GRPCOpts          clashGRPCOpts `yaml:"grpc-opts"`
+	Reality           clashReality  `yaml:"reality-opts"`
+	ALPN              stringList    `yaml:"alpn"`
+	AuthStr           string        `yaml:"auth-str"`
+	Up                string        `yaml:"up"`
+	Down              string        `yaml:"down"`
 }
 
 type clashWSOpts struct {
@@ -100,9 +129,34 @@ type clashWSOpts struct {
 	Headers map[string]string `yaml:"headers"`
 }
 
+type clashGRPCOpts struct {
+	ServiceName string `yaml:"grpc-service-name"`
+}
+
 type clashReality struct {
 	PublicKey string `yaml:"public-key"`
 	ShortID   string `yaml:"short-id"`
+}
+
+// flexibleInt 兼容机场把 port / alterId 写成字符串的情况（port: "443"）。
+// yaml.v3 遇到类型不匹配会让整份订阅解析失败，一个节点写法特殊就会导致全部节点丢失。
+type flexibleInt int
+
+func (f *flexibleInt) UnmarshalYAML(value *yaml.Node) error {
+	f.parse(value.Value)
+	return nil
+}
+
+func (f *flexibleInt) UnmarshalJSON(data []byte) error {
+	f.parse(strings.Trim(strings.TrimSpace(string(data)), `"`))
+	return nil
+}
+
+// parse 解析失败时保持 0，由 validateNode 把该节点判为无效并跳过。
+func (f *flexibleInt) parse(text string) {
+	if n, err := strconv.Atoi(strings.TrimSpace(text)); err == nil {
+		*f = flexibleInt(n)
+	}
 }
 
 type stringList []string
@@ -129,19 +183,20 @@ type singBoxDocument struct {
 }
 
 type singBoxOutbound struct {
-	Type       string           `json:"type"`
-	Tag        string           `json:"tag"`
-	Server     string           `json:"server"`
-	ServerPort int              `json:"server_port"`
-	Method     string           `json:"method"`
-	Password   string           `json:"password"`
-	UUID       string           `json:"uuid"`
-	AlterID    int              `json:"alter_id"`
-	Security   string           `json:"security"`
-	Flow       string           `json:"flow"`
-	UDP        bool             `json:"udp"`
-	TLS        *TLSOptions      `json:"tls"`
-	Transport  TransportOptions `json:"transport"`
+	Type           string           `json:"type"`
+	Tag            string           `json:"tag"`
+	Server         string           `json:"server"`
+	ServerPort     flexibleInt      `json:"server_port"`
+	Method         string           `json:"method"`
+	Password       string           `json:"password"`
+	UUID           string           `json:"uuid"`
+	AlterID        flexibleInt      `json:"alter_id"`
+	Security       string           `json:"security"`
+	Flow           string           `json:"flow"`
+	UDP            bool             `json:"udp"`
+	PacketEncoding string           `json:"packet_encoding"`
+	TLS            *TLSOptions      `json:"tls"`
+	Transport      TransportOptions `json:"transport"`
 }
 
 func Parse(data []byte, format string) ([]ProxyNode, string, error) {
@@ -181,6 +236,7 @@ func parseClashYAML(data []byte) ([]ProxyNode, error) {
 	}
 
 	var nodes []ProxyNode
+	var firstErr error
 	for _, proxy := range doc.Proxies {
 		node, ok := clashProxyToNode(proxy)
 		if !ok {
@@ -189,12 +245,19 @@ func parseClashYAML(data []byte) ([]ProxyNode, error) {
 		if IsInformationalNodeName(node.Name) {
 			continue
 		}
+		// 机场订阅里常有个别字段缺失的节点，跳过它们而不是丢掉整份订阅。
 		if err := validateNode(node); err != nil {
-			return nil, err
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		nodes = append(nodes, node)
 	}
 	if len(nodes) == 0 {
+		if firstErr != nil {
+			return nil, firstErr
+		}
 		return nil, errors.New("Clash YAML contains no supported proxy nodes")
 	}
 	return nodes, nil
@@ -209,25 +272,32 @@ func clashProxyToNode(proxy clashProxy) (ProxyNode, bool) {
 		Name:     firstNonEmpty(proxy.Name, proxy.Server),
 		Protocol: protocol,
 		Server:   proxy.Server,
-		Port:     proxy.Port,
+		Port:     int(proxy.Port),
 		Method:   proxy.Cipher,
 		Password: firstNonEmpty(proxy.Password, proxy.AuthStr),
 		UUID:     proxy.UUID,
-		AlterID:  proxy.AlterID,
+		AlterID:  int(proxy.AlterID),
 		Security: proxy.Security,
 		Flow:     proxy.Flow,
 		UDP:      proxy.UDP,
+	}
+	// mihomo 用 packet-encoding 字段，vless 还有个单独的 xudp 开关。
+	node.PacketEncoding = NormalizePacketEncoding(proxy.PacketEncoding)
+	if node.PacketEncoding == "" && proxy.XUDP {
+		node.PacketEncoding = PacketEncodingXUDP
 	}
 	if protocol == ProtocolHysteria2 && node.Password == "" {
 		node.Password = proxy.AuthStr
 	}
 	if proxy.TLS || proxy.SNI != "" || proxy.ServerName != "" || proxy.Reality.PublicKey != "" {
 		node.TLS = &TLSOptions{
-			Enabled:    true,
-			ServerName: firstNonEmpty(proxy.ServerName, proxy.SNI),
-			ALPN:       []string(proxy.ALPN),
-			PublicKey:  proxy.Reality.PublicKey,
-			ShortID:    proxy.Reality.ShortID,
+			Enabled:     true,
+			ServerName:  firstNonEmpty(proxy.ServerName, proxy.SNI),
+			Insecure:    proxy.SkipCertVerify,
+			ALPN:        []string(proxy.ALPN),
+			PublicKey:   proxy.Reality.PublicKey,
+			ShortID:     proxy.Reality.ShortID,
+			Fingerprint: proxy.ClientFingerprint,
 		}
 	}
 	if proxy.Network != "" {
@@ -238,6 +308,11 @@ func clashProxyToNode(proxy clashProxy) (ProxyNode, bool) {
 		node.Transport.Path = proxy.WSOpts.Path
 		node.Transport.Headers = proxy.WSOpts.Headers
 		node.Transport.Host = proxy.WSOpts.Headers["Host"]
+	}
+	// gRPC 的 service name 在 Clash 里单独一个字段，丢了节点就连不上。
+	if proxy.GRPCOpts.ServiceName != "" {
+		node.Transport.Type = firstNonEmpty(node.Transport.Type, "grpc")
+		node.Transport.Path = proxy.GRPCOpts.ServiceName
 	}
 	return node, true
 }
@@ -251,35 +326,43 @@ func parseSingBoxJSON(data []byte) ([]ProxyNode, error) {
 		return nil, errors.New("sing-box JSON contains no outbounds")
 	}
 	var nodes []ProxyNode
+	var firstErr error
 	for _, outbound := range doc.Outbounds {
 		protocol := normalizeProtocol(outbound.Type)
 		if !isSupportedProtocol(protocol) {
 			continue
 		}
 		node := ProxyNode{
-			Name:      firstNonEmpty(outbound.Tag, outbound.Server),
-			Protocol:  protocol,
-			Server:    outbound.Server,
-			Port:      outbound.ServerPort,
-			Method:    outbound.Method,
-			Password:  outbound.Password,
-			UUID:      outbound.UUID,
-			AlterID:   outbound.AlterID,
-			Security:  outbound.Security,
-			Flow:      outbound.Flow,
-			UDP:       outbound.UDP,
-			TLS:       outbound.TLS,
-			Transport: outbound.Transport,
+			Name:           firstNonEmpty(outbound.Tag, outbound.Server),
+			Protocol:       protocol,
+			Server:         outbound.Server,
+			Port:           int(outbound.ServerPort),
+			Method:         outbound.Method,
+			Password:       outbound.Password,
+			UUID:           outbound.UUID,
+			AlterID:        int(outbound.AlterID),
+			Security:       outbound.Security,
+			Flow:           outbound.Flow,
+			UDP:            outbound.UDP,
+			PacketEncoding: NormalizePacketEncoding(outbound.PacketEncoding),
+			TLS:            outbound.TLS,
+			Transport:      outbound.Transport,
 		}
 		if IsInformationalNodeName(node.Name) {
 			continue
 		}
 		if err := validateNode(node); err != nil {
-			return nil, err
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		nodes = append(nodes, node)
 	}
 	if len(nodes) == 0 {
+		if firstErr != nil {
+			return nil, firstErr
+		}
 		return nil, errors.New("sing-box JSON contains no supported proxy outbounds")
 	}
 	return nodes, nil
@@ -379,34 +462,29 @@ func parseVMessURI(raw string) (ProxyNode, error) {
 		return ProxyNode{}, fmt.Errorf("invalid vmess URI payload")
 	}
 	var doc struct {
-		Name     string `json:"ps"`
-		Server   string `json:"add"`
-		Port     string `json:"port"`
-		UUID     string `json:"id"`
-		AlterID  string `json:"aid"`
-		Network  string `json:"net"`
-		Security string `json:"scy"`
-		Host     string `json:"host"`
-		Path     string `json:"path"`
-		TLS      string `json:"tls"`
-		SNI      string `json:"sni"`
-		Type     string `json:"type"`
+		Name     string      `json:"ps"`
+		Server   string      `json:"add"`
+		Port     flexibleInt `json:"port"`
+		UUID     string      `json:"id"`
+		AlterID  flexibleInt `json:"aid"`
+		Network  string      `json:"net"`
+		Security string      `json:"scy"`
+		Host     string      `json:"host"`
+		Path     string      `json:"path"`
+		TLS      string      `json:"tls"`
+		SNI      string      `json:"sni"`
+		Type     string      `json:"type"`
 	}
 	if err := json.Unmarshal([]byte(decoded), &doc); err != nil {
 		return ProxyNode{}, err
 	}
-	port, err := parsePort(doc.Port)
-	if err != nil {
-		return ProxyNode{}, err
-	}
-	alterID, _ := strconv.Atoi(doc.AlterID)
 	node := ProxyNode{
 		Name:      firstNonEmpty(doc.Name, doc.Server),
 		Protocol:  ProtocolVMess,
 		Server:    doc.Server,
-		Port:      port,
+		Port:      int(doc.Port),
 		UUID:      doc.UUID,
-		AlterID:   alterID,
+		AlterID:   int(doc.AlterID),
 		Security:  doc.Security,
 		Transport: TransportOptions{Type: doc.Network, Path: doc.Path, Host: doc.Host},
 	}
@@ -429,13 +507,14 @@ func parseUserInfoURI(raw, protocol string) (ProxyNode, error) {
 	secret := u.User.Username()
 	password, hasPassword := u.User.Password()
 	node := ProxyNode{
-		Name:      firstNonEmpty(fragmentName(raw), u.Hostname()),
-		Protocol:  protocol,
-		Server:    u.Hostname(),
-		Port:      port,
-		Flow:      q.Get("flow"),
-		Security:  q.Get("security"),
-		Transport: TransportOptions{Type: q.Get("type"), Path: q.Get("path"), Host: firstNonEmpty(q.Get("host"), q.Get("Host"))},
+		Name:           firstNonEmpty(fragmentName(raw), u.Hostname()),
+		Protocol:       protocol,
+		Server:         u.Hostname(),
+		Port:           port,
+		Flow:           q.Get("flow"),
+		Security:       q.Get("security"),
+		PacketEncoding: NormalizePacketEncoding(firstNonEmpty(q.Get("packetEncoding"), q.Get("packet_encoding"))),
+		Transport:      TransportOptions{Type: q.Get("type"), Path: firstNonEmpty(q.Get("path"), q.Get("serviceName")), Host: firstNonEmpty(q.Get("host"), q.Get("Host"))},
 	}
 	switch protocol {
 	case ProtocolVLESS:
@@ -450,11 +529,12 @@ func parseUserInfoURI(raw, protocol string) (ProxyNode, error) {
 	default:
 		node.Password = secret
 	}
-	if shouldEnableTLS(q) {
+	if shouldEnableTLS(q) || alwaysTLSProtocol(protocol) {
 		node.TLS = &TLSOptions{
 			Enabled:     true,
-			ServerName:  firstNonEmpty(q.Get("sni"), q.Get("peer")),
+			ServerName:  firstNonEmpty(q.Get("sni"), q.Get("peer"), q.Get("host")),
 			Insecure:    tlsInsecureFromQuery(q),
+			ALPN:        splitALPN(q.Get("alpn")),
 			PublicKey:   q.Get("pbk"),
 			ShortID:     q.Get("sid"),
 			Fingerprint: firstNonEmpty(q.Get("fp"), q.Get("fingerprint")),
@@ -463,11 +543,40 @@ func parseUserInfoURI(raw, protocol string) (ProxyNode, error) {
 	return node, validateNode(node)
 }
 
+// alwaysTLSProtocol 的链接常常不带 security/sni 参数，但这些协议本身就跑在 TLS 上，
+// 不把 TLS 打开 sing-box 会直接报 "TLS required" 启动失败。
+func alwaysTLSProtocol(protocol string) bool {
+	switch protocol {
+	case ProtocolHysteria, ProtocolHysteria2, ProtocolTUIC, ProtocolAnyTLS:
+		return true
+	default:
+		return false
+	}
+}
+
+func splitALPN(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 func shouldEnableTLS(q url.Values) bool {
-	return q.Get("security") == "tls" ||
-		q.Get("security") == "reality" ||
-		q.Get("sni") != "" ||
-		q.Get("peer") != ""
+	switch strings.ToLower(strings.TrimSpace(q.Get("security"))) {
+	case "tls", "reality", "xtls":
+		return true
+	}
+	return q.Get("sni") != "" ||
+		q.Get("peer") != "" ||
+		q.Get("pbk") != ""
 }
 
 func tlsInsecureFromQuery(q url.Values) bool {
@@ -515,9 +624,11 @@ func validateNode(node ProxyNode) error {
 	return nil
 }
 
+// splitURIItems 只按换行/制表符切分：节点名（#后面的 fragment）里常带空格，
+// 按空格切会把一条链接拆成两段，后半段解析失败后节点名也被截断。
 func splitURIItems(text string) []string {
 	fields := strings.FieldsFunc(text, func(r rune) bool {
-		return r == '\n' || r == '\r' || r == '\t' || r == ' '
+		return r == '\n' || r == '\r' || r == '\t'
 	})
 	out := make([]string, 0, len(fields))
 	for _, field := range fields {

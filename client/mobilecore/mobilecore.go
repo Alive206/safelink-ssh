@@ -160,6 +160,8 @@ func (c *Core) Call(method, payload string) string {
 		return c.buildProxyConfig(data)
 	case "defaultProxyRules":
 		return ok(map[string]any{"rules": config.DefaultProxyRules()})
+	case "refreshRuleSets":
+		return c.refreshRuleSets(data)
 	case "testProxyNode":
 		return c.testProxyNode(data)
 	case "testProxyNodes":
@@ -247,7 +249,11 @@ func (c *Core) buildProxyConfig(data map[string]any) string {
 		}
 	}
 	cfg, err := proxycore.BuildConfig(node, proxycore.Options{
-		Mode:          asStringDefault(data, "mode", proxycore.ProxyModeRule),
+		Mode: asStringDefault(data, "mode", proxycore.ProxyModeRule),
+		// WorkDir 决定 cache_file 落在哪，必须是内核实际运行的那个目录，
+		// 不给就会回落到 os.TempDir()，而 Android 上那是 /data/local/tmp，应用写不进去。
+		WorkDir:       c.proxyRuntimeDir(data),
+		RuleSetDir:    c.ruleSetDir(data),
 		SOCKSAddr:     asStringDefault(data, "socks_addr", "127.0.0.1:10808"),
 		HTTPAddr:      asStringDefault(data, "http_addr", "127.0.0.1:10809"),
 		ClashAPIAddr:  asString(data, "clash_api_addr"),
@@ -258,6 +264,35 @@ func (c *Core) buildProxyConfig(data map[string]any) string {
 		return fail("build_proxy_config", err)
 	}
 	return ok(map[string]any{"config": string(cfg)})
+}
+
+// refreshRuleSets 把内置规则集更新到最新。Android 的内核由 Kotlin 侧启动，
+// 不走 proxycore.Runner，所以桌面端那套“起来之后顺手更新”在这里不会发生，
+// 得由 Flutter 在连上之后显式调一次。下载失败不影响任何事，内置的那份一直可用。
+func (c *Core) refreshRuleSets(data map[string]any) string {
+	dir := c.ruleSetDir(data)
+	go proxycore.RefreshRuleSets(context.Background(), dir)
+	return ok(map[string]any{"dir": dir, "started": true})
+}
+
+// proxyRuntimeDir 是 sing-box 实际运行的目录，cache_file 要落在这里。
+// 必须和 Kotlin 侧 SingBoxRuntime 启动内核用的目录一致，否则 rule_set 的 .srs
+// 缓存换个目录就得重新下载。Kotlin 会注入 proxy_work_dir，这里只是兜底。
+func (c *Core) proxyRuntimeDir(data map[string]any) string {
+	if dir := asString(data, "proxy_work_dir"); dir != "" {
+		return dir
+	}
+	return filepath.Join(c.dataDir, "sing-box")
+}
+
+// ruleSetDir 是内置规则集的落地目录，必须是应用私有目录：Android 上 os.TempDir()
+// 是 /data/local/tmp，应用没有写权限，规则集铺不出去会让 BuildConfig 整个失败。
+// 连接和测速共用同一份，省掉每个临时测速目录各铺一遍 250KB。
+func (c *Core) ruleSetDir(data map[string]any) string {
+	if dir := asString(data, "rule_set_dir"); dir != "" {
+		return dir
+	}
+	return filepath.Join(c.dataDir, "rule-sets")
 }
 
 func (c *Core) testProxyNode(data map[string]any) string {
@@ -297,8 +332,10 @@ func (c *Core) proxyOptions(data map[string]any) proxycore.Options {
 		workDir = filepath.Join(c.dataDir, "proxy-tests")
 	}
 	return proxycore.Options{
-		CorePath:      asString(data, "core_path"),
-		WorkDir:       workDir,
+		CorePath: asString(data, "core_path"),
+		WorkDir:  workDir,
+		// 规则集跟连接路径共用，不随每次测速的临时目录走
+		RuleSetDir:    c.ruleSetDir(data),
 		Mode:          asStringDefault(data, "mode", proxycore.ProxyModeRule),
 		SOCKSAddr:     asStringDefault(data, "socks_addr", "127.0.0.1:10808"),
 		HTTPAddr:      asStringDefault(data, "http_addr", "127.0.0.1:10809"),

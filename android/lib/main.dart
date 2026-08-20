@@ -206,6 +206,8 @@ class AppController extends ChangeNotifier {
   static const _proxyClashAddr = '127.0.0.1:10810';
   static const _storeKey = 'safelink_state_v1';
   static const _settingsVersion = 2;
+  // 跟 Go 侧 subscriptionclient 用的是同一个值，机场按 UA 决定给不给用量头，两端得一致
+  static const _subscriptionUserAgent = 'ClashVerge/2.4.1';
   final NativeBridge native;
   StreamSubscription<Map<String, dynamic>>? _eventSub;
   Timer? _runtimePoll;
@@ -634,8 +636,19 @@ class AppController extends ChangeNotifier {
         );
       }
       _log('info', '已启动 ${node.name}');
+      _refreshRuleSets();
       await save();
       notifyListeners();
+    });
+  }
+
+  // 规则集内置在包里，启动不依赖网络。这里只是趁着代理已经通了把过期的那份换掉，
+  // 桌面端在内核起来之后自己会做，Android 的内核由 Kotlin 启动、不走那条路径，得显式调。
+  // 失败无所谓，内置的一直可用，所以不 await、不报错给用户。
+  void _refreshRuleSets() {
+    native.coreCall('refreshRuleSets').catchError((Object error) {
+      _log('debug', '规则集更新未启动: $error');
+      return null;
     });
   }
 

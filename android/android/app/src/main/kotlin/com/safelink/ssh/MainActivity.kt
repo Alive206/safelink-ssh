@@ -229,6 +229,15 @@ class MainActivity : FlutterActivity() {
         if (!json.has("work_dir")) {
             json.put("work_dir", File(filesDir, "proxy-tests").absolutePath)
         }
+        // 内核真正运行的目录，cache_file 得落在这里；work_dir 那个是测速用的，不是同一个地方。
+        if (!json.has("proxy_work_dir")) {
+            json.put("proxy_work_dir", SingBoxRuntime.workDir(this).absolutePath)
+        }
+        // 内置规则集的落地目录。不能交给 Go 侧默认值去猜：它会回落到
+        // /data/local/tmp，应用在那里没有写权限，规则集铺不出去连配置都生成不了。
+        if (!json.has("rule_set_dir")) {
+            json.put("rule_set_dir", File(filesDir, "rule-sets").absolutePath)
+        }
         if (!json.has("dns_servers")) {
             val servers = systemDnsServers()
             if (servers.isNotEmpty()) {

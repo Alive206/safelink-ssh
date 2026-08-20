@@ -50,6 +50,15 @@ const (
 
 	// sing-box 的 REALITY 客户端必须开 uTLS，链接里没给 fp 时用这个默认指纹
 	defaultUTLSFingerprint = "chrome"
+
+	// 规则模式冷启动要先把 geosite/geoip 规则集拉下来才会开始监听，实测能超过 4s，
+	// 就绪等待必须留够时间，否则规则集还没下完就被判定为启动失败。
+	defaultReadyTimeout = 15 * time.Second
+
+	// 只留 sing-box 启动阶段的开头输出：启动失败的原因都在最前面，
+	// 而进程可能长跑几小时，不能无上限地攒日志。
+	maxCoreLogTailBytes = 8 * 1024
+
 	// vmess/vless 的 UDP 封装默认用 xudp：机场服务端多为 Xray，不开的话 UDP 转发会异常
 	defaultPacketEncoding = proxysubscription.PacketEncodingXUDP
 
@@ -98,6 +107,13 @@ type Options struct {
 	// DNSServers 是解析节点服务器域名用的 DNS。Android 上没有 /etc/resolv.conf，
 	// sing-box 默认的 local DNS 会退化成查 127.0.0.1:53 直接失败，必须显式给出。
 	DNSServers []string
+	// RuleSetDir 是本地 .srs 规则集的存放目录，空则取 WorkDir/rule-sets。
+	// 测速会用独立的临时工作目录，必须把这里指回主目录，否则每测一个节点
+	// 都要重新铺一遍规则集文件。
+	RuleSetDir string
+	// withoutRuleSets 用于降级启动：规则集文件铺不出来或者已损坏时，剔掉 rule_set
+	// 再生成一份配置，让代理至少能起来。只在包内使用。
+	withoutRuleSets bool
 }
 
 type Status struct {
@@ -159,12 +175,35 @@ func (r *Runner) SetRuleModeRules(rules []config.ProxyRule) {
 }
 
 func (r *Runner) Start(ctx context.Context, node proxysubscription.ProxyNode) error {
+	err := r.start(ctx, node, true)
+	if err == nil {
+		// 代理已经起来了，后台把过期的规则集更新一遍。
+		// 失败无所谓：内置的那份一直可用，只是旧一点。
+		ruleSetDir := normalizeOptions(r.opts).RuleSetDir
+		go refreshLocalRuleSets(context.WithoutCancel(ctx), ruleSetDir)
+		return nil
+	}
+	if !isRuleSetInitFailure(err.Error()) {
+		return err
+	}
+	// 规则集是启动硬依赖：sing-box 加载不了就直接 FATAL 退出，代理整个起不来。
+	// 内置之后这里几乎不会走到（只剩文件铺不出去、被外部改坏这类情况），
+	// 作为最后一道防线保留：少一条分流规则也比连不上强。
+	if retryErr := r.start(ctx, node, false); retryErr != nil {
+		// 降级也失败说明另有原因，原始错误更能说明问题
+		return err
+	}
+	return nil
+}
+
+func (r *Runner) start(ctx context.Context, node proxysubscription.ProxyNode, useRuleSets bool) error {
 	r.mu.Lock()
 	if r.cmd != nil {
 		r.mu.Unlock()
 		return errors.New("proxy core is already running")
 	}
 	opts := normalizeOptions(r.opts)
+	opts.withoutRuleSets = !useRuleSets
 	if opts.CorePath == "" {
 		opts.CorePath = FindCorePath("")
 	}
@@ -202,6 +241,10 @@ func (r *Runner) Start(ctx context.Context, node proxysubscription.ProxyNode) er
 	runCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(runCtx, opts.CorePath, "run", "-c", configPath)
 	cmd.Dir = opts.WorkDir
+	// 抓住启动阶段的输出，规则集初始化失败之类的原因只在 sing-box 日志里
+	logs := newCoreLogTail()
+	cmd.Stdout = logs
+	cmd.Stderr = logs
 	hideCommandWindow(cmd)
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -233,7 +276,7 @@ func (r *Runner) Start(ctx context.Context, node proxysubscription.ProxyNode) er
 			r.state = StateStopped
 			if err != nil && runCtx.Err() == nil {
 				r.state = StateError
-				r.lastError = err.Error()
+				r.lastError = withCoreLogs(err, logs).Error()
 			}
 			r.startedAt = time.Time{}
 			r.lastTraffic = connectionTraffic{}
@@ -243,10 +286,12 @@ func (r *Runner) Start(ctx context.Context, node proxysubscription.ProxyNode) er
 		close(done)
 	}()
 
-	readyCtx, readyCancel := context.WithTimeout(ctx, 5*time.Second)
+	readyCtx, readyCancel := context.WithTimeout(ctx, defaultReadyTimeout)
 	defer readyCancel()
 	for _, addr := range readyAddrs {
-		if err := waitForLocalTCPWithDone(readyCtx, addr, done, "proxy listener"); err != nil {
+		err := waitForLocalTCPWithDeadline(readyCtx, addr, done, "proxy listener", defaultReadyTimeout)
+		if err != nil {
+			err = withCoreLogs(err, logs)
 			cancel()
 			if done != nil {
 				<-done
@@ -542,6 +587,8 @@ func testNodeWithCore(ctx context.Context, node proxysubscription.ProxyNode, opt
 		SOCKSAddr:    socksAddr,
 		HTTPAddr:     httpAddr,
 		ClashAPIAddr: clashAPIAddr,
+		// 指回主目录的规则集：testDir 每次都是新临时目录，不指就要每测一个节点重铺一遍
+		RuleSetDir: opts.RuleSetDir,
 	})
 	if err != nil {
 		result.Error = err.Error()
@@ -672,6 +719,8 @@ func SpeedTestNode(ctx context.Context, node proxysubscription.ProxyNode, opts O
 		HTTPAddr:      httpAddr,
 		ClashAPIAddr:  clashAPIAddr,
 		RuleModeRules: opts.RuleModeRules,
+		// 同上：规则集文件跟主目录共用，不随临时工作目录走
+		RuleSetDir: opts.RuleSetDir,
 	})
 	if err != nil {
 		result.Error = err.Error()
@@ -1059,6 +1108,61 @@ func checkCoreConfig(ctx context.Context, corePath, configPath, workDir string) 
 	return fmt.Errorf("check sing-box config: %w", err)
 }
 
+// coreLogTail 收 sing-box 的输出。只留开头 maxCoreLogTailBytes 字节：启动失败的
+// 原因都在最前面，而正常运行时日志会一直长，不能全攒在内存里。
+// 子进程写入发生在另一个 goroutine，所以要加锁。
+type coreLogTail struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func newCoreLogTail() *coreLogTail {
+	return &coreLogTail{}
+}
+
+func (t *coreLogTail) Write(p []byte) (int, error) {
+	n := len(p)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if remain := maxCoreLogTailBytes - t.buf.Len(); remain > 0 {
+		if len(p) > remain {
+			p = p[:remain]
+		}
+		t.buf.Write(p)
+	}
+	// 超出上限的部分丢掉，但对 sing-box 要报写成功，否则它会当成管道错误
+	return n, nil
+}
+
+func (t *coreLogTail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.TrimSpace(t.buf.String())
+}
+
+// withCoreLogs 把 sing-box 自己的输出拼到错误上。光看"监听端口超时"根本不知道
+// 为何起不来，真正的原因（如规则集下载失败）只在它的日志里。
+func withCoreLogs(err error, logs *coreLogTail) error {
+	if logs == nil {
+		return err
+	}
+	output := logs.String()
+	if output == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, output)
+}
+
+// isRuleSetInitFailure 认出“远程规则集拉不下来导致 sing-box 启动失败”这类错误，
+// 典型形态：FATAL start service: (initialize rule-set[2]: initial rule-set: geoip-cn: Get ...)
+func isRuleSetInitFailure(message string) bool {
+	lower := strings.ToLower(message)
+	if !strings.Contains(lower, "rule-set") && !strings.Contains(lower, "rule_set") {
+		return false
+	}
+	return strings.Contains(lower, "initial") || strings.Contains(lower, "download")
+}
+
 func testHTTPThroughProxy(ctx context.Context, client *http.Client) (int64, error) {
 	var attempts []string
 	for _, testURL := range testURLs {
@@ -1313,7 +1417,11 @@ func waitForLocalTCP(ctx context.Context, addr string) error {
 }
 
 func waitForLocalTCPWithDone(ctx context.Context, addr string, done <-chan struct{}, label string) error {
-	deadline := time.NewTimer(3 * time.Second)
+	return waitForLocalTCPWithDeadline(ctx, addr, done, label, 3*time.Second)
+}
+
+func waitForLocalTCPWithDeadline(ctx context.Context, addr string, done <-chan struct{}, label string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -1355,7 +1463,7 @@ func BuildConfig(node proxysubscription.ProxyNode, opts Options) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	route, err := buildRoute(opts.Mode, opts.RuleModeRules)
+	route, err := buildRoute(opts.Mode, opts.RuleModeRules, opts.RuleSetDir, !opts.withoutRuleSets)
 	if err != nil {
 		return nil, err
 	}
@@ -1376,10 +1484,11 @@ func BuildConfig(node proxysubscription.ProxyNode, opts Options) ([]byte, error)
 	}
 	applyDNSConfig(cfg, route, opts)
 	experimental := make(map[string]any)
-	if _, ok := route["rule_set"]; ok {
-		experimental["cache_file"] = map[string]any{
-			"enabled": true,
-		}
+	// cache_file 无条件开：rule_set 的 .srs 缓存全靠它，冷启动一次要多付好几秒。
+	// path 也显式给出，避开 sing-box 按工作目录推断导致换个目录就重新下载。
+	experimental["cache_file"] = map[string]any{
+		"enabled": true,
+		"path":    filepath.Join(opts.WorkDir, "cache.db"),
 	}
 	if opts.ClashAPIAddr != "" {
 		experimental["clash_api"] = map[string]any{
@@ -1488,7 +1597,7 @@ func normalizeDNSServers(servers []string) []string {
 	return normalized
 }
 
-func buildRoute(mode string, rules []config.ProxyRule) (map[string]any, error) {
+func buildRoute(mode string, rules []config.ProxyRule, ruleSetDir string, useRuleSets bool) (map[string]any, error) {
 	switch NormalizeMode(mode) {
 	case ProxyModeDirect:
 		return map[string]any{"final": "direct"}, nil
@@ -1505,11 +1614,16 @@ func buildRoute(mode string, rules []config.ProxyRule) (map[string]any, error) {
 			if !rule.Enabled || strings.TrimSpace(rule.Value) == "" {
 				continue
 			}
+			isRuleSet := config.NormalizeProxyRuleType(rule.Type) == config.ProxyRuleTypeRuleSet
+			// 降级启动时连引用一起丢：只删 rule_set 定义会让 sing-box 报 rule-set not found
+			if isRuleSet && !useRuleSets {
+				continue
+			}
 			routeRule := map[string]any{
 				proxyRuleRouteKey(rule.Type): []string{rule.Value},
 				"outbound":                   rule.Outbound,
 			}
-			if rule.Type == config.ProxyRuleTypeRuleSet {
+			if isRuleSet {
 				ruleSets = append(ruleSets, rule.Value)
 			}
 			routeRules = append(routeRules, routeRule)
@@ -1518,7 +1632,11 @@ func buildRoute(mode string, rules []config.ProxyRule) (map[string]any, error) {
 			"rules": routeRules,
 			"final": "selected",
 		}
-		if definitions := buildRemoteRuleSetDefinitions(ruleSets); len(definitions) > 0 {
+		definitions, err := buildLocalRuleSetDefinitions(ruleSets, ruleSetDir)
+		if err != nil {
+			return nil, err
+		}
+		if len(definitions) > 0 {
 			route["rule_set"] = definitions
 		}
 		return route, nil
@@ -1540,29 +1658,38 @@ func proxyRuleRouteKey(ruleType string) string {
 	}
 }
 
-func buildRemoteRuleSetDefinitions(ruleSets []string) []map[string]any {
+// buildLocalRuleSetDefinitions 生成 local 类型的 rule_set 定义，顺带把内置的 .srs
+// 铺到 dir。铺文件这个副作用放在这里是故意的：BuildConfig 有好几个调用方，
+// 少铺一次就会让 sing-box 找不到规则集文件而启动失败，集中在这里最不容易漏。
+func buildLocalRuleSetDefinitions(ruleSets []string, dir string) ([]map[string]any, error) {
 	seen := make(map[string]bool, len(ruleSets))
-	definitions := make([]map[string]any, 0, len(ruleSets))
+	tags := make([]string, 0, len(ruleSets))
 	for _, ruleSet := range ruleSets {
 		tag := strings.ToLower(strings.TrimSpace(ruleSet))
-		if seen[tag] {
-			continue
-		}
-		url, ok := remoteProxyRuleSetURLs[tag]
-		if !ok {
+		if seen[tag] || embeddedRuleSetFiles[tag] == "" {
 			continue
 		}
 		seen[tag] = true
+		tags = append(tags, tag)
+	}
+	paths, err := ensureLocalRuleSetFiles(dir, tags)
+	if err != nil {
+		return nil, err
+	}
+	definitions := make([]map[string]any, 0, len(tags))
+	for _, tag := range tags {
+		path, ok := paths[tag]
+		if !ok {
+			continue
+		}
 		definitions = append(definitions, map[string]any{
-			"type":            "remote",
-			"tag":             tag,
-			"format":          "binary",
-			"url":             url,
-			"download_detour": "selected",
-			"update_interval": "24h",
+			"type":   "local",
+			"tag":    tag,
+			"format": "binary",
+			"path":   path,
 		})
 	}
-	return definitions
+	return definitions, nil
 }
 
 func buildInbound(tag, inboundType, addr string) map[string]any {
@@ -1768,6 +1895,9 @@ func normalizeOptions(opts Options) Options {
 	}
 	if opts.WorkDir == "" {
 		opts.WorkDir = filepath.Join(os.TempDir(), "safelink-proxy")
+	}
+	if opts.RuleSetDir == "" {
+		opts.RuleSetDir = filepath.Join(opts.WorkDir, "rule-sets")
 	}
 	opts.Mode = NormalizeMode(opts.Mode)
 	opts.RuleModeRules = normalizeRuleModeRules(opts.RuleModeRules)

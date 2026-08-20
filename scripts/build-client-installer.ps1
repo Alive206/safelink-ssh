@@ -44,15 +44,30 @@ Push-Location $ClientDir
 try {
     New-Item -ItemType Directory -Force -Path $BuildBin | Out-Null
     $wails = Get-Command wails -ErrorAction SilentlyContinue
+    $built = $false
     if ($wails) {
         & wails build -platform windows/amd64
-        if ($LASTEXITCODE -ne 0) {
-            throw "wails build failed with exit code $LASTEXITCODE"
+        if ($LASTEXITCODE -eq 0) {
+            $built = $true
+        } else {
+            # Wails CLI 2.9.1 自带的 go.mod 解析器不认 Go 1.24 的 tool 指令，而
+            # client/go.mod 里的 `tool golang.org/x/mobile/cmd/gobind` 是 Android 构建必需的。
+            # 两边都不能动，所以 wails 失败就回退到 Go 直构：前端 dist 和 wailsjs 绑定
+            # 都已经就位，wails 在这一步只是包一层资源。
+            Write-Host "wails build failed with exit code $LASTEXITCODE; falling back to the Go build."
         }
     } else {
         Write-Host "Wails CLI was not found; using Go fallback build."
+    }
+    if (-not $built) {
         go run github.com/akavel/rsrc@v0.10.2 -manifest "build\windows\wails.exe.manifest" -ico "build\windows\icon.ico" -o "rsrc_windows_amd64.syso"
+        if ($LASTEXITCODE -ne 0) {
+            throw "rsrc failed with exit code $LASTEXITCODE"
+        }
         go build -tags "desktop,production" -ldflags "-w -s -H windowsgui" -o "build\bin\SafeLink.exe" .
+        if ($LASTEXITCODE -ne 0) {
+            throw "go build failed with exit code $LASTEXITCODE"
+        }
     }
 } finally {
     Pop-Location

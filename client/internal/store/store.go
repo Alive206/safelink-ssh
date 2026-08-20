@@ -238,7 +238,11 @@ func (s *Store) LoadActiveProxyNodes() ([]proxysubscription.ProxyNode, error) {
 		}
 	}
 	sort.SliceStable(active, func(i, j int) bool {
-		return proxyNodeProtocolRank(active[i].Protocol) < proxyNodeProtocolRank(active[j].Protocol)
+		ri, rj := proxyNodeProtocolRank(active[i].Protocol), proxyNodeProtocolRank(active[j].Protocol)
+		if ri != rj {
+			return ri < rj
+		}
+		return proxyNodeVariantRank(active[i]) < proxyNodeVariantRank(active[j])
 	})
 	return active, nil
 }
@@ -615,6 +619,28 @@ func proxyNodeProtocolRank(protocol string) int {
 		return 2
 	default:
 		return 3
+	}
+}
+
+// proxyNodeVariantRank 在同一协议内排传输层变体：REALITY + xtls-rprx-vision 比
+// WebSocket 少一层 HTTP upgrade 和帧开销，建连和单连接吞吐都更好，排前面。
+// 这只影响还没测过延迟时的默认顺序；测过的节点前端仍然按实测延迟排。
+func proxyNodeVariantRank(node proxysubscription.ProxyNode) int {
+	reality := node.TLS != nil && strings.TrimSpace(node.TLS.PublicKey) != ""
+	vision := strings.Contains(node.Flow, "vision")
+	ws := strings.EqualFold(strings.TrimSpace(node.Transport.Type), "ws") ||
+		strings.EqualFold(strings.TrimSpace(node.Transport.Type), "websocket")
+	switch {
+	case reality && vision && !ws:
+		return 0
+	case reality && vision:
+		return 1
+	case reality:
+		return 2
+	case !ws:
+		return 3
+	default:
+		return 4
 	}
 }
 

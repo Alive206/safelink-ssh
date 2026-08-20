@@ -2,6 +2,8 @@ package mobilecore
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +42,110 @@ func TestCoreBuildsProxyConfig(t *testing.T) {
 	if !resp.OK || !strings.Contains(resp.Data.Config, `"shadowsocks"`) {
 		t.Fatalf("Call(buildProxyConfig) = %s", got)
 	}
+}
+
+// rule 模式下配置里要带 rule_set，而规则集文件必须铺在应用私有目录里。
+// 之前这条路径没覆盖：只测了 global 模式，而 global 不碰 rule_set，
+// 结果“目录回落到 os.TempDir() 导致 Android 上铺不出去”这个问题完全没被拦住。
+func TestCoreBuildsRuleModeConfigWithLocalRuleSetsUnderDataDir(t *testing.T) {
+	dataDir := t.TempDir()
+	core := NewCore(dataDir)
+	payload := `{"mode":"rule","node":{"name":"ss","protocol":"ss","server":"example.com","port":8388,"method":"aes-128-gcm","password":"secret"}}`
+
+	var resp struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+		Data    struct {
+			Config string `json:"config"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(core.Call("buildProxyConfig", payload)), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("buildProxyConfig failed: %s", resp.Message)
+	}
+
+	var cfg struct {
+		Route struct {
+			RuleSet []struct {
+				Type string `json:"type"`
+				Tag  string `json:"tag"`
+				Path string `json:"path"`
+				URL  string `json:"url"`
+			} `json:"rule_set"`
+		} `json:"route"`
+		Experimental struct {
+			CacheFile struct {
+				Path string `json:"path"`
+			} `json:"cache_file"`
+		} `json:"experimental"`
+	}
+	if err := json.Unmarshal([]byte(resp.Data.Config), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Route.RuleSet) == 0 {
+		t.Fatal("rule 模式的配置里没有 rule_set")
+	}
+	for _, rs := range cfg.Route.RuleSet {
+		if rs.Type != "local" {
+			t.Fatalf("rule_set %s type = %s, want local", rs.Tag, rs.Type)
+		}
+		if rs.URL != "" {
+			t.Fatalf("rule_set %s 还带着 url=%s，启动又会去联网", rs.Tag, rs.URL)
+		}
+		// 必须在应用私有目录下：Android 上 os.TempDir() 是 /data/local/tmp，写不进去
+		if !strings.HasPrefix(rs.Path, dataDir) {
+			t.Fatalf("rule_set %s path = %s, want under %s", rs.Tag, rs.Path, dataDir)
+		}
+		info, err := os.Stat(rs.Path)
+		if err != nil {
+			t.Fatalf("rule_set %s 文件没落盘: %v", rs.Tag, err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("rule_set %s 文件是空的", rs.Tag)
+		}
+	}
+	// cache_file 同样不能落到内核写不进去的地方，否则 .srs 缓存等于白做
+	if !strings.HasPrefix(cfg.Experimental.CacheFile.Path, dataDir) {
+		t.Fatalf("cache_file path = %s, want under %s", cfg.Experimental.CacheFile.Path, dataDir)
+	}
+}
+
+// Kotlin 侧会把目录注入到 payload 里，注入的值要能盖掉默认值。
+func TestCoreHonorsInjectedRuleSetDir(t *testing.T) {
+	core := NewCore(t.TempDir())
+	ruleSetDir := filepath.Join(t.TempDir(), "injected-rule-sets")
+	payload := `{"mode":"rule","rule_set_dir":` + quoteJSON(ruleSetDir) + `,` +
+		`"node":{"name":"ss","protocol":"ss","server":"example.com","port":8388,"method":"aes-128-gcm","password":"secret"}}`
+
+	var resp struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+		Data    struct {
+			Config string `json:"config"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(core.Call("buildProxyConfig", payload)), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("buildProxyConfig failed: %s", resp.Message)
+	}
+	if !strings.Contains(resp.Data.Config, strings.ReplaceAll(ruleSetDir, `\`, `\\`)) {
+		t.Fatalf("注入的 rule_set_dir 没生效，config = %s", resp.Data.Config)
+	}
+	if entries, err := os.ReadDir(ruleSetDir); err != nil || len(entries) == 0 {
+		t.Fatalf("规则集没铺到注入的目录: %v", err)
+	}
+}
+
+func quoteJSON(s string) string {
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
 }
 
 func TestCoreProxyTestMethodsReturnStructuredFailures(t *testing.T) {

@@ -51,6 +51,11 @@ object SingBoxRuntime {
 
     fun isRunning(): Boolean = synchronized(lock) { process?.isAlive == true }
 
+    // 内核的工作目录。cache_file 由 Go 侧写进配置里的绝对路径，两边必须指同一个地方，
+    // 否则 rule_set 的 .srs 缓存每次都落在内核找不到的位置，等于白缓存。
+    fun workDir(context: Context): File =
+        File(context.applicationContext.filesDir, "sing-box").also { it.mkdirs() }
+
     fun start(
         context: Context,
         configJson: String,
@@ -67,7 +72,7 @@ object SingBoxRuntime {
         synchronized(lock) {
             stopLocked(emitEvent = false)
             val appContext = context.applicationContext
-            val workDir = File(appContext.filesDir, "sing-box").also { it.mkdirs() }
+            val workDir = workDir(appContext)
             val configFile = File(workDir, "config.json")
             configFile.writeText(configJson, Charsets.UTF_8)
 

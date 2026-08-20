@@ -1,6 +1,7 @@
 package proxycore
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/safelink/pkg/config"
 	"github.com/example/safelink/pkg/proxysubscription"
 )
 
@@ -565,4 +567,161 @@ func executableSuffix() string {
 		return ".exe"
 	}
 	return ""
+}
+
+// 降级启动时不能只删 rule_set 定义：路由规则里还引用着它的话 sing-box 会直接
+// 报 rule-set not found，降级一样起不来。
+func TestBuildRouteWithoutRuleSetsDropsDefinitionsAndReferences(t *testing.T) {
+	ruleSetDir := t.TempDir()
+	route, err := buildRoute(ProxyModeRule, nil, ruleSetDir, false)
+	if err != nil {
+		t.Fatalf("buildRoute returned error: %v", err)
+	}
+	if _, ok := route["rule_set"]; ok {
+		t.Fatalf("route.rule_set should be absent, got %+v", route["rule_set"])
+	}
+	for _, raw := range route["rules"].([]map[string]any) {
+		if _, ok := raw["rule_set"]; ok {
+			t.Fatalf("route.rules still references a rule_set: %+v", raw)
+		}
+	}
+	if route["final"] != "selected" {
+		t.Fatalf("route.final = %q, want selected", route["final"])
+	}
+	// 降级时不需要规则集，也就不应该白铺一遍文件
+	if entries, err := os.ReadDir(ruleSetDir); err == nil && len(entries) > 0 {
+		t.Fatalf("rule set files were written during fallback start: %v", entries)
+	}
+
+	// 对照：默认仍然带规则集，降级只能是启动失败后的退路
+	withRuleSets, err := buildRoute(ProxyModeRule, nil, ruleSetDir, true)
+	if err != nil {
+		t.Fatalf("buildRoute returned error: %v", err)
+	}
+	if _, ok := withRuleSets["rule_set"]; !ok {
+		t.Fatal("route.rule_set missing when rule sets are enabled")
+	}
+}
+
+// 内置的 .srs 必须真的能铺出来，且已存在的文件不重写：批量测速会反复调用。
+func TestEnsureLocalRuleSetFilesWritesOnceAndKeepsContent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rule-sets")
+	tags := []string{
+		config.ProxyRuleSetGeoIPCN,
+		config.ProxyRuleSetGeositeGeolocationCN,
+		config.ProxyRuleSetGeositeGeolocationNotCN,
+	}
+	paths, err := ensureLocalRuleSetFiles(dir, tags)
+	if err != nil {
+		t.Fatalf("ensureLocalRuleSetFiles returned error: %v", err)
+	}
+	if len(paths) != len(tags) {
+		t.Fatalf("got %d paths, want %d: %+v", len(paths), len(tags), paths)
+	}
+	modTimes := make(map[string]time.Time, len(paths))
+	for tag, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("rule set %s not written: %v", tag, err)
+		}
+		if info.Size() < minRuleSetBytes {
+			t.Fatalf("rule set %s is only %d bytes, embedded file looks broken", tag, info.Size())
+		}
+		modTimes[tag] = info.ModTime()
+	}
+
+	// 第二次调用不应该重写：每测一个节点重写几百 KB 没必要
+	time.Sleep(10 * time.Millisecond)
+	again, err := ensureLocalRuleSetFiles(dir, tags)
+	if err != nil {
+		t.Fatalf("second ensureLocalRuleSetFiles returned error: %v", err)
+	}
+	for tag, path := range again {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("rule set %s disappeared: %v", tag, err)
+		}
+		if !info.ModTime().Equal(modTimes[tag]) {
+			t.Fatalf("rule set %s was rewritten, mod time changed %v -> %v",
+				tag, modTimes[tag], info.ModTime())
+		}
+	}
+}
+
+// 下载回来的东西要把关住：写进去一份损坏的 .srs 会让下次启动直接 FATAL。
+func TestDownloadRuleSetRejectsBadResponses(t *testing.T) {
+	good := bytes.Repeat([]byte{0x53, 0x52, 0x53}, minRuleSetBytes)
+	cases := []struct {
+		name    string
+		status  int
+		body    []byte
+		wantErr bool
+	}{
+		{name: "ok", status: http.StatusOK, body: good},
+		{name: "not found", status: http.StatusNotFound, body: good, wantErr: true},
+		{name: "server error", status: http.StatusServiceUnavailable, body: good, wantErr: true},
+		{name: "too small", status: http.StatusOK, body: []byte("nope"), wantErr: true},
+		{name: "html error page", status: http.StatusOK,
+			body:    append([]byte("<!DOCTYPE html>"), bytes.Repeat([]byte(" "), minRuleSetBytes)...),
+			wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write(tc.body)
+			}))
+			defer srv.Close()
+			data, err := downloadRuleSet(context.Background(), srv.Client(), srv.URL)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d bytes", len(data))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(data, tc.body) {
+				t.Fatal("downloaded content does not match response body")
+			}
+		})
+	}
+}
+
+func TestIsRuleSetInitFailure(t *testing.T) {
+	// sing-box 真实日志：规则集拉不下来时它不是降级，而是直接 FATAL 退出
+	const realLog = `FATAL start service: (initialize rule-set[2]: initial rule-set: ` +
+		`geoip-cn: Get "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs": ` +
+		`unexpected HTTP response status: 503 Service Unavailable)`
+	if !isRuleSetInitFailure(realLog) {
+		t.Fatal("real sing-box rule-set FATAL log was not recognized")
+	}
+	for _, unrelated := range []string{
+		"",
+		"proxy listener exited before 127.0.0.1:10808 became ready",
+		"FATAL start service: (initialize inbound/socks[socks-in]: listen tcp: address already in use)",
+	} {
+		if isRuleSetInitFailure(unrelated) {
+			t.Fatalf("unrelated failure treated as rule-set failure: %q", unrelated)
+		}
+	}
+}
+
+// 日志缓冲得封顶，但对 sing-box 必须报写成功，否则它会把短写当成管道错误。
+func TestCoreLogTailCapsSizeButReportsFullWrite(t *testing.T) {
+	logs := newCoreLogTail()
+	chunk := make([]byte, maxCoreLogTailBytes)
+	for i := range chunk {
+		chunk[i] = 'a'
+	}
+	if n, err := logs.Write(chunk); n != len(chunk) || err != nil {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(chunk))
+	}
+	if n, err := logs.Write([]byte("overflow")); n != len("overflow") || err != nil {
+		t.Fatalf("Write past cap = (%d, %v), want (%d, nil)", n, err, len("overflow"))
+	}
+	if got := len(logs.String()); got > maxCoreLogTailBytes {
+		t.Fatalf("buffered %d bytes, want at most %d", got, maxCoreLogTailBytes)
+	}
 }

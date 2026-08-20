@@ -228,3 +228,42 @@ func hasAnyRuleSet(rules []config.ProxyRule) bool {
 	}
 	return false
 }
+
+// 同为 VLESS 时按传输层变体排：REALITY + vision 比 WebSocket 少一层 HTTP upgrade
+// 和帧开销，默认顺序要把它们放前面。
+func TestLoadActiveProxyNodesPrefersRealityVisionOverWebSocket(t *testing.T) {
+	st := store.New(t.TempDir())
+	sub := store.SubscriptionSource{ID: "sub", Name: "sub", Kind: store.SubscriptionKindProxy, Enabled: true}
+	if err := st.SaveSubscriptions([]store.SubscriptionSource{sub}); err != nil {
+		t.Fatalf("SaveSubscriptions: %v", err)
+	}
+
+	ws := proxysubscription.ProxyNode{
+		Name: "vless-ws-tls", Protocol: proxysubscription.ProtocolVLESS,
+		Server: "ws.example.com", Port: 443, UUID: "11111111-1111-1111-1111-111111111111",
+		SubscriptionID: sub.ID,
+		Transport:      proxysubscription.TransportOptions{Type: "ws", Path: "/path"},
+		TLS:            &proxysubscription.TLSOptions{Enabled: true, ServerName: "ws.example.com"},
+	}
+	realityVision := proxysubscription.ProxyNode{
+		Name: "vless-reality-vision", Protocol: proxysubscription.ProtocolVLESS,
+		Server: "reality.example.com", Port: 443, UUID: "11111111-1111-1111-1111-111111111111",
+		SubscriptionID: sub.ID, Flow: "xtls-rprx-vision",
+		TLS:            &proxysubscription.TLSOptions{Enabled: true, ServerName: "reality.example.com", PublicKey: "pubkey", ShortID: "beef"},
+	}
+	// 存入时故意把 WS 排在前面，确保顺序是排序逻辑得出的而不是写入顺序
+	if err := st.SaveProxyNodes([]proxysubscription.ProxyNode{ws, realityVision}); err != nil {
+		t.Fatalf("SaveProxyNodes: %v", err)
+	}
+
+	nodes, err := st.LoadActiveProxyNodes()
+	if err != nil {
+		t.Fatalf("LoadActiveProxyNodes: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("loaded %d nodes, want 2", len(nodes))
+	}
+	if nodes[0].Name != "vless-reality-vision" {
+		t.Fatalf("first node = %q, want vless-reality-vision", nodes[0].Name)
+	}
+}

@@ -157,7 +157,10 @@ func TestBuildConfigIncludesDefaultRuleSetsForChinaBypass(t *testing.T) {
 		Method:   "aes-128-gcm",
 		Password: "secret",
 	}
-	data, err := proxycore.BuildConfig(node, proxycore.Options{Mode: proxycore.ProxyModeRule})
+	data, err := proxycore.BuildConfig(node, proxycore.Options{
+		Mode:    proxycore.ProxyModeRule,
+		WorkDir: t.TempDir(),
+	})
 	if err != nil {
 		t.Fatalf("BuildConfig returned error: %v", err)
 	}
@@ -182,15 +185,103 @@ func TestBuildConfigIncludesDefaultRuleSetsForChinaBypass(t *testing.T) {
 	}
 
 	ruleSets := route["rule_set"].([]any)
-	if !remoteRuleSetsContain(ruleSets, config.ProxyRuleSetGeositeGeolocationNotCN) ||
-		!remoteRuleSetsContain(ruleSets, config.ProxyRuleSetGeositeGeolocationCN) ||
-		!remoteRuleSetsContain(ruleSets, config.ProxyRuleSetGeoIPCN) {
-		t.Fatalf("route.rule_set missing expected remote definitions: %+v", ruleSets)
+	if !localRuleSetsContain(ruleSets, config.ProxyRuleSetGeositeGeolocationNotCN) ||
+		!localRuleSetsContain(ruleSets, config.ProxyRuleSetGeositeGeolocationCN) ||
+		!localRuleSetsContain(ruleSets, config.ProxyRuleSetGeoIPCN) {
+		t.Fatalf("route.rule_set missing expected local definitions: %+v", ruleSets)
 	}
 	experimental := cfg["experimental"].(map[string]any)
 	cacheFile := experimental["cache_file"].(map[string]any)
 	if cacheFile["enabled"] != true {
 		t.Fatalf("cache_file.enabled = %v, want true", cacheFile["enabled"])
+	}
+}
+
+// 规则集必须是内置的本地文件。以前是 remote 类型现下载，分流规则本身成了能上网的
+// 前提：拉不到就 FATAL 起不来。现在启动不碰网络，文件必须真实落盘且内容非空。
+func TestBuildConfigUsesEmbeddedLocalRuleSets(t *testing.T) {
+	node := proxysubscription.ProxyNode{
+		Name:     "ss-hk",
+		Protocol: proxysubscription.ProtocolShadowsocks,
+		Server:   "ss.example.com",
+		Port:     8388,
+		Method:   "aes-128-gcm",
+		Password: "secret",
+	}
+	ruleSetDir := filepath.Join(t.TempDir(), "rule-sets")
+	data, err := proxycore.BuildConfig(node, proxycore.Options{
+		Mode:       proxycore.ProxyModeRule,
+		WorkDir:    t.TempDir(),
+		RuleSetDir: ruleSetDir,
+	})
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+	}
+
+	ruleSets := cfg["route"].(map[string]any)["rule_set"].([]any)
+	if len(ruleSets) == 0 {
+		t.Fatal("route.rule_set is empty, expected default local definitions")
+	}
+	for _, raw := range ruleSets {
+		ruleSet := raw.(map[string]any)
+		if ruleSet["type"] != "local" {
+			t.Fatalf("rule_set %v type = %v, want local", ruleSet["tag"], ruleSet["type"])
+		}
+		// remote 专属字段一个都不该留下，留着 sing-box 又会去联网
+		if _, ok := ruleSet["url"]; ok {
+			t.Fatalf("rule_set %v still carries a url: %+v", ruleSet["tag"], ruleSet)
+		}
+		if _, ok := ruleSet["download_detour"]; ok {
+			t.Fatalf("rule_set %v still carries download_detour: %+v", ruleSet["tag"], ruleSet)
+		}
+		path, _ := ruleSet["path"].(string)
+		if filepath.Dir(path) != ruleSetDir {
+			t.Fatalf("rule_set %v path = %q, want a file under %q", ruleSet["tag"], path, ruleSetDir)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("rule_set %v file was not written: %v", ruleSet["tag"], err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("rule_set %v file is empty", ruleSet["tag"])
+		}
+	}
+}
+
+// cache_file 要无条件开并带显式 path：规则集的 .srs 缓存全靠它，冷启动一次要多付好几秒。
+func TestBuildConfigAlwaysEnablesCacheFileWithPath(t *testing.T) {
+	node := proxysubscription.ProxyNode{
+		Name:     "ss-hk",
+		Protocol: proxysubscription.ProtocolShadowsocks,
+		Server:   "ss.example.com",
+		Port:     8388,
+		Method:   "aes-128-gcm",
+		Password: "secret",
+	}
+	workDir := t.TempDir()
+	for _, mode := range []string{proxycore.ProxyModeRule, proxycore.ProxyModeGlobal, proxycore.ProxyModeDirect} {
+		t.Run(mode, func(t *testing.T) {
+			data, err := proxycore.BuildConfig(node, proxycore.Options{Mode: mode, WorkDir: workDir})
+			if err != nil {
+				t.Fatalf("BuildConfig returned error: %v", err)
+			}
+			var cfg map[string]any
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				t.Fatalf("config is not JSON: %v\n%s", err, string(data))
+			}
+			cacheFile := cfg["experimental"].(map[string]any)["cache_file"].(map[string]any)
+			if cacheFile["enabled"] != true {
+				t.Fatalf("cache_file.enabled = %v, want true", cacheFile["enabled"])
+			}
+			want := filepath.Join(workDir, "cache.db")
+			if cacheFile["path"] != want {
+				t.Fatalf("cache_file.path = %v, want %q", cacheFile["path"], want)
+			}
+		})
 	}
 }
 
@@ -613,10 +704,10 @@ func routeRulesContainRuleSet(rules []any, tag, outbound string) bool {
 	return false
 }
 
-func remoteRuleSetsContain(ruleSets []any, tag string) bool {
+func localRuleSetsContain(ruleSets []any, tag string) bool {
 	for _, raw := range ruleSets {
 		ruleSet := raw.(map[string]any)
-		if ruleSet["tag"] == tag && ruleSet["type"] == "remote" && ruleSet["format"] == "binary" {
+		if ruleSet["tag"] == tag && ruleSet["type"] == "local" && ruleSet["format"] == "binary" {
 			return true
 		}
 	}
